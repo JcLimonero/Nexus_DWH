@@ -1,11 +1,15 @@
 """
-nexus_client_postgres.py  v3 — PostgreSQL
+nexus_client_postgres.py  v4 — PostgreSQL
 ───────────────────────────────────────────
 Cliente ETL que carga datos en PostgreSQL (DWH destino).
 Lee su configuración del backend usando token de razón social, grupo o agencia.
 Reporta cada ejecución (exitosa o fallida) al backend.
-Origen: MySQL, SQL Server o PostgreSQL (según origen_tipo en config).
+Origen: MySQL, SQL Server, PostgreSQL o Firebird (según origen_tipo en config).
 Destino: PostgreSQL (psycopg2).
+
+Cambios v4:
+- Soporte para schema en load_table (p. ej. "dwh.carter")
+- Soporte para origen Firebird (vía DSN ODBC o conexión directa con fdb)
 """
 
 import configparser
@@ -187,13 +191,12 @@ def _empty_runtime_config() -> Dict[str, Any]:
 
 
 def _normalize_source_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    tipo = (data.get("origen_tipo") or data.get("source_type") or "sqlserver").lower()
+    default_port = 3050 if tipo == "firebird" else 1433
     return {
-        "tipo": (data.get("origen_tipo") or data.get("source_type") or "sqlserver").lower(),
+        "tipo": tipo,
         "ip": data.get("origen_ip") or data.get("source_host") or "",
-        "port": data.get("origen_port") or data.get("source_port") or (
-            3050 if (data.get("origen_tipo") or data.get("source_type","")).lower() == "firebird"
-            else 1433
-        ),
+        "port": data.get("origen_port") or data.get("source_port") or default_port,
         "db": data.get("origen_db") or data.get("source_db") or data.get("source_database") or "",
         "user": data.get("origen_user") or data.get("source_user") or data.get("source_username") or "",
         "pass": data.get("origen_pass") or data.get("source_pass") or data.get("source_password") or "",
@@ -263,9 +266,6 @@ def send_client_event(
     detail: str = "",
     rows_loaded: int = 0,
 ) -> None:
-    """
-    Informa al backend el resultado de una ejecución de tarea.
-    """
     url     = f"{API_BASE_URL}/client-event"
     headers = build_api_headers()
     payload = {
@@ -298,7 +298,7 @@ def mark_task_last_run(config_id: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Conexiones — Origen (MySQL, SQL Server o PostgreSQL)
+# Conexiones — Origen (MySQL, SQL Server, PostgreSQL o Firebird)
 # ─────────────────────────────────────────────────────────────────────────────
 def _detect_sql_server_driver() -> str:
     available = pyodbc.drivers()
@@ -357,6 +357,7 @@ def _source_connection(source_config: Optional[Dict[str, Any]] = None):
             database=cfg["db"],
             charset="utf8mb4",
         )
+
     elif tipo == "sqlserver":
         conn = pyodbc.connect(_build_sqlserver_conn_str(cfg))
 
@@ -376,19 +377,29 @@ def _source_connection(source_config: Optional[Dict[str, Any]] = None):
             password=cfg["pass"],
             dbname=cfg["db"],
         )
-    
+
     elif tipo == "firebird":
         dsn = cfg.get("dsn_odbc", "").strip()
         if dsn:
-            conn = pyodbc.connect(
-                f"DSN={dsn};UID={cfg.get('user','')};PWD={cfg.get('pass','')}",
-                autocommit=False,
-            )
+            # Vía DSN ODBC (p. ej. ConexionMMW32prodAL configurado en Windows)
+            parts = [f"DSN={dsn}"]
+            if cfg.get("user"):
+                parts.append(f"UID={cfg['user']}")
+            if cfg.get("pass"):
+                parts.append(f"PWD={cfg['pass']}")
+            conn = pyodbc.connect(";".join(parts), autocommit=False)
+            # Firebird suele devolver strings en latin-1
             conn.setdecoding(pyodbc.SQL_CHAR,  encoding="latin-1")
             conn.setdecoding(pyodbc.SQL_WCHAR, encoding="latin-1")
             conn.setencoding(encoding="latin-1")
         elif cfg.get("ip"):
-            import fdb
+            # Vía fdb nativo (sin DSN): requiere `pip install fdb`
+            try:
+                import fdb  # type: ignore
+            except ImportError:
+                raise RuntimeError(
+                    "Para conectar a Firebird sin DSN instala: pip install fdb"
+                )
             port = int(cfg.get("port", 3050))
             conn = fdb.connect(
                 host=cfg["ip"],
@@ -399,10 +410,14 @@ def _source_connection(source_config: Optional[Dict[str, Any]] = None):
                 charset="WIN1252",
             )
         else:
-            raise ValueError("Firebird requiere dsn_odbc o ip configurado.")
+            raise ValueError(
+                "Firebird requiere 'dsn_odbc' o 'source_host' configurado."
+            )
+
     else:
         raise ValueError(
-            f"origen_tipo no soportado: {tipo}. Use: mysql, sqlserver, postgresql, pervasive, firebird"
+            f"origen_tipo no soportado: {tipo}. "
+            f"Use: mysql, sqlserver, postgresql, pervasive, firebird"
         )
 
     try:
@@ -441,18 +456,35 @@ def _dwh_connection():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PostgreSQL helpers
+# PostgreSQL helpers — schema-aware
 # ─────────────────────────────────────────────────────────────────────────────
 def quote_ident(name: str) -> str:
-    """PostgreSQL usa comillas dobles para identificadores."""
+    """PostgreSQL usa comillas dobles para identificadores (columnas)."""
     return f'"{name}"'
 
 
+def split_schema_table(table: str) -> Tuple[str, str]:
+    """
+    Separa 'dwh.carter' → ('dwh', 'carter').
+    Sin punto → ('public', tabla).
+    """
+    if "." in table:
+        schema, tbl = table.split(".", 1)
+        return schema.strip(), tbl.strip()
+    return "public", table.strip()
+
+
+def quote_table(table: str) -> str:
+    """
+    Devuelve identificador PostgreSQL con schema:
+      'dwh.carter'  → '"dwh"."carter"'
+      'customers'   → '"public"."customers"'
+    """
+    schema, tbl = split_schema_table(table)
+    return f'"{schema}"."{tbl}"'
+
+
 def _column_suggests_pg_temporal(column: str) -> bool:
-    """
-    Columnas que suelen cargarse como DATE/TIMESTAMP en PostgreSQL.
-    (Evita tocar VARCHAR genéricos salvo que el nombre lo indique.)
-    """
     c = column.lower()
     if c == "timestamp":
         return True
@@ -464,10 +496,6 @@ def _column_suggests_pg_temporal(column: str) -> bool:
 
 
 def sanitize_value_for_postgres(column: str, value: Any) -> Any:
-    """
-    PostgreSQL rechaza fechas inválidas como '1992-00-00' o '0000-00-00'
-    (habituales en SQL Server / MySQL como “fecha vacía”).
-    """
     if value is None:
         return None
     if isinstance(value, (datetime, date)):
@@ -487,15 +515,10 @@ def sanitize_value_for_postgres(column: str, value: Any) -> Any:
     return value
 
 
-# La BD puede admitir textos amplios; dejar vacío desactiva el truncado por
-# longitud y conserva solamente el saneamiento de fechas inválidas.
 _CUSTOMERS_VARCHAR_LIMITS: Dict[str, int] = {}
 
 
 def truncate_string_for_dwh_table(table: str, column: str, value: Any) -> Any:
-    """
-    Evita StringDataRightTruncation en columnas VARCHAR del DWH cuando el origen trae texto largo.
-    """
     if value is None:
         return None
     if isinstance(value, bytes):
@@ -505,7 +528,9 @@ def truncate_string_for_dwh_table(table: str, column: str, value: Any) -> Any:
             return value
     if not isinstance(value, str):
         return value
-    t = (table or "").lower().strip()
+    # Comparar solo el nombre de tabla sin schema
+    _, tbl = split_schema_table(table)
+    t = tbl.lower().strip()
     if t != "customers":
         return value
     key = column.lower().strip().strip('"').strip("'")
@@ -537,16 +562,11 @@ def prepare_rows_for_postgres(
 def resolve_upsert_keys_to_columns(
     columns: Sequence[str], upsert_keys: Sequence[str]
 ) -> List[str]:
-    """
-    Alinea nombres del catálogo (p. ej. idAgency) con los que devuelve el driver
-    (p. ej. idagency). Si no coinciden, valid_keys queda vacío y el cliente hace
-    INSERT plano → choques en PK al repetir cargas.
-    """
     if not columns or not upsert_keys:
         return []
     by_lower = {c.lower(): c for c in columns}
     out: List[str] = []
-    seen: set[str] = set()
+    seen: set = set()
     for k in upsert_keys:
         if k is None:
             continue
@@ -566,14 +586,9 @@ def maybe_adjust_customers_load(
     columns: Sequence[str],
     rows: Sequence[Sequence[Any]],
     upsert_keys: Sequence[str],
-) -> tuple[List[str], List[tuple], List[str]]:
-    """
-    Tabla customers: el destino suele usar id generado (IDENTITY); el upsert
-    natural es idAgency + ndClientDMS. Si el extract trae id del DMS y hacemos
-    ON CONFLICT por agencia+cliente, hay que no insertar esa columna id.
-    """
-    t = (load_table or "").lower().strip()
-    if t != "customers":
+) -> tuple:
+    _, tbl = split_schema_table(load_table)
+    if tbl.lower().strip() != "customers":
         return list(columns), [tuple(r) for r in rows], list(upsert_keys)
 
     cols = list(columns)
@@ -598,14 +613,6 @@ def dedupe_rows_for_upsert(
     rows: Sequence[Sequence[Any]],
     upsert_keys: Sequence[str],
 ) -> List[tuple]:
-    """
-    En un mismo INSERT ... ON CONFLICT, PostgreSQL exige que no haya dos filas
-    propuestas que choquen con el mismo destino (CardinalityViolation).
-
-    Si el extract devuelve varias filas con la misma clave (p. ej. idAgency +
-    ndClientDMS), se deja una por clave: **gana la última** según el orden del
-    resultado del SELECT (conviene ORDER BY timestamp en el origen).
-    """
     valid_keys = resolve_upsert_keys_to_columns(columns, upsert_keys)
     if not valid_keys or not rows:
         return [tuple(r) for r in rows]
@@ -632,11 +639,11 @@ def infer_column_types(
     type_map: Dict[str, str] = {}
     for i, col in enumerate(columns):
         val = samples[i]
-        if isinstance(val, bool):          sql_type = "BOOLEAN"
+        if isinstance(val, bool):         sql_type = "BOOLEAN"
         elif isinstance(val, datetime):   sql_type = "TIMESTAMP"
         elif isinstance(val, date):       sql_type = "DATE"
         elif isinstance(val, Decimal):    sql_type = "DECIMAL(18,4)"
-        else:                              sql_type = "TEXT"
+        else:                             sql_type = "TEXT"
         type_map[col] = sql_type
     return type_map
 
@@ -647,12 +654,13 @@ def create_table_if_missing(
     upsert_keys: Sequence[str],
 ) -> None:
     """
-    Crea la tabla si no existe. Si el origen no trae columna ``id``, se añade
-    ``id BIGSERIAL PRIMARY KEY`` y las claves de upsert pasan a ser UNIQUE
-    (el INSERT no incluye ``id``; PostgreSQL lo rellena).
-    Si el origen ya trae ``id``, se mantiene el esquema anterior (PK en
-    claves de negocio cuando hay upsert_keys).
+    Crea la tabla si no existe, respetando el schema (p. ej. dwh.carter).
+    Si el origen no trae columna 'id', se añade id BIGSERIAL PRIMARY KEY.
     """
+    # Asegurar que el schema exista
+    schema, _ = split_schema_table(table)
+    cursor.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+
     has_source_id = any((c or "").lower() == "id" for c in columns)
     col_defs: List[str] = []
     if not has_source_id:
@@ -672,17 +680,18 @@ def create_table_if_missing(
         col_defs.append(f"PRIMARY KEY ({pk})")
 
     cursor.execute(
-        f"CREATE TABLE IF NOT EXISTS {quote_ident(table)} "
+        f"CREATE TABLE IF NOT EXISTS {quote_table(table)} "
         f"({', '.join(col_defs)})"
     )
 
 
 def pg_table_exists(cursor: Any, table: str) -> bool:
-    """True si existe relación en public (nombre sin comillas = minúsculas en PG)."""
+    """True si existe la tabla en el schema indicado (o public si no se especifica)."""
+    schema, tbl = split_schema_table(table)
     cursor.execute(
         "SELECT 1 FROM information_schema.tables "
-        "WHERE table_schema = 'public' AND table_name = %s",
-        (table.lower(),),
+        "WHERE table_schema = %s AND table_name = %s",
+        (schema.lower(), tbl.lower()),
     )
     return cursor.fetchone() is not None
 
@@ -692,15 +701,14 @@ def ensure_columns_exist(
     columns: Sequence[str], col_types: Dict[str, str],
 ) -> None:
     """
-    Verifica que la tabla PostgreSQL tenga todas las columnas que los datos
-    necesitan.  Si faltan, las agrega con ALTER TABLE ADD COLUMN usando el
-    tipo inferido (TEXT por defecto).  Evita errores de 'column X does not
-    exist' cuando un SP devuelve columnas no previstas en el DDL original.
+    Verifica que la tabla PostgreSQL tenga todas las columnas necesarias.
+    Si faltan, las agrega con ALTER TABLE ADD COLUMN.
     """
+    schema, tbl = split_schema_table(table)
     cursor.execute(
         "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = %s",
-        (table.lower(),),
+        "WHERE table_schema = %s AND table_name = %s",
+        (schema.lower(), tbl.lower()),
     )
     existing = {row[0] for row in cursor.fetchall()}
     existing_lower = {n.lower() for n in existing}
@@ -710,7 +718,7 @@ def ensure_columns_exist(
             continue
         sql_type = col_types.get(col, "TEXT")
         cursor.execute(
-            f"ALTER TABLE {quote_ident(table)} "
+            f"ALTER TABLE {quote_table(table)} "
             f"ADD COLUMN {quote_ident(col)} {sql_type}"
         )
         added += 1
@@ -719,56 +727,56 @@ def ensure_columns_exist(
         log.info("  %d columna(s) añadida(s) a '%s'.", added, table)
 
 
-def build_upsert_sql_values_template(table: str, columns: Sequence[str], upsert_keys: Sequence[str]) -> str:
-    """SQL para execute_values: INSERT ... VALUES %s ON CONFLICT ... (sin placeholders %s por columna)."""
-    cols_sql     = ", ".join(quote_ident(c) for c in columns)
-    valid_keys   = resolve_upsert_keys_to_columns(columns, upsert_keys)
+def build_upsert_sql_values_template(
+    table: str, columns: Sequence[str], upsert_keys: Sequence[str]
+) -> str:
+    """SQL para execute_values: INSERT ... VALUES %s ON CONFLICT ..."""
+    cols_sql   = ", ".join(quote_ident(c) for c in columns)
+    valid_keys = resolve_upsert_keys_to_columns(columns, upsert_keys)
 
     if not valid_keys:
-        return f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES %s"
+        return f"INSERT INTO {quote_table(table)} ({cols_sql}) VALUES %s"
 
     vk_set = set(valid_keys)
     update_cols = [c for c in columns if c not in vk_set]
     conflict_cols = ", ".join(quote_ident(k) for k in valid_keys)
     if not update_cols:
         return (
-            f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES %s "
+            f"INSERT INTO {quote_table(table)} ({cols_sql}) VALUES %s "
             f"ON CONFLICT ({conflict_cols}) DO NOTHING"
         )
     set_clause = ", ".join(
         f"{quote_ident(c)} = EXCLUDED.{quote_ident(c)}" for c in update_cols
     )
     return (
-        f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES %s "
+        f"INSERT INTO {quote_table(table)} ({cols_sql}) VALUES %s "
         f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
     )
 
 
-def build_upsert_sql(table: str, columns: Sequence[str], upsert_keys: Sequence[str]) -> str:
+def build_upsert_sql(
+    table: str, columns: Sequence[str], upsert_keys: Sequence[str]
+) -> str:
     cols_sql     = ", ".join(quote_ident(c) for c in columns)
     placeholders = ", ".join("%s" for _ in columns)
     valid_keys   = resolve_upsert_keys_to_columns(columns, upsert_keys)
 
     if not valid_keys:
-        return f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES ({placeholders})"
+        return f"INSERT INTO {quote_table(table)} ({cols_sql}) VALUES ({placeholders})"
 
     vk_set = set(valid_keys)
     update_cols = [c for c in columns if c not in vk_set]
+    conflict_cols = ", ".join(quote_ident(k) for k in valid_keys)
     if not update_cols:
-        # INSERT ... ON CONFLICT DO NOTHING
-        conflict_cols = ", ".join(quote_ident(k) for k in valid_keys)
         return (
-            f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES ({placeholders}) "
+            f"INSERT INTO {quote_table(table)} ({cols_sql}) VALUES ({placeholders}) "
             f"ON CONFLICT ({conflict_cols}) DO NOTHING"
         )
-
-    # INSERT ... ON CONFLICT DO UPDATE
-    conflict_cols = ", ".join(quote_ident(k) for k in valid_keys)
     set_clause = ", ".join(
         f"{quote_ident(c)} = EXCLUDED.{quote_ident(c)}" for c in update_cols
     )
     return (
-        f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES ({placeholders}) "
+        f"INSERT INTO {quote_table(table)} ({cols_sql}) VALUES ({placeholders}) "
         f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
     )
 
@@ -776,7 +784,6 @@ def build_upsert_sql(table: str, columns: Sequence[str], upsert_keys: Sequence[s
 # ─────────────────────────────────────────────────────────────────────────────
 # Nombres de columnas: unificar orígenes distintos (SP/vistas) sin tocar cada BD
 # ─────────────────────────────────────────────────────────────────────────────
-# Clave = nombre que devuelve pyodbc (comparación sin distinguir mayúsculas).
 _DWH_COLUMN_SYNONYMS: Dict[str, Dict[str, str]] = {
     "services": {
         "servicer_to_performe": "service_to_perform",
@@ -795,7 +802,9 @@ _DWH_COLUMN_SYNONYMS: Dict[str, Dict[str, str]] = {
 
 
 def canonicalize_dwh_column_names(load_table: str, columns: Sequence[str]) -> List[str]:
-    t = (load_table or "").lower().strip()
+    # Usar solo el nombre de tabla sin schema para buscar sinónimos
+    _, tbl = split_schema_table(load_table)
+    t = tbl.lower().strip()
     syn = _DWH_COLUMN_SYNONYMS.get(t)
     if not syn:
         return list(columns)
@@ -809,10 +818,6 @@ def merge_row_columns_if_duplicate_names(
     *,
     task_id: str = "",
 ) -> Tuple[List[str], List[tuple]]:
-    """
-    Tras renombrar, si dos columnas distintas quedan con el mismo nombre,
-    se unen en una sola por fila (prioridad al último valor no nulo).
-    """
     if not columns:
         return [], [tuple(r) for r in rows]
 
@@ -857,11 +862,6 @@ def merge_row_columns_if_duplicate_names(
 # Ejecutar tarea
 # ─────────────────────────────────────────────────────────────────────────────
 def normalize_last_run_for_tsql(last_run_at: Optional[str]) -> str:
-    """
-    El API devuelve last_run_at en ISO-8601 (p. ej. 2025-03-27T14:30:00.123456).
-    SQL Server falla a menudo con varchar '...T...' o con offset (+00:00) en literales.
-    Se convierte a 'YYYY-MM-DD HH:MM:SS.mmm' (naive, UTC si venía con zona).
-    """
     default = "1900-01-01 00:00:00"
     if not last_run_at:
         return default
@@ -892,11 +892,10 @@ def run_task(task: Dict[str, Any]) -> int:
     """
     Ejecuta la tarea ETL completa.
     Devuelve el número de filas cargadas.
-    Lanza excepción si algo falla (el scheduler la captura y reporta el error).
     """
     task_id          = task["id"]
     task_name        = task["name"]
-    load_table       = task["load_table"]
+    load_table       = task["load_table"].lower()
     upsert_keys_raw  = task.get("upsert_keys") or []
     query_tabla      = task.get("query_tabla_destino")
     query_constraint = task.get("query_constraint")
@@ -928,12 +927,19 @@ def run_task(task: Dict[str, Any]) -> int:
         except Exception as exc:
             log.warning("  Constraint falló (puede que ya exista): %s", exc)
 
-    # 3) Extraer desde origen (MySQL, SQL Server o PostgreSQL)
+    # 3) Extraer desde origen
     extract_sql = prepare_extract_sql(task["extract_sql"], last_run_at)
     with _source_connection(task_source_config) as conn:
         cur = conn.cursor()
         cur.execute(extract_sql)
-        rows    = cur.fetchall()
+        #rows    = cur.fetchall()
+        rows = []
+        while True:
+            chunk = cur.fetchmany(50000)
+            if not chunk:
+                break
+            rows.extend(chunk)
+            log.info("  Leídas %d filas...", len(rows))
         columns_raw = [
             d[0].decode("latin-1") if isinstance(d[0], bytes) else str(d[0])
             for d in (cur.description or [])
@@ -955,8 +961,32 @@ def run_task(task: Dict[str, Any]) -> int:
 
     orig_ncol = len(columns)
     rows_tuples = prepare_rows_for_postgres(load_table, columns, rows_list)
+
+    # Inyectar columnas estáticas (p. ej. {"dn": 1000}) definidas por tarea/agencia
+    import json as _json
+    static_columns = task.get("static_columns") or {}
+    if isinstance(static_columns, str):
+        try:
+            static_columns = _json.loads(static_columns)
+        except Exception:
+            static_columns = {}
+    if static_columns:
+        nulls = [k for k, v in static_columns.items() if v is None]
+        if nulls:
+            log.warning(
+                "  Tarea %s: static_columns tiene valores null en: %s",
+                task_id, ", ".join(nulls),
+            )
+        extra_cols = list(static_columns.keys())
+        extra_vals = tuple(static_columns.values())
+        columns = list(columns) + extra_cols
+        rows_tuples = [row + extra_vals for row in rows_tuples]
+        log.info("  Tarea %s: columnas estáticas inyectadas: %s", task_id, static_columns)
+
     upsert_keys = resolve_upsert_keys_to_columns(columns, upsert_keys_raw)
-    if not upsert_keys and (load_table or "").lower().strip() == "customers":
+
+    _, load_tbl_name = split_schema_table(load_table)
+    if not upsert_keys and load_tbl_name.lower().strip() == "customers":
         upsert_keys = resolve_upsert_keys_to_columns(
             columns, ["idAgency", "ndClientDMS"]
         )
@@ -966,14 +996,16 @@ def run_task(task: Dict[str, Any]) -> int:
                 task_id,
                 ", ".join(upsert_keys),
             )
+
     columns, rows_tuples, upsert_keys = maybe_adjust_customers_load(
         load_table, columns, rows_tuples, upsert_keys
     )
-    if (load_table or "").lower().strip() == "customers" and len(columns) < orig_ncol:
+    if load_tbl_name.lower().strip() == "customers" and len(columns) < orig_ncol:
         log.info(
             "  Tarea %s: customers — se omite columna id del origen (IDENTITY en destino).",
             task_id,
         )
+
     n_raw = len(rows_tuples)
     rows_tuples = dedupe_rows_for_upsert(columns, rows_tuples, upsert_keys)
     n_dedup = len(rows_tuples)
@@ -981,17 +1013,12 @@ def run_task(task: Dict[str, Any]) -> int:
         log.warning(
             "  Tarea %s: %d filas duplicadas por clave upsert en el mismo lote "
             "(se usa la última por clave): %d → %d.",
-            task_id,
-            n_raw - n_dedup,
-            n_raw,
-            n_dedup,
+            task_id, n_raw - n_dedup, n_raw, n_dedup,
         )
     if _verbose:
         log.info("  Filas a cargar: %d", n_dedup)
 
-    # 4) Si la tabla destino no existe, crearla (inferida). Cubre el caso en que
-    #    query_tabla_destino sigue creando customers_vehicle / last_customer_sale
-    #    pero load_table ya es customer_vehicle / last_customer_seller.
+    # 4) Crear tabla destino si no existe (con schema correcto)
     col_types = infer_column_types(columns, rows_tuples)
     with _dwh_connection() as conn:
         cur = conn.cursor()
@@ -1005,9 +1032,9 @@ def run_task(task: Dict[str, Any]) -> int:
         ensure_columns_exist(cur, load_table, columns, col_types)
         conn.commit()
 
-    # 5) Upsert con execute_values (10-50x más rápido que executemany)
+    # 5) Upsert con execute_values
     CHUNK_SIZE = 20000
-    PAGE_SIZE = 5000
+    PAGE_SIZE  = 5000
     upsert_sql = build_upsert_sql_values_template(load_table, columns, upsert_keys)
     with _dwh_connection() as conn:
         cur = conn.cursor()
@@ -1114,7 +1141,6 @@ def run_scheduler() -> None:
             if configs and nuevas:
                 detect_changes(configs, nuevas)
 
-            # Resetear timer si schedule_seconds cambió
             old_map = {str(t["id"]): t for t in configs}
             for t in nuevas:
                 tid = str(t["id"])
@@ -1145,10 +1171,8 @@ def run_scheduler() -> None:
                 _last_run_ts[task_id] = time.time()
                 executed += 1
 
-                # Notificar last_run_at al backend
                 mark_task_last_run(task_id)
 
-                # Reportar ejecución exitosa al monitor
                 send_client_event(
                     config_id=task_id,
                     task_name=task_name,
@@ -1170,7 +1194,6 @@ def run_scheduler() -> None:
                 )
                 log.error("Error en tarea %s: %s\n%s", task_id, exc, error_msg)
 
-                # Reportar error al monitor (con traceback completo)
                 send_client_event(
                     config_id=task_id,
                     task_name=task_name,
@@ -1189,7 +1212,7 @@ def run_scheduler() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     validate_api_url_security()
-    log.info("=== Nexus DWH Client (PostgreSQL) ===")
+    log.info("=== Nexus DWH Client (PostgreSQL) v4 ===")
     log.info("Server   : %s", API_BASE_URL)
     log.info("Mode     : %s", _client_mode_label())
     log.info("Token    : %s", _mask_active_client_token())

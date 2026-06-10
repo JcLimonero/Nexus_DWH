@@ -83,6 +83,7 @@ class SyncTaskConfig(BaseModel):
     run_on_company_token: bool = True
     last_run_at: Optional[str] = None
     updated_at: str = ""
+    static_columns: Optional[str] = None
 
 
 TaskConfig = SyncTaskConfig
@@ -603,7 +604,8 @@ def fetch_company_task_configs(company_token: str) -> List[SyncTaskConfig]:
                 at.is_active,
                 at.last_run_at,
                 at.updated_at,
-                at.run_on_company_token
+                at.run_on_company_token,
+                oc.static_columns
             FROM agency_task at
             JOIN agency a ON a.id = at.agency_id
             JOIN object_catalog oc ON oc.id = at.object_catalog_id
@@ -641,6 +643,7 @@ def fetch_company_task_configs(company_token: str) -> List[SyncTaskConfig]:
             last_run_at=row[12].isoformat() if row[12] else None,
             updated_at=row[13].isoformat()  if row[13] else "",
             run_on_company_token=bool(row[14]),
+            static_columns=row[15] or None,
         ))
     return task_configs
 
@@ -666,7 +669,8 @@ def fetch_agency_task_configs(agency_token: str) -> List[SyncTaskConfig]:
                 at.is_active,
                 at.last_run_at,
                 at.updated_at,
-                at.run_on_company_token
+                at.run_on_company_token,
+                oc.static_columns
             FROM agency_task at
             JOIN agency a ON a.id = at.agency_id
             JOIN object_catalog oc ON oc.id = at.object_catalog_id
@@ -703,6 +707,7 @@ def fetch_agency_task_configs(agency_token: str) -> List[SyncTaskConfig]:
             last_run_at=row[12].isoformat() if row[12] else None,
             updated_at=row[13].isoformat()  if row[13] else "",
             run_on_company_token=bool(row[14]),
+            static_columns=row[15] or None,
         ))
     return task_configs
 
@@ -745,7 +750,8 @@ def fetch_group_task_configs(group_token: str) -> Tuple[List[GroupSyncTaskConfig
                 at.is_active,
                 at.last_run_at,
                 at.updated_at,
-                at.run_on_company_token
+                at.run_on_company_token,
+                oc.static_columns
             FROM agency_task at
             JOIN agency a ON a.id = at.agency_id
             JOIN object_catalog oc ON oc.id = at.object_catalog_id
@@ -794,6 +800,7 @@ def fetch_group_task_configs(group_token: str) -> Tuple[List[GroupSyncTaskConfig
                 last_run_at=row[23].isoformat() if row[23] else None,
                 updated_at=row[24].isoformat() if row[24] else "",
                 run_on_company_token=bool(row[25]),
+                static_columns=row[26] or None,
                 source=SourceRuntimeConfig(
                     source_type=(row[8] or "sqlserver").lower(),
                     source_dsn=decrypt_config_secret(row[9] or ""),
