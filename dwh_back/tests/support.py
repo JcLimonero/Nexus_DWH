@@ -21,7 +21,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional
 
 import psycopg2
@@ -275,3 +278,39 @@ def seed_config(b: Backend) -> Dict[str, Any]:
         "agency_a1": aa1, "agency_a2": aa2, "agency_b1": ab1,
         "t_cli": t_cli, "t_lenta": t_lenta, "t_dups": t_dups, "t_bad": t_bad, "t_sin": t_sin, "t_b": t_b,
     }
+
+
+class FakeWebhookReceiver:
+    """Receptor HTTP LOCAL (127.0.0.1) que registra los webhooks. Nunca destinos reales."""
+
+    def __init__(self):
+        self.requests = []
+        self.codes = []          # códigos a devolver en orden; después 200
+        self.lock = threading.Lock()
+        rec = self
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                with rec.lock:
+                    rec.requests.append({"headers": {k.lower(): v for k, v in self.headers.items()},
+                                         "body": body, "path": self.path})
+                    code = rec.codes.pop(0) if rec.codes else 200
+                self.send_response(code)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/hook"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def bodies(self, event=None):
+        with self.lock:
+            out = [json.loads(r["body"]) for r in self.requests]
+        return [b for b in out if event is None or b.get("event") == event]
+
+    def stop(self):
+        self.server.shutdown()

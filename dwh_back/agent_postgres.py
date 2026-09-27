@@ -340,8 +340,14 @@ def create_agent_routers(
     heartbeat_retention_days: int = 7,
     download_log_retention_days: int = 30,
     future_tolerance_hours: int = 26,
+    health: Optional[Any] = None,
 ) -> Tuple[APIRouter, APIRouter, APIRouter]:
-    """Devuelve (agent_router, admin_router, monitor_router)."""
+    """
+    Devuelve (agent_router, admin_router, monitor_router).
+    ``health`` (IncidentEngine, opcional): ganchos de incidencias que corren en
+    la MISMA transacción que el reporte (dentro de un savepoint: un error del
+    gancho nunca tumba el reporte del agente).
+    """
 
     # ── BD ──────────────────────────────────────────────────────────────────
     @contextmanager
@@ -827,6 +833,11 @@ def create_agent_routers(
             sync_changed = False
             if body.status in TERMINAL:
                 sync_changed = apply_sync_state(cur, ctx, ex, body, err_code, cp)
+                if health is not None:
+                    health.on_execution_terminal(
+                        cur, installation_id=str(ctx.id), installation_name=ctx.name, task=t, ex=ex,
+                        status=body.status, error_code=err_code, message=err_msg, warnings=warnings,
+                        checkpoint_applied=cp is not None)
                 # Evento compatible para el monitor/panel actuales.
                 if body.status == "success":
                     detail = f"{body.rows_loaded or 0} filas cargadas en '{t['destination_table']}'"
@@ -880,6 +891,9 @@ def create_agent_routers(
                 (str(ctx.id), to_utc(body.event_time), body.agent_seq, body.client_version,
                  body.uptime_seconds, body.queue_depth, json.dumps(running)),
             )
+            if health is not None:
+                # El latido resuelve la desconexión (solo esa categoría).
+                health.on_heartbeat(cur, str(ctx.id))
             maybe_cleanup(cur)
         return {"status": "ok", "server_time": iso(utcnow()),
                 "credential_rotation_required": ctx.rotation_required}
@@ -903,6 +917,11 @@ def create_agent_routers(
             )
             created = cur.fetchone() is not None
             bump_seq(cur, ctx, body.agent_seq)
+            if created and health is not None:
+                health.on_agent_event(
+                    cur, installation_id=str(ctx.id), installation_name=ctx.name,
+                    scope={"group_id": ctx.group_id, "company_id": ctx.company_id, "agency_id": ctx.agency_id},
+                    event_type=body.event_type, payload=payload)
         return {"status": "ok", "duplicate": not created}
 
     # ── Rotación de credencial ──────────────────────────────────────────────
