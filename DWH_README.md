@@ -1566,6 +1566,10 @@ Agentes   ──HTTPS──► Traefik (Coolify) ──────────�
 
 ### 23.2. Aplicaciones en Coolify
 
+**Opción recomendada (VPS stage): una sola aplicación Docker Compose** con el `docker-compose.yml` de la raíz: servicios `backend` (8000) y `frontend` (3000) en la misma red interna (el panel usa `DWH_API_URL=http://backend:8000`), `host.docker.internal` ya mapeado (`extra_hosts`) y migraciones al arrancar (`NEXUS_RUN_MIGRATIONS=true`). En Coolify: *+ New → Docker Compose*, repo `JcLimonero/Nexus_DWH`, rama `main`, ubicación `/docker-compose.yml`; dominios por servicio (`frontend` → panel, `backend` → API de agentes). Variables de la aplicación: `DB_USER`, `DB_PASSWORD` (secreto), `DB_NAME` (defecto `NexusDWH`), `NEXUS_CONFIG_SECRET_KEY` (secreto), `NEXUS_PANEL_PROXY_KEY` (secreto, compartida por ambos servicios), `DWH_PUBLIC_ORIGIN` (URL HTTPS del panel); opcionales `NEXUS_TRUSTED_PROXIES` / `NEXUS_FORWARDED_ALLOW_IPS` (defecto `10.0.0.0/16`, redes Docker locales del VPS; acótelas a la subred de la aplicación si es posible) y `NEXUS_AGENT_LATEST_VERSION`.
+
+**Alternativa: dos aplicaciones Dockerfile**:
+
 | | Backend | Panel |
 |---|---|---|
 | Origen | GitHub público `JcLimonero/Nexus_DWH`, rama `main` | igual |

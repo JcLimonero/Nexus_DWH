@@ -1,0 +1,45 @@
+# Coolify (build pack: Docker Compose) en el VPS stage. Ver DWH_README.md §23.
+# Dominios por servicio en la UI de Coolify:
+#   frontend -> https://<panel>:3000     backend -> https://<api-agentes>:8000
+# La BD de configuración es el PostgreSQL 16 NATIVO del VPS (host.docker.internal).
+# Los secretos (DB_PASSWORD, NEXUS_CONFIG_SECRET_KEY, NEXUS_PANEL_PROXY_KEY) se definen como
+# variables de entorno de la aplicación en Coolify; nunca en este archivo.
+services:
+  backend:
+    build:
+      context: ./dwh_back
+    expose:
+      - "8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      NEXUS__DATABASE__HOST: ${DB_HOST:-host.docker.internal}
+      NEXUS__DATABASE__PORT: ${DB_PORT:-5432}
+      NEXUS__DATABASE__DB: ${DB_NAME:-NexusDWH}
+      NEXUS__DATABASE__USER: ${DB_USER}
+      NEXUS__DATABASE__PASSWORD: ${DB_PASSWORD}
+      NEXUS_RUN_MIGRATIONS: ${NEXUS_RUN_MIGRATIONS:-true}
+      NEXUS_CONFIG_SECRET_KEY: ${NEXUS_CONFIG_SECRET_KEY}
+      NEXUS__AUTH__PANEL_PROXY_KEY: ${NEXUS_PANEL_PROXY_KEY}
+      # Redes docker locales del VPS (10.0.x.0/24); el panel envía la IP del usuario firmada.
+      NEXUS__AUTH__TRUSTED_PROXIES: ${NEXUS_TRUSTED_PROXIES:-10.0.0.0/16}
+      # Traefik delante: IP real de los agentes para los límites por IP.
+      NEXUS__SERVER__PROXY_HEADERS: ${NEXUS_PROXY_HEADERS:-true}
+      NEXUS__SERVER__FORWARDED_ALLOW_IPS: ${NEXUS_FORWARDED_ALLOW_IPS:-10.0.0.0/16}
+      NEXUS__AGENT__LATEST_VERSION: ${NEXUS_AGENT_LATEST_VERSION:-}
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./dwh_front
+    expose:
+      - "3000"
+    depends_on:
+      - backend
+    environment:
+      DWH_API_URL: http://backend:8000
+      DWH_PUBLIC_ORIGIN: ${DWH_PUBLIC_ORIGIN}
+      DWH_PANEL_PROXY_KEY: ${NEXUS_PANEL_PROXY_KEY}
+      DWH_TRUSTED_PROXY_HOPS: ${DWH_TRUSTED_PROXY_HOPS:-1}
+      DWH_COOKIE_SECURE: ${DWH_COOKIE_SECURE:-true}
+    restart: unless-stopped
