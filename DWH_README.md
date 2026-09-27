@@ -6,7 +6,7 @@ Documento único para entender y operar el **stack DWH de Nexus**:
 - `dwh_client/` — **cliente ETL** que corre en cada sede y carga datos al DWH.
 - `dwh_api/` — app de **monitoreo** (consume los endpoints `/monitor/*` del backend).
 - `dwh_front/` — **panel web de administración** (Next.js) para dar de alta grupos, empresas, agencias, catálogo y tareas, y ver el monitor (solo variante PostgreSQL; ver sección 16).
-- Distribución del agente (Nuitka, servicio de Windows, firma y actualizaciones): sección 21. Destino (DWH) configurable por grupo/empresa, esquema, SSL/TLS y "Probar conexión": sección 22. Resumen de entrega del endurecimiento (fases 1–5): [ENTREGA_ENDURECIMIENTO.md](ENTREGA_ENDURECIMIENTO.md).
+- Distribución del agente (Nuitka, servicio de Windows, firma y actualizaciones): sección 21. Destino (DWH) configurable por grupo/empresa, esquema, SSL/TLS y "Probar conexión": sección 22. Despliegue del backend y el panel en contenedores (Coolify, configuración por variables `NEXUS__<SECCION>__<CLAVE>`): sección 23. Resumen de entrega del endurecimiento (fases 1–5): [ENTREGA_ENDURECIMIENTO.md](ENTREGA_ENDURECIMIENTO.md).
 - **Encriptación de secretos** con Fernet (opcional, recomendada en producción).
 
 El stack existe en **dos variantes** equivalentes:
@@ -583,7 +583,8 @@ Si el IDE falla con “Maven artifact ... cannot be resolved”, descarga el JAR
 - [ ] Paquetes del agente con firma Authenticode y manifiesto firmado (Ed25519) cuando existan certificado y clave; `[agent] latest_version` del backend al día para ver versiones desactualizadas (§21.5–21.6).
 - [ ] Política de Windows Error Reporting / volcados de memoria revisada por el cliente (§21.2).
 - [ ] Panel: usuarios nominales con el rol mínimo y alcance por grupo; `[admin] allow_static_token = false`; revisar **Auditoría** periódicamente; `DWH_COOKIE_SECURE=true` detrás de HTTPS.
-- [ ] Panel detrás de un proxy inverso (nginx) que **sobrescriba** `X-Real-IP` con `DWH_CLIENT_IP_HEADER=x-real-ip`, `DWH_PANEL_PROXY_KEY` = `[auth] panel_proxy_key` (aleatoria, distinta por entorno) y `DWH_PUBLIC_ORIGIN` con la URL pública; sin esto no hay límite de login por IP (§20.3).
+- [ ] Panel detrás de un proxy inverso (nginx) que **sobrescriba** `X-Real-IP` con `DWH_CLIENT_IP_HEADER=x-real-ip`, `DWH_PANEL_PROXY_KEY` = `[auth] panel_proxy_key` (aleatoria, distinta por entorno) y `DWH_PUBLIC_ORIGIN` con la URL pública; sin esto no hay límite de login por IP (§20.3). En Coolify/Traefik: `DWH_TRUSTED_PROXY_HOPS=1` y verificación con una IP falsa (§23.4).
+- [ ] Contenedores (Coolify, §23): secretos (`NEXUS__DATABASE__PASSWORD`, `NEXUS_CONFIG_SECRET_KEY`, `NEXUS__AUTH__PANEL_PROXY_KEY`/`DWH_PANEL_PROXY_KEY`, `NEXUS__MONITOR__TOKEN`) **solo** como variables de Coolify (sin *Build Variable*), nunca en la imagen ni en el repo; `NEXUS__ADMIN__ALLOW_STATIC_TOKEN` sin definir (false); rol de PostgreSQL propio (no `postgres`) y `pg_hba.conf` limitado a la red Docker; 5432 no expuesto a Internet; `trusted_proxies`/`forwarded_allow_ips` limitados a la red de Coolify; backend y panel solo por HTTPS.
 
 ---
 
@@ -672,7 +673,7 @@ pnpm install
 pnpm dev                        # http://localhost:3000
 ```
 
-Producción: `pnpm build && pnpm start` detrás de HTTPS. Comprobaciones: `pnpm typecheck`, `pnpm lint`, `pnpm build`.
+Producción: imagen Docker (`dwh_front/Dockerfile`, `output: "standalone"` → `node server.js`; sección 23) detrás de HTTPS. Sin Docker: `pnpm build` y `node .next/standalone/server.js` (copiando `.next/static` a `.next/standalone/.next/static`); `pnpm start` sigue funcionando con un aviso de Next. Comprobaciones: `pnpm typecheck`, `pnpm lint`, `pnpm build`.
 
 ### 16.5. Vista por grupo y por agencia; clonar extractores
 
@@ -1207,7 +1208,7 @@ Módulos `dwh_back/panel_auth.py`, `users_postgres.py`, `manage_users.py`, `db_p
 - **Por usuario (BD)**: tras `max_failed_attempts` (5) fallos, bloqueo de `lockout_base_seconds × 2^(fallos − 5)` (30 s, 60 s, 120 s…, tope `lockout_max_seconds` = 1 h). Durante el bloqueo ni la contraseña correcta entra (429 `account_locked`). Un inicio correcto reinicia el contador; **Usuarios → Desbloquear** o `manage_users.py unlock`.
 - **Usuarios inexistentes**: mismo bloqueo en memoria (el 429 no revela si el usuario existe) y la contraseña se verifica contra un hash argon2id de referencia (tiempo de respuesta similar; misma respuesta 401 `invalid_credentials`).
 - **Por IP**: `ip_max_failures` (30) fallos (de cualquier usuario: cubre el "rociado" de contraseñas) en `ip_window_seconds` (15 min) → 429, **solo si la IP del usuario es conocida y no compartida**. Con IP desconocida, loopback o la de un proxy de confianza (el panel sin clave), **no** hay límite por IP y queda solo el bloqueo por usuario: los fallos de un atacante nunca bloquean a todos los usuarios.
-- **Cómo se conoce la IP** (despliegue): `X-Forwarded-For` **nunca** se usa en el backend (uvicorn arranca con `proxy_headers = false`; `[server] proxy_headers`/`forwarded_allow_ips` solo si hay un proxy inverso de confianza delante del backend). El servidor del panel envía `x-nexus-client-ip` + `x-nexus-proxy-key`; el backend lo acepta solo si la petición viene de `[auth] trusted_proxies` **y** la clave coincide con `[auth] panel_proxy_key` (= `DWH_PANEL_PROXY_KEY` del panel; también `NEXUS_PANEL_PROXY_KEY`). El panel obtiene la IP del navegador solo de fuentes de confianza: `DWH_CLIENT_IP_HEADER` (p. ej. `x-real-ip` que su nginx **sobrescribe** con `$remote_addr`) o `DWH_TRUSTED_PROXY_HOPS = N` (N proxies que **agregan** a `X-Forwarded-For`: se toma el N-ésimo desde el final), nunca el primer valor de `X-Forwarded-For`. Sin configurar (defecto) la IP es desconocida: Next como servidor propio no expone la IP del socket cuando el cliente ya manda `X-Forwarded-For`. Recomendado en producción: nginx con HTTPS delante del panel, `proxy_set_header X-Real-IP $remote_addr;`, `DWH_CLIENT_IP_HEADER=x-real-ip` y la clave compartida.
+- **Cómo se conoce la IP** (despliegue): `X-Forwarded-For` **nunca** se usa en el backend (uvicorn arranca con `proxy_headers = false`; `[server] proxy_headers`/`forwarded_allow_ips` solo si hay un proxy inverso de confianza delante del backend). El servidor del panel envía `x-nexus-client-ip` + `x-nexus-proxy-key`; el backend lo acepta solo si la petición viene de `[auth] trusted_proxies` (direcciones o redes CIDR) **y** la clave coincide con `[auth] panel_proxy_key` (= `DWH_PANEL_PROXY_KEY` del panel; también `NEXUS_PANEL_PROXY_KEY`). El panel obtiene la IP del navegador solo de fuentes de confianza: `DWH_CLIENT_IP_HEADER` (p. ej. `x-real-ip` que su nginx **sobrescribe** con `$remote_addr`) o `DWH_TRUSTED_PROXY_HOPS = N` (N proxies que **agregan** a `X-Forwarded-For`: se toma el N-ésimo desde el final), nunca el primer valor de `X-Forwarded-For`. Sin configurar (defecto) la IP es desconocida: Next como servidor propio no expone la IP del socket cuando el cliente ya manda `X-Forwarded-For`. Recomendado en producción: nginx con HTTPS delante del panel, `proxy_set_header X-Real-IP $remote_addr;`, `DWH_CLIENT_IP_HEADER=x-real-ip` y la clave compartida.
 - Límites en memoria: por proceso (con varias réplicas, el límite es por réplica); el bloqueo por usuario es en BD (compartido).
 
 ### 20.4. Permisos, roles y alcance por grupo
@@ -1537,3 +1538,149 @@ Qué comprueba el agente (**solo lectura**: sesión `default_transaction_read_on
 - SSL/TLS para los **orígenes** (SQL Server usa `TrustServerCertificate=yes` como antes).
 - Separar credenciales de inventario por propósito (sigue §19.1).
 - Canal residual en `error_code` de la prueba de conexión: un agente comprometido podría enviar un dato transformado (mayúsculas, `_`) que pase el formato; el agente ya posee esas credenciales, así que el riesgo es bajo (cerrarlo exigiría una lista cerrada de códigos).
+
+---
+
+## 23. Despliegue en Coolify (contenedores)
+
+Backend (`dwh_back`) y panel (`dwh_front`) como **dos aplicaciones** de Coolify construidas desde el repositorio público `JcLimonero/Nexus_DWH` (rama `main`). PostgreSQL 16 corre en el **host** del VPS (BD `NexusDWH`); los agentes de las sedes hablan con el backend por HTTPS y el panel habla con el backend por la **red interna** de Docker.
+
+```
+Navegador ──HTTPS──► Traefik (Coolify) ──► panel :3000 ──http interno──► backend :8000 ──► PostgreSQL (host.docker.internal:5432, NexusDWH)
+Agentes   ──HTTPS──► Traefik (Coolify) ──────────────────────────────────► backend :8000
+```
+
+**Regla de secretos:** ningún secreto va en la imagen ni en el repositorio. Todo se define como **variable de entorno en Coolify** (las marcadas SECRETO las escribe una persona; en Coolify desmarque *Build Variable* para ellas). Las imágenes no copian `config.ini`, `.env*` ni pruebas (`.dockerignore`).
+
+### 23.1. Configuración del backend por variables (`NEXUS__<SECCION>__<CLAVE>`)
+
+`nexus_config.py` (lo usan `main_postgres.py`, `migrate.py` y `manage_users.py`):
+
+- `config.ini` es **opcional** (`NEXUS_CONFIG_FILE` o `dwh_back/config.ini`). Sin archivo se usan los valores por defecto del código.
+- Cada variable `NEXUS__<SECCION>__<CLAVE>` **define o sobrescribe** `[seccion] clave` de `config_postgres.ini.example` (sección y clave sin distinguir mayúsculas; separador: doble guion bajo; la clave puede llevar guiones bajos simples). Ejemplos: `NEXUS__DATABASE__PASSWORD`, `NEXUS__DATABASE__POOL_MAX`, `NEXUS__AUTH__TRUSTED_PROXIES`, `NEXUS__CONNECTION_TEST__ENABLED`.
+- Una variable **vacía se ignora** (no borra el valor del archivo ni rompe un entero). Nombres mal formados se ignoran con un aviso.
+- Al arrancar se registran **solo los nombres** (`database.password, auth.panel_proxy_key, …`), nunca los valores.
+- Siguen funcionando las variables específicas anteriores: `NEXUS_CONFIG_SECRET_KEY` (clave Fernet), `NEXUS_PANEL_PROXY_KEY`, `NEXUS_ADMIN_TOKEN`, `NEXUS_CORS_ORIGINS`, `NEXUS_CONFIG_FILE` (se usan cuando la clave no tiene valor en el archivo ni en `NEXUS__…`).
+- Nuevo en `[database]`: `sslmode` (`disable|allow|prefer|require|verify-ca|verify-full`; vacío = defecto de libpq) y `sslrootcert`, también para `migrate.py` y `manage_users.py`.
+- `[auth] trusted_proxies` y `[server] forwarded_allow_ips` admiten **redes CIDR** (las IP de los contenedores cambian en cada despliegue).
+
+### 23.2. Aplicaciones en Coolify
+
+**Opción recomendada (VPS stage): una sola aplicación Docker Compose** con el `docker-compose.yml` de la raíz: servicios `backend` (8000) y `frontend` (3000) en la misma red interna (el panel usa `DWH_API_URL=http://backend:8000`), `host.docker.internal` ya mapeado (`extra_hosts`) y migraciones al arrancar (`NEXUS_RUN_MIGRATIONS=true`). En Coolify: *+ New → Docker Compose*, repo `JcLimonero/Nexus_DWH`, rama `main`, ubicación `/docker-compose.yml`; dominios por servicio (`frontend` → panel, `backend` → API de agentes). Variables de la aplicación: `DB_USER`, `DB_PASSWORD` (secreto), `DB_NAME` (defecto `NexusDWH`), `NEXUS_CONFIG_SECRET_KEY` (secreto), `NEXUS_PANEL_PROXY_KEY` (secreto, compartida por ambos servicios), `DWH_PUBLIC_ORIGIN` (URL HTTPS del panel); opcionales `NEXUS_TRUSTED_PROXIES` / `NEXUS_FORWARDED_ALLOW_IPS` (defecto `10.0.0.0/16`, redes Docker locales del VPS; acótelas a la subred de la aplicación si es posible) y `NEXUS_AGENT_LATEST_VERSION`.
+
+**Alternativa: dos aplicaciones Dockerfile**:
+
+| | Backend | Panel |
+|---|---|---|
+| Origen | GitHub público `JcLimonero/Nexus_DWH`, rama `main` | igual |
+| Build pack | **Dockerfile** | **Dockerfile** |
+| Base directory | `/dwh_back` | `/dwh_front` |
+| Dockerfile | `/Dockerfile` (dentro de la base) | `/Dockerfile` |
+| Puerto expuesto (*Ports Exposes*) | `8000` | `3000` |
+| Dominio (ejemplo) | `https://dwh-api.midominio.com` (público: lo usan los agentes) | `https://dwh-panel.midominio.com` |
+| Health check | `GET /health` → 200 (`HEALTHCHECK` de la imagen) | `GET /login` → 200 (`HEALTHCHECK` de la imagen) |
+| Usuario del proceso | `nexus` (uid 10001), sin privilegios | `nexus` (uid 10001) |
+
+- Imágenes: backend `python:3.12-slim` con solo `requirements_postgres.txt`, `CMD python main_postgres.py --host 0.0.0.0 --port 8000`; panel multi-etapa `node:22-alpine` + pnpm (corepack) con `output: "standalone"` (`node server.js`, `PORT=3000`, `HOSTNAME=0.0.0.0`).
+- Health checks: basta el `HEALTHCHECK` de cada Dockerfile; si se activa el de Coolify, use las mismas rutas y puertos (`/health`:8000, `/login`:3000). El `/health` del backend no consulta la BD.
+- **Red interna panel → backend**: ambas aplicaciones quedan en la red Docker de Coolify (`coolify` por defecto). Dé al backend un nombre estable en esa red (en Coolify: *Network Aliases* / alias de red del backend, p. ej. `nexus-dwh-back`; según la versión, también sirve el nombre de contenedor con *Consistent Container Names*) y use `DWH_API_URL=http://nexus-dwh-back:8000`. Compruebe desde la terminal del panel: `wget -qO- http://nexus-dwh-back:8000/health`. (Usar la URL pública del backend también funciona, pero la petición sale y vuelve por Traefik y el backend ve la IP pública del VPS: habría que agregar esa IP a `trusted_proxies`; se prefiere la red interna.)
+- **PostgreSQL en el host**: `NEXUS__DATABASE__HOST=host.docker.internal`. Compruebe desde la terminal del backend `getent hosts host.docker.internal`; si no resuelve (Linux), agregue en *Custom Docker Options* del backend `--add-host=host.docker.internal:host-gateway`. En el host: `listen_addresses` debe incluir la IP del puente Docker (o `*` con firewall que **no** exponga 5432 a Internet) y `pg_hba.conf` debe permitir la red de Docker (p. ej. `host NexusDWH nexus_app 10.0.0.0/8 scram-sha-256` y/o `172.16.0.0/12`). Use un rol propio (p. ej. `nexus_app`) **dueño** de `NexusDWH` (las migraciones crean tablas), no `postgres`.
+
+### 23.3. Variables del backend
+
+| Variable | Uso | Ejemplo (no secreto) | |
+|---|---|---|---|
+| `NEXUS__DATABASE__HOST` | Host de PostgreSQL | `host.docker.internal` | |
+| `NEXUS__DATABASE__PORT` | Puerto | `5432` | |
+| `NEXUS__DATABASE__DB` | Base de configuración | `NexusDWH` | |
+| `NEXUS__DATABASE__USER` | Rol de la app | `nexus_app` | |
+| `NEXUS__DATABASE__PASSWORD` | Contraseña del rol | — | **SECRETO** |
+| `NEXUS__DATABASE__SSLMODE` | TLS a PostgreSQL (opcional; en el mismo host basta vacío/`prefer`) | `prefer` | |
+| `NEXUS__DATABASE__POOL_MIN` / `POOL_MAX` | Pool (§20.9) | `5` / `20` | |
+| `NEXUS__DATABASE__AUTO_MIGRATE` | Migrar al arrancar dentro del proceso (alternativa a `NEXUS_RUN_MIGRATIONS`) | `false` | |
+| `NEXUS_CONFIG_SECRET_KEY` | Clave Fernet para descifrar los `ENC:` de la BD (§5) | — | **SECRETO** |
+| `NEXUS__AUTH__PANEL_PROXY_KEY` (o `NEXUS_PANEL_PROXY_KEY`) | Clave compartida con el panel (= `DWH_PANEL_PROXY_KEY`) | — | **SECRETO** |
+| `NEXUS__AUTH__TRUSTED_PROXIES` | Desde dónde se acepta `x-nexus-client-ip` + clave (red Docker del panel). Ideal: la subred de la red `coolify` (`docker network inspect coolify`, p. ej. `10.0.1.0/24`) | `10.0.0.0/8,172.16.0.0/12` | |
+| `NEXUS__SERVER__PROXY_HEADERS` | Usar `X-Forwarded-For` de Traefik para la IP real de los **agentes** (límites de enrolamiento/credenciales por IP, §20.10). Sin esto todos los agentes comparten la IP de Traefik | `true` | |
+| `NEXUS__SERVER__FORWARDED_ALLOW_IPS` | Solo de estas IP/redes se acepta ese `X-Forwarded-For` (la red de Traefik; uvicorn toma la primera IP no confiable desde la derecha, así que un valor falso del cliente no sirve) | `10.0.0.0/8,172.16.0.0/12` | |
+| `NEXUS__ADMIN__ALLOW_STATIC_TOKEN` | Token estático break-glass (§20.6). **Defecto `false`**; no lo defina | `false` | |
+| `NEXUS__MONITOR__TOKEN` | Solo si se usa el monitor legado `dwh_api` (`/monitor/*`) | — | SECRETO, opcional |
+| `NEXUS__AGENT__LATEST_VERSION` | Última versión publicada del agente (§21.6) | `5.3.0` | |
+| `NEXUS__AGENT__LEGACY_ENDPOINTS` | `false` cuando no queden agentes v3/v4 | `true` | |
+| `NEXUS__CORS__ORIGINS` (o `NEXUS_CORS_ORIGINS`) | Normalmente vacío (el panel no necesita CORS) | — | |
+| `NEXUS__HEALTH__*`, `NEXUS__NOTIFICATIONS__*`, `NEXUS__INVENTORY__*`, `NEXUS__CONNECTION_TEST__*`, `NEXUS__SERVER__MAX_BODY_BYTES`, … | Cualquier otra clave de `config_postgres.ini.example` | `NEXUS__NOTIFICATIONS__ALLOW_HTTP=false` | |
+| `NEXUS_RUN_MIGRATIONS` | `true` = el contenedor ejecuta `python migrate.py` antes de arrancar (si falla, no arranca) | `false` | |
+
+Con proxy headers activos, las peticiones internas del panel (que no envían `X-Forwarded-For`) conservan la IP del contenedor del panel, así que `trusted_proxies` + clave siguen funcionando.
+
+### 23.4. Variables del panel
+
+| Variable | Uso | Ejemplo (no secreto) | |
+|---|---|---|---|
+| `DWH_API_URL` | Backend por la red interna | `http://nexus-dwh-back:8000` | |
+| `DWH_PANEL_PROXY_KEY` | = `NEXUS__AUTH__PANEL_PROXY_KEY` del backend | — | **SECRETO** |
+| `DWH_PUBLIC_ORIGIN` | Origen público para la verificación CSRF | `https://dwh-panel.midominio.com` | |
+| `DWH_COOKIE_SECURE` | Cookie `Secure` (HTTPS) | `true` | |
+| `DWH_TRUSTED_PROXY_HOPS` | IP del navegador: último valor de `X-Forwarded-For` que agrega Traefik (**recomendado**, ver abajo) | `1` | |
+| `DWH_CLIENT_IP_HEADER` | Alternativa: `x-real-ip` (no defina ambas; si está, tiene prioridad) | — | |
+| `NEXT_PUBLIC_DWH_TIMEZONE` | Opcional, **de construcción** (*Build Variable*), pública; vacío = `America/Mexico_City` | — | |
+
+Las variables `DWH_*` son solo de servidor y se leen **en tiempo de ejecución** (no se incrustan en el build; verificado en `.next/server`): cambiarlas solo requiere reiniciar, no reconstruir. El panel ya no usa `DWH_MONITOR_TOKEN`.
+
+**IP del navegador detrás de Traefik** (límite de login por IP, §20.3; verificado con Traefik v3 local): Traefik, con su configuración por defecto, **borra** los `X-Forwarded-For`/`X-Real-Ip` que manda el cliente y los reescribe con la IP del socket, así que tanto `DWH_CLIENT_IP_HEADER=x-real-ip` como `DWH_TRUSTED_PROXY_HOPS=1` dan la IP real. Pero si el Traefik del servidor tiene `forwardedHeaders.insecure=true` (o `trustedIPs` amplios), **conserva** el `X-Real-Ip` del cliente (falsificable) mientras que a `X-Forwarded-For` solo **agrega** la IP real al final: `DWH_TRUSTED_PROXY_HOPS=1` sigue siendo correcto en ambos casos, por eso es la opción recomendada. Si hay otro proxy delante de Traefik (p. ej. Cloudflare en modo proxy), súmelo: `DWH_TRUSTED_PROXY_HOPS=2`. Comprobación tras desplegar: intente iniciar sesión con un usuario inexistente enviando `curl -H 'X-Real-Ip: 1.2.3.4' -H 'X-Forwarded-For: 1.2.3.4' -H 'x-nexus-csrf: 1' -H 'Origin: https://dwh-panel.midominio.com' -H 'content-type: application/json' -d '{"username":"prueba_ip","password":"xxxxxxxxxxxxxx"}' https://dwh-panel.midominio.com/api/auth/login` y confirme en **Auditoría** que la IP del intento es la suya y no `1.2.3.4`.
+
+### 23.5. Generar los secretos (en su equipo, nunca en el repo)
+
+```
+# Clave Fernet (NEXUS_CONFIG_SECRET_KEY). Si ya hay valores ENC: en la BD, use la clave EXISTENTE.
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Clave compartida panel↔backend (la misma en NEXUS__AUTH__PANEL_PROXY_KEY y DWH_PANEL_PROXY_KEY)
+openssl rand -base64 48 | tr -d '\n=+/' ; echo
+# Contraseña del rol de PostgreSQL
+openssl rand -base64 32 | tr -d '\n=+/' ; echo
+# (Opcional) token del monitor legado
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Guárdelos en el gestor de secretos del equipo y péguelos en Coolify (*Environment Variables*, sin *Build Variable*). Distintos por entorno (stage/producción).
+
+### 23.6. Migraciones
+
+- **Recomendado** (control explícito): tras el primer despliegue y en cada versión que traiga migraciones, abra la **Terminal** del backend en Coolify y ejecute `python migrate.py` (o `python migrate.py --status` para ver pendientes). El backend avisa en el log si hay migraciones pendientes.
+- **Automático**: `NEXUS_RUN_MIGRATIONS=true` en el backend → el contenedor ejecuta `migrate.py` antes de arrancar (advisory lock: seguro con varias réplicas; si falla, el contenedor no arranca y Coolify conserva la versión anterior). Alternativa dentro del proceso: `NEXUS__DATABASE__AUTO_MIGRATE=true`.
+- BD nueva: `migrate.py` aplica la línea base (`schema_postgres.sql`) y todas las migraciones.
+
+### 23.7. Primer superadministrador
+
+En la **Terminal** del backend (Coolify → aplicación → *Terminal*; o `docker exec -it <contenedor> sh`):
+
+```
+python migrate.py
+python manage_users.py create-superadmin --username jlimon      # pide la contraseña dos veces
+python manage_users.py list
+```
+
+Usa las mismas variables `NEXUS__DATABASE__*` del contenedor (no hace falta `config.ini`). Si la terminal no es interactiva: `NEXUS_NEW_USER_PASSWORD=... python manage_users.py create-superadmin --username X --password-env NEXUS_NEW_USER_PASSWORD` (evite dejar la contraseña en el historial). Por defecto obliga a cambiar la contraseña en el primer inicio.
+
+### 23.8. Actualizaciones y agentes
+
+- Active *Auto Deploy* (webhook de GitHub) en ambas aplicaciones: cada push a `main` reconstruye y redespliega. Coolify espera a que el contenedor nuevo esté *healthy* antes de retirar el anterior.
+- Tras un despliegue con migraciones nuevas: `python migrate.py` (o `NEXUS_RUN_MIGRATIONS=true`).
+- Cambiar solo variables: *Restart* (no hace falta reconstruir), salvo `NEXT_PUBLIC_DWH_TIMEZONE` (requiere *Redeploy*).
+- Agentes de las sedes: `[server] api_url = https://dwh-api.midominio.com` (la URL HTTPS pública del backend) con `mode = production` (§13, §17). El panel no se expone a los agentes.
+- Comprobaciones: `curl https://dwh-api.midominio.com/health` → `{"status":"ok"}`; `https://dwh-panel.midominio.com/login` carga; en el log del backend aparece `Configuración desde variables de entorno: …` (solo nombres).
+
+### 23.9. Prueba local de las imágenes
+
+```
+docker build -t nexus-dwh-back dwh_back && docker build -t nexus-dwh-front dwh_front
+docker network create nexus-net
+docker run -d --name back --network nexus-net -p 127.0.0.1:18000:8000 \
+  -e NEXUS__DATABASE__HOST=host.docker.internal -e NEXUS__DATABASE__PORT=5546 \
+  -e NEXUS__DATABASE__DB=mgd_dwh_config -e NEXUS__DATABASE__USER=postgres -e NEXUS__DATABASE__PASSWORD=devpass \
+  -e NEXUS__AUTH__TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12 -e NEXUS__AUTH__PANEL_PROXY_KEY=clave-local nexus-dwh-back
+docker run -d --name front --network nexus-net -p 127.0.0.1:13000:3000 -e DWH_API_URL=http://back:8000 \
+  -e DWH_PANEL_PROXY_KEY=clave-local -e DWH_COOKIE_SECURE=false -e DWH_PUBLIC_ORIGIN=http://127.0.0.1:13000 nexus-dwh-front
+```
+
+(Solo desarrollo: `devpass` es la contraseña del contenedor local de §16.4.) Pruebas: `dwh_back/tests/test_env_config.py` (variables `NEXUS__*`, vacías/mal formadas, sin valores en el resumen, `allow_static_token` falso por defecto, `trusted_proxies` CIDR, `migrate.py`/`manage_users.py` solo con variables).

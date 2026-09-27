@@ -1,11 +1,20 @@
+; Configuración del backend PostgreSQL (main_postgres.py, migrate.py, manage_users.py).
+; Copia este archivo como config.ini y ajusta los valores. El archivo es OPCIONAL: cualquier
+; valor se puede definir (o sobrescribir) con variables de entorno NEXUS__<SECCION>__<CLAVE>,
+; p. ej. NEXUS__DATABASE__PASSWORD o NEXUS__AUTH__TRUSTED_PROXIES (contenedores/Coolify:
+; DWH_README.md §23). Una variable vacía se ignora.
+
 [database]
 ; Conexión a la BD de configuración (PostgreSQL).
-; Copia este archivo como config.ini y ajusta los valores.
 host = 127.0.0.1
 port = 5432
 db = mgd_dwh_config
 user = postgres
 password = TU_PASSWORD_AQUI
+; TLS hacia PostgreSQL (libpq): disable | allow | prefer | require | verify-ca | verify-full.
+; Vacío = defecto de libpq (prefer). sslrootcert = ruta del CA para verify-ca/verify-full.
+; sslmode =
+; sslrootcert =
 ; Aplicar migraciones pendientes al arrancar (defecto false: usar migrate.py).
 ; auto_migrate = false
 ; Pool de conexiones del backend (db_pool.py). Si todas están ocupadas se espera
@@ -55,6 +64,7 @@ password = TU_PASSWORD_AQUI
 ; trusted_proxies Y la clave coincide con panel_proxy_key (= DWH_PANEL_PROXY_KEY del panel;
 ; también NEXUS_PANEL_PROXY_KEY). Sin clave o IP desconocida: sin límite por IP (solo bloqueo
 ; por usuario). Genera la clave: python -c "import secrets; print(secrets.token_urlsafe(32))"
+; trusted_proxies admite direcciones o redes CIDR (contenedores: 10.0.0.0/8,172.16.0.0/12).
 ; trusted_proxies = 127.0.0.1,::1
 ; panel_proxy_key =
 
@@ -98,6 +108,7 @@ password = TU_PASSWORD_AQUI
 ; se usa la IP del socket. Actívelo SOLO si hay un proxy de confianza delante y limite
 ; forwarded_allow_ips a su dirección.
 ; proxy_headers = false
+; forwarded_allow_ips admite direcciones o redes CIDR (p. ej. la red Docker del proxy inverso).
 ; forwarded_allow_ips = 127.0.0.1
 ; Límites de tamaño del cuerpo de las peticiones (bytes); se responde 413.
 ; max_body_bytes = 1048576
