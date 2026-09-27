@@ -15,7 +15,8 @@ def env():
     if not support.docker_available():
         pytest.skip("Docker no disponible")
     support.recreate_config_db(DBNAME)
-    b = support.Backend(DBNAME)
+    # latest_version: la API de instalaciones marca "outdated" a las versiones menores (fase 5).
+    b = support.Backend(DBNAME, extra_ini={"agent": {"latest_version": "5.2.0"}})
     b.start()
     try:
         ids = support.seed_config(b)

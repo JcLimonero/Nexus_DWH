@@ -391,6 +391,29 @@ def test_heartbeat_y_monitor(env, db):
     assert "last_ip" not in inst
 
 
+def test_version_publicada_marca_instalaciones_desactualizadas(env):
+    """[agent] latest_version = 5.2.0 (conftest): versión menor → outdated; igual/mayor → current;
+    no numérica (agentes de prueba/legados) → unknown. Es solo informativo (no bloquea al agente)."""
+    import agent_postgres
+
+    assert agent_postgres.agent_version_status("5.1.9", "5.2.0") == "outdated"
+    assert agent_postgres.agent_version_status("5.2", "5.2.0") == "current"
+    assert agent_postgres.agent_version_status("5.10.0", "5.2.0") == "current"
+    assert agent_postgres.agent_version_status("test", "5.2.0") == "unknown"
+    assert agent_postgres.agent_version_status("5.1.0", "") == "unknown"
+    b, ids = env["backend"], env["ids"]
+    status = {}
+    for name, ver in (("ver-vieja", "5.1.0"), ("ver-actual", "5.2.0")):
+        iid, sec = enroll(b, "x-agency-token", ids["agency_a1"]["agency_token"], name=name)
+        assert requests.post(b.url + "/agent/heartbeat", headers=H(iid, sec),
+                             json={"client_version": ver}, timeout=10).status_code == 200
+        status[iid] = ver
+    rows = {i["id"]: i for i in b.admin("GET", "/admin/installations", expect=200)["items"]}
+    for iid, ver in status.items():
+        assert rows[iid]["latest_version"] == "5.2.0"
+        assert rows[iid]["version_status"] == ("outdated" if ver == "5.1.0" else "current")
+
+
 def test_eventos_de_agente_dedup(env):
     b, ids = env["backend"], env["ids"]
     iid, sec = enroll(b, "x-group-token", ids["group_a"]["group_token"], name="eventos")

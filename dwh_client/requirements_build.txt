@@ -1,0 +1,5 @@
+# Compilación del agente con Nuitka (packaging/build_agent.ps1 / build_agent.sh).
+# En Windows se necesita además Visual Studio Build Tools (MSVC 14.3+, "Desktop development with C++").
+-r requirements_postgres.txt
+Nuitka==4.2.2
+ordered-set==4.1.0

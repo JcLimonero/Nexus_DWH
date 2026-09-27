@@ -9,6 +9,8 @@ Sistema de Data Warehouse para Nexus. Incluye:
 
 Esquema de la BD de configuración (PostgreSQL): `dwh_back/schema_postgres.sql`. Guía completa: [DWH_README.md](DWH_README.md) (el panel web está en la sección 16).
 
+Agente PostgreSQL v5 en producción: compilado con Nuitka (`NexusAgent.exe`, sin fuentes), instalado como servicio de Windows de mínimo privilegio y con actualizaciones validadas — ver [DWH_README.md §21](DWH_README.md). Resumen de entrega del endurecimiento (fases 1–5), variables, migraciones, pruebas, pendientes y límites: [ENTREGA_ENDURECIMIENTO.md](ENTREGA_ENDURECIMIENTO.md).
+
 ## Configuración
 
 Copia `config.ini.example` como `config.ini` en cada carpeta y ajusta las credenciales.

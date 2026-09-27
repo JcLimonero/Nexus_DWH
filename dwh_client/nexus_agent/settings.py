@@ -97,6 +97,32 @@ class Settings:
             return "company", self.company_token
         return "", ""
 
+    @property
+    def enrollment_file(self) -> str:
+        """Token de enrolamiento de UN solo uso (lo deja el instalador del servicio; ver §21.3)."""
+        return os.path.join(self.data_dir, ENROLLMENT_FILE_NAME)
+
+
+ENROLLMENT_FILE_NAME = "enrollment_token.ini"
+
+
+def read_enrollment_file(path: str) -> tuple:
+    """
+    Lee ``<data_dir>/enrollment_token.ini`` (sección [nexus], mismas claves que
+    config.ini: group_token / agency_token / token). Devuelve (tipo, token) o
+    ('', ''). El agente lo borra en cuanto guarda su credencial de instalación.
+    """
+    if not path or not os.path.isfile(path):
+        return "", ""
+    ini = configparser.ConfigParser()
+    try:
+        ini.read(path, encoding="utf-8-sig")
+    except configparser.Error:
+        raise ConfigError(f"{ENROLLMENT_FILE_NAME} no tiene formato INI válido.")
+    tmp = Settings(group_token=_get(ini, "nexus", "group_token"), agency_token=_get(ini, "nexus", "agency_token"),
+                   company_token=_get(ini, "nexus", "token"))
+    return tmp.enrollment_token()
+
 
 def _get(ini: configparser.ConfigParser, section: str, key: str, default: str = "") -> str:
     return ini.get(section, key, fallback=default).strip()
@@ -141,7 +167,14 @@ def load_settings(config_path: Optional[str] = None, data_dir: Optional[str] = N
     if not os.path.exists(path):
         raise ConfigError(f"No se encontró config.ini en: {path}")
     ini = configparser.ConfigParser()
-    ini.read(path, encoding="utf-8")
+    try:
+        ini.read(path, encoding="utf-8-sig")
+    except configparser.Error as exc:
+        # Secciones/opciones duplicadas, encabezado faltante, etc.: es un error de
+        # configuración (código 2), no una caída que dispare reinicios.
+        raise ConfigError(f"config.ini no tiene formato INI válido ({type(exc).__name__}).")
+    except UnicodeDecodeError:
+        raise ConfigError("config.ini no está en UTF-8.")
     base_dir = os.path.dirname(os.path.abspath(path))
 
     s = Settings(config_path=path)

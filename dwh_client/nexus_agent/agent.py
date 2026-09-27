@@ -48,7 +48,7 @@ from .etl import RunContext, TaskResult, parse_watermark, register_task_secrets,
 from .localstate import LocalState, OutboxItem
 from .logsetup import get_logger
 from .sanitize import SECRETS, Cancelled, ConfigError, StageError, sanitize_error
-from .settings import Settings
+from .settings import Settings, read_enrollment_file
 
 log = get_logger()
 
@@ -140,12 +140,24 @@ class Agent:
             SECRETS.add(cred.secret)
             self.holder.set(cred)
             log.info("Instalación %s (credencial local cargada).", cred.installation_id)
+            if os.path.exists(self.settings.enrollment_file):
+                # Quedó de un enrolamiento anterior (p. ej. no se pudo borrar): ya no se necesita.
+                self._discard_enrollment_file()
+                log.warning("Había un token de enrolamiento de un solo uso sin consumir con credencial ya "
+                            "existente: se borró (no se usa).")
             return cred
 
         kind, token = self.settings.enrollment_token()
+        from_file = False
+        if not token:
+            # Token de un solo uso dejado por el instalador del servicio en la carpeta de datos
+            # (así el enrolamiento lo hace la cuenta del servicio y DPAPI queda ligado a ella).
+            kind, token = read_enrollment_file(self.settings.enrollment_file)
+            from_file = bool(token)
         if not token:
             raise FatalAgentError(EXIT_CONFIG, "No hay credencial de instalación ni token de enrolamiento "
-                                               "([nexus] group_token / agency_token / token).")
+                                               "([nexus] group_token / agency_token / token o "
+                                               "<data_dir>/enrollment_token.ini).")
         SECRETS.add(token)
         attempt = 0
         while True:
@@ -160,6 +172,17 @@ class Agent:
                 if self.stop_event.wait(delay):
                     raise FatalAgentError(EXIT_OK, "Detenido antes de enrolar.")
             except (ApiAuthError, ApiForbidden, ApiRejected) as exc:
+                if from_file:
+                    # No se conserva el token rechazado en claro: se borra y queda solo una marca sin
+                    # secretos (fecha y código) para el operador y set_enrollment_token.ps1.
+                    self._discard_enrollment_file()
+                    try:
+                        with open(self.settings.enrollment_file + ".rechazado", "w", encoding="utf-8") as fh:
+                            fh.write(f"{iso_utc(utcnow())} {exc.code}\n")
+                    except OSError:
+                        pass
+                    log.error("Nexus rechazó el token de enrolamiento de un solo uso (%s); se borró. "
+                              "Genere un token nuevo en el panel y re-enrole (set_enrollment_token.ps1).", exc.code)
                 raise FatalAgentError(EXIT_AUTH, f"Enrolamiento rechazado ({exc.code}): {exc.message}")
         cred = InstallationCredential(
             installation_id=str(data["installation_id"]), secret=str(data["secret"]),
@@ -168,12 +191,38 @@ class Agent:
         SECRETS.add(cred.secret)
         self.store.save(cred)
         self.holder.set(cred)
-        log.warning(
-            "Instalación enrolada: %s (alcance %s). Recomendación: elimine token/group_token/agency_token "
-            "de config.ini; ya no se usan para operar.", cred.installation_id,
-            (data.get("scope") or {}).get("type", "?"),
-        )
+        scope_type = (data.get("scope") or {}).get("type", "?")
+        if from_file:
+            self._discard_enrollment_file()
+            log.warning("Instalación enrolada: %s (alcance %s). Token de un solo uso consumido y borrado de la "
+                        "carpeta de datos.", cred.installation_id, scope_type)
+        else:
+            log.warning(
+                "Instalación enrolada: %s (alcance %s). Recomendación: elimine token/group_token/agency_token "
+                "de config.ini; ya no se usan para operar.", cred.installation_id, scope_type,
+            )
         return cred
+
+    def _discard_enrollment_file(self) -> None:
+        """Sobrescribe y borra el token de un solo uso (mejor esfuerzo; en SSD no hay borrado físico)."""
+        path = self.settings.enrollment_file
+        for attempt in range(3):
+            try:
+                if not os.path.exists(path):
+                    return
+                size = os.path.getsize(path)
+                with open(path, "r+b") as fh:
+                    fh.write(b"\0" * size)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.unlink(path)
+                return
+            except OSError as exc:
+                if attempt == 2:
+                    log.error("No se pudo borrar %s (%s): bórrelo a mano.", os.path.basename(path),
+                              type(exc).__name__)
+                else:
+                    time.sleep(0.5)
 
     def rotate_credential(self) -> bool:
         try:

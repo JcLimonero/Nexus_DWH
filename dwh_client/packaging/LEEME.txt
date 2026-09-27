@@ -1,0 +1,42 @@
+Nexus DWH Agent — paquete compilado
+===================================
+
+Contenido
+  NexusAgent.exe        agente compilado con Nuitka (sin código fuente)
+  *.dll / *.pyd         bibliotecas de los drivers y de Python
+  config.example.ini    plantilla de configuración SIN valores (copiar como config.ini)
+  scripts\              instalación del servicio, actualización y token de enrolamiento
+  release.json          manifiesto: versión y SHA-256 de cada archivo
+  release.json.sig      firma Ed25519 del manifiesto (si el paquete está firmado)
+
+Comprobación rápida
+  NexusAgent.exe --version
+  NexusAgent.exe --selftest          (drivers, TLS y SQLite; no abre red ni BD)
+
+Antes de empezar
+  Descomprima el paquete en una carpeta accesible SOLO para Administradores (no C:\Temp), p. ej.:
+    mkdir C:\NexusAgentPkg
+    icacls C:\NexusAgentPkg /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F
+  (los scripts además copian y validan en su propia carpeta protegida).
+
+Instalación como servicio (PowerShell como administrador, en la carpeta del paquete)
+  .\scripts\install_service.ps1 -PackageDir . -ApiUrl https://nexus.midominio.com -TokenType agency
+  (pide el token de enrolamiento sin mostrarlo; el servicio se enrola solo y lo borra)
+
+Actualización (PowerShell como administrador)
+  Use SIEMPRE el script de la versión INSTALADA, nunca el que trae el paquete nuevo:
+  & "C:\Program Files\NexusAgent\scripts\update_agent.ps1" -PackageDir C:\NexusAgentPkg\NexusAgent
+  (valida con el agente instalado firma del manifiesto, versión, SHA-256 y Authenticode antes de
+   cambiar nada; conserva la versión anterior y la restaura si el servicio no arranca)
+
+Requisitos de la máquina
+  - Windows Server 2016+ / Windows 10+ de 64 bits.
+  - Driver ODBC del origen (p. ej. "ODBC Driver 17/18 for SQL Server", Pervasive, Firebird ODBC)
+    y, para Firebird sin DSN, el cliente Firebird (fbclient.dll).
+  - Salida HTTPS hacia Nexus y acceso de red al origen y al DWH. No abre puertos de entrada.
+
+Documentación completa: DWH_README.md, sección 21 (y ENTREGA_ENDURECIMIENTO.md).
+
+Límites (léase): la compilación dificulta leer el programa pero NO impide extraer de la
+memoria del proceso las consultas o credenciales que recibe de Nexus, ni capturar las
+consultas en el motor de base de datos. Un administrador de esta máquina puede hacerlo.

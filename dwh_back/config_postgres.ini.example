@@ -88,6 +88,10 @@ password = TU_PASSWORD_AQUI
 ; credenciales de instalación inválidas por IP dentro de la ventana
 ; auth_fail_limit = 30
 ; auth_fail_window_seconds = 300
+; Última versión PUBLICADA del agente (p. ej. 5.2.0). Solo informativo: el panel marca
+; "Desactualizada" a las instalaciones que reportan una versión menor. Vacío = sin comparación.
+; La actualización la hace el operador con update_agent.ps1 (el agente no se auto-actualiza).
+; latest_version =
 
 [server]
 ; X-Forwarded-For en el backend (IP real de agentes detrás de un proxy inverso). Defecto false:

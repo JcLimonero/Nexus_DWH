@@ -24,7 +24,6 @@ from nexus_agent.logsetup import setup_logging
 from nexus_agent.settings import load_settings
 
 DBNAME = "nexus_test_cfg_client_health"
-CLIENT_PY = os.path.join(support.CLIENT_DIR, ".venv", "bin", "python")
 DISCONNECT = 10
 
 
@@ -240,7 +239,7 @@ def test_04_agente_muerto_nexus_detecta_desconexion_y_latido_no_cierra_errores(e
     b.admin("POST", f"/admin/tasks/{tid_bad}/enable", expect=200)
     ini = write_ini(env, "salud-proceso", token_kind="agency_token", token=env["ids"]["agency_a2"]["agency_token"],
                     extra={"run_all_on_start": "true"})
-    cmd = [CLIENT_PY, os.path.join(support.CLIENT_DIR, "client_postgres.py"), "--config", ini]
+    cmd = [*support.agent_cmd(), "--config", ini]
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     env["procs"].append(p)
     try:

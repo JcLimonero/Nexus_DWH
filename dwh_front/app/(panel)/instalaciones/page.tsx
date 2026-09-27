@@ -143,7 +143,14 @@ export default function InstalacionesPage() {
                     <Td>
                       <LastSeen value={i.last_seen_at} />
                     </Td>
-                    <Td className="whitespace-nowrap font-mono text-xs">{i.client_version || "—"}</Td>
+                    <Td className="whitespace-nowrap font-mono text-xs">
+                      {i.client_version || "—"}
+                      {i.version_status === "outdated" && (
+                        <div className="mt-1" title={`Última versión publicada: ${i.latest_version}`}>
+                          <Badge tone="amber">Desactualizada</Badge>
+                        </div>
+                      )}
+                    </Td>
                     <Td className="text-right tabular-nums">
                       {hb?.queue_depth ?? "—"}
                       {hb?.queue_overflow_total ? <p className="text-xs text-red-600">{hb.queue_overflow_total} descartes</p> : null}
