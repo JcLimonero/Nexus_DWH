@@ -118,7 +118,10 @@ jobs:
           & $exe --selftest; if ($LASTEXITCODE) { exit 1 }
           & $exe --verify-update build\dist\NexusAgent --allow-same-version --allow-unsigned-manifest; if ($LASTEXITCODE) { exit 1 }
           & $exe --verify-update build\dist\NexusAgent --allow-same-version
-          if ($LASTEXITCODE -ne 4) { Write-Error 'Un manifiesto sin firma debe rechazarse sin --allow-unsigned-manifest'; exit 1 }
+          if ($LASTEXITCODE -ne 4) { Write-Error "Un manifiesto sin firma debe rechazarse (4) sin --allow-unsigned-manifest; fue $LASTEXITCODE"; exit 1 }
+          # El envoltorio de GitHub para pwsh termina con el código del ÚLTIMO comando nativo: el 4
+          # esperado haría fallar el paso. Todas las comprobaciones pasaron: se sale con 0 explícito.
+          exit 0
 
       - name: Servicio con cuenta virtual (instalar, DPAPI, errores de configuración, actualización con vuelta atrás, desinstalar)
         run: |
@@ -131,10 +134,10 @@ jobs:
           function Assert($cond, $msg) { if (-not $cond) { Write-Error $msg; exit 1 } }
           function Assert-OldVersionRunning($label) {
             Start-Sleep -Seconds 5
-            Assert ((Get-Service NexusAgent).Status -eq 'Running') "$label: el servicio no está en ejecución tras la vuelta atrás"
+            Assert ((Get-Service NexusAgent).Status -eq 'Running') "${label}: el servicio no está en ejecución tras la vuelta atrás"
             $v = (& "$installed\NexusAgent.exe" --version).Trim()
-            Assert ($v -eq $script:origVersion) "$label: versión instalada $v, se esperaba $script:origVersion"
-            Assert (-not (Get-ChildItem 'C:\Program Files' -Directory -Filter 'NexusAgent.new-*')) "$label: quedó una carpeta de trabajo"
+            Assert ($v -eq $script:origVersion) "${label}: versión instalada $v, se esperaba $script:origVersion"
+            Assert (-not (Get-ChildItem 'C:\Program Files' -Directory -Filter 'NexusAgent.new-*')) "${label}: quedó una carpeta de trabajo"
           }
 
           # 1) Instalación sin token: arranca, comprueba DPAPI con su cuenta y se detiene con código 2.
@@ -239,6 +242,7 @@ jobs:
           & "$installed\scripts\uninstall_service.ps1" -RemoveProgram -RemoveData -Confirm:$false
           Assert ($LASTEXITCODE -eq 0) 'uninstall_service.ps1 falló'
           Assert (-not (Get-Service NexusAgent -ErrorAction SilentlyContinue)) 'El servicio sigue registrado'
+          exit 0
 
       - name: Nombre del artefacto
         id: name
