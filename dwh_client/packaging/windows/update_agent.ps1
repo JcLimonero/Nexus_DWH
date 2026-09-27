@@ -52,8 +52,9 @@ $account = "NT SERVICE\$ServiceName"
 function Fail([string]$msg, [int]$code = 1) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit $code }
 
 function Get-AgentVersion([string]$Exe) {
-  # Captura explícita de stdout: en pwsh 7.x "(& NexusAgent.exe --version)" puede fallar con
-  # "StandardOutputEncoding is only supported when standard output is redirected".
+  # Captura explícita de stdout: igual en Windows PowerShell 5.1 y pwsh 7, y con un error claro si el
+  # .exe no puede ejecutarse (pwsh 7.6 informa "Acceso denegado" como "StandardOutputEncoding is only
+  # supported when standard output is redirected").
   $psi = New-Object System.Diagnostics.ProcessStartInfo $Exe, '--version'
   $psi.UseShellExecute = $false
   $psi.RedirectStandardOutput = $true

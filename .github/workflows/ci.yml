@@ -114,10 +114,6 @@ jobs:
       - name: Ejecutable compilado --version / --selftest / --verify-update
         run: |
           $exe = "build\dist\NexusAgent\NexusAgent.exe"
-          Write-Host "PowerShell $($PSVersionTable.PSVersion)"
-          # Sonda (no bloqueante): captura de la salida del .exe con el operador de llamada de pwsh.
-          try { $o = & (Resolve-Path $exe).Path --version; Write-Host "captura con & OK: $o" }
-          catch { Write-Host "captura con & FALLA: $($_.Exception.Message)" }
           & $exe --version; if ($LASTEXITCODE) { exit 1 }
           & $exe --selftest; if ($LASTEXITCODE) { exit 1 }
           & $exe --verify-update build\dist\NexusAgent --allow-same-version --allow-unsigned-manifest; if ($LASTEXITCODE) { exit 1 }
@@ -138,9 +134,8 @@ jobs:
           $t0 = Get-Date
           # Los scripts se ejecutan como en producción (DWH_README §21: "powershell -ExecutionPolicy
           # Bypass"), en un proceso aparte de Windows PowerShell 5.1: el código de salida es el del
-          # script y su "exit" no altera la sesión del paso (en proceso, pwsh 7 dejaba roto el
-          # siguiente comando nativo: "StandardOutputEncoding is only supported when standard output
-          # is redirected"). -EncodedCommand evita problemas de comillas en rutas con espacios.
+          # script y su "exit" no termina el paso. -EncodedCommand evita problemas de comillas en
+          # rutas con espacios.
           $winps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
           function Invoke-Script([string]$Invocation) {
             $cmd = "`$ProgressPreference = 'SilentlyContinue'; try { `$global:LASTEXITCODE = `$null; $Invocation; if (`$null -eq `$LASTEXITCODE) { exit 99 }; exit `$LASTEXITCODE } " +
@@ -165,9 +160,9 @@ jobs:
           }
           function Assert($cond, $msg) { if (-not $cond) { Show-Diagnostics; Write-Host "::error::$msg"; exit 1 } }
           trap { Show-Diagnostics; break }
-          # La versión se lee con stdout redirigido explícitamente: "(& NexusAgent.exe --version)" falla
-          # en el pwsh del runner ("StandardOutputEncoding is only supported when standard output is
-          # redirected").
+          # Versión con stdout redirigido explícitamente: si el .exe no puede ejecutarse, el error es
+          # claro ("Access is denied"); pwsh 7.6 con "(& exe)" lo informa como "StandardOutputEncoding
+          # is only supported when standard output is redirected".
           function Get-AgentVersion([string]$Exe) {
             $psi = New-Object System.Diagnostics.ProcessStartInfo $Exe, '--version'
             $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
