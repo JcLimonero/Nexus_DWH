@@ -7,6 +7,8 @@ import {
   Activity,
   Bell,
   Boxes,
+  History,
+  MonitorSmartphone,
   Building2,
   Database,
   LayoutDashboard,
@@ -34,6 +36,8 @@ const NAV = [
   {
     section: "Monitoreo",
     items: [
+      { href: "/instalaciones", label: "Instalaciones", icon: MonitorSmartphone },
+      { href: "/ejecuciones", label: "Ejecuciones", icon: History },
       { href: "/eventos", label: "Eventos", icon: Bell },
       { href: "/actividad", label: "Actividad", icon: Activity },
     ],

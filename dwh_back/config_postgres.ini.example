@@ -6,6 +6,8 @@ port = 5432
 db = mgd_dwh_config
 user = postgres
 password = TU_PASSWORD_AQUI
+; Aplicar migraciones pendientes al arrancar (defecto false: usar migrate.py).
+; auto_migrate = false
 
 [monitor]
 ; Token para acceder a los endpoints /monitor/*
@@ -28,3 +30,24 @@ password = TU_PASSWORD_AQUI
 ; desde su servidor (proxy) y NO lo necesita; configúralo solo si algún
 ; navegador debe llamar directo al backend.
 ; origins = https://otra-app.midominio.com
+
+[agent]
+; API del agente por instalación (/agent/*).
+; Vigencia máxima (s) de la autorización/config que recibe el agente.
+; config_max_age_seconds = 900
+; Tras rotar el secreto, el anterior sigue valiendo hasta que el agente use el
+; nuevo o hasta que pase este tiempo (s).
+; rotation_grace_seconds = 3600
+; heartbeat_retention_days = 7
+; download_log_retention_days = 30
+; Endpoints legados (/configs, /group-configs, /agency-configs, /client-event,
+; /configs/{id}/last_run). false = responden 410 (cuando ya no haya agentes v3/v4).
+; legacy_endpoints = true
+; Tolerancia (horas) para fechas/watermarks "futuros" enviados por el agente.
+; future_tolerance_hours = 26
+
+[server]
+; Límites de tamaño del cuerpo de las peticiones (bytes); se responde 413.
+; max_body_bytes = 1048576
+; agent_max_body_bytes = 262144
+; enroll_max_body_bytes = 16384

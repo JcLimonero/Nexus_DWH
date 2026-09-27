@@ -90,6 +90,7 @@ export interface Task extends Timestamps {
   run_on_company_token: boolean;
   last_run_at: string | null;
   effective_active: boolean;
+  query_version?: number | null;
 }
 
 export interface Stats {
@@ -153,4 +154,97 @@ export interface ActivityItem {
 
 export interface ListResponse<T> {
   items: T[];
+}
+
+export type InstallationScope = "group" | "company" | "agency";
+
+export interface InstallationHeartbeat {
+  uptime_seconds: number | null;
+  queue_depth: number | null;
+  queue_overflow_total: number | null;
+  running: { task_id: number | null; execution_id: string | null }[];
+  config_age_seconds: number | null;
+  received_at: string | null;
+}
+
+export interface Installation {
+  id: string;
+  name: string;
+  hostname: string;
+  os_info: string;
+  scope_type: InstallationScope;
+  group_id: number;
+  group_name: string;
+  company_id: number | null;
+  company_name: string | null;
+  agency_id: number | null;
+  agency_name: string | null;
+  status: "active" | "revoked";
+  enrolled_via: InstallationScope;
+  enrollment_token_prefix: string;
+  client_version: string;
+  last_seen_at: string | null;
+  last_ip?: string;
+  last_heartbeat: InstallationHeartbeat | null;
+  credential_rotated_at: string | null;
+  rotation_required: boolean;
+  rotation_in_grace: boolean;
+  revoked_at: string | null;
+  revoked_reason: string | null;
+  created_at: string;
+  failures_24h: number;
+  last_execution_at: string | null;
+  legacy: false;
+}
+
+export interface LegacyClient {
+  auth_kind: InstallationScope;
+  group_id: number | null;
+  group_name: string | null;
+  company_id: number | null;
+  company_name: string | null;
+  agency_id: number | null;
+  agency_name: string | null;
+  token_prefix: string;
+  last_seen_at: string | null;
+  requests_30d: number;
+  http_errors_30d: number;
+  last_ip: string | null;
+  legacy: true;
+}
+
+export type ExecutionStatus = "running" | "success" | "failed" | "interrupted";
+export type FailureStage = "config" | "extract" | "transform" | "load" | "report";
+
+export interface Execution {
+  execution_id: string;
+  installation_id: string;
+  installation_name: string | null;
+  task_id: number;
+  group_id: number | null;
+  group_name: string | null;
+  company_id: number | null;
+  company_name: string | null;
+  agency_id: number | null;
+  agency_name: string | null;
+  object_name: string | null;
+  destination_table: string | null;
+  client_version: string;
+  query_version: number | null;
+  attempt: number;
+  status: ExecutionStatus;
+  failure_stage: FailureStage | null;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  rows_read: number | null;
+  rows_loaded: number | null;
+  rows_inserted: number | null;
+  rows_updated: number | null;
+  error_code: string | null;
+  error_message_sanitized: string | null;
+  warnings: string[];
+  checkpoint_confirmed: string | null;
+  checkpoint_kind: string | null;
+  received_at: string;
 }

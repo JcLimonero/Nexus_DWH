@@ -1,18 +1,24 @@
 """
-nexus_server_postgres.py  v3 — PostgreSQL
+nexus_server_postgres.py  v4 — PostgreSQL
 ──────────────────────────────────────────
 Versión del servidor Nexus que usa PostgreSQL en lugar de MySQL.
-El token de cada cliente identifica una razón social.
-El grupo se resuelve automáticamente vía JOIN en cada petición.
 
-Endpoints clientes ETL:
+Agentes nuevos (identidad por instalación; ver agent_postgres.py):
+  POST /agent/enroll             → alta de la instalación con token de enrolamiento
+  GET  /agent/tasks              → tareas autorizadas para la instalación
+  POST /agent/executions, PUT /agent/executions/{id}, POST /agent/heartbeat,
+  POST /agent/events, POST /agent/credentials/rotate
+
+Endpoints LEGADOS de clientes ETL (compatibilidad; [agent] legacy_endpoints):
   GET  /configs                  → todas las tareas de una company (x-token = company_token)
   GET  /agency-configs           → solo tareas de una agency (x-agency-token)
   GET  /group-configs            → tareas de todas las companies del grupo (x-group-token)
   PUT  /configs/{id}/last_run    → marcar tarea ejecutada (mismos headers que el GET correspondiente)
+  POST /client-event             → clientes reportan eventos (éxito o error)
+  Prioridad de tokens en TODO el backend: grupo > agencia > empresa.
 
 Endpoints monitor (requieren header x-monitor-token):
-  POST /client-event             → clientes reportan eventos (éxito o error)
+  GET  /monitor/installations    → instalaciones (agentes nuevos) + clientes legados
   GET  /monitor/events           → historial de eventos
   GET  /monitor/clients          → resumen de todos los clientes
   GET  /monitor/activity         → log HTTP del backend
@@ -26,6 +32,8 @@ Endpoints administración (requieren header x-admin-token; ver admin_postgres.py
 
 import argparse
 import configparser
+import hmac
+import logging
 import os
 import sys
 import time
@@ -33,11 +41,13 @@ import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
+import psycopg2.extras
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -56,8 +66,23 @@ if getattr(sys, "frozen", False):
 else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# NEXUS_CONFIG_FILE permite usar otro config.ini (p. ej. pruebas automatizadas).
+CONFIG_PATH = os.environ.get("NEXUS_CONFIG_FILE", "").strip() or os.path.join(_APP_DIR, "config.ini")
 _ini = configparser.ConfigParser()
-_ini.read(os.path.join(_APP_DIR, "config.ini"))
+_ini.read(CONFIG_PATH)
+
+# Los módulos hermanos (admin_postgres, agent_postgres, redact) se importan por nombre.
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+
+from redact import redact_text, token_prefix  # noqa: E402
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    stream=sys.stderr,
+)
+server_log = logging.getLogger("nexus.server")
 
 DB_HOST       = _ini.get("database", "host",     fallback="127.0.0.1")
 DB_PORT       = _ini.getint("database", "port",  fallback=5432)
@@ -74,6 +99,22 @@ ADMIN_TOKEN = (
     _ini.get("admin", "token", fallback="").strip()
     or os.environ.get("NEXUS_ADMIN_TOKEN", "").strip()
 )
+# API del agente por instalación (/agent/*)
+AGENT_CONFIG_MAX_AGE = _ini.getint("agent", "config_max_age_seconds", fallback=900)
+AGENT_ROTATION_GRACE = _ini.getint("agent", "rotation_grace_seconds", fallback=3600)
+AGENT_HEARTBEAT_RETENTION_DAYS = _ini.getint("agent", "heartbeat_retention_days", fallback=7)
+AGENT_DOWNLOAD_LOG_RETENTION_DAYS = _ini.getint("agent", "download_log_retention_days", fallback=30)
+# Endpoints legados (/configs, /group-configs, /agency-configs, /client-event,
+# /configs/{id}/last_run). true = siguen activos (compatibilidad); false = 410.
+LEGACY_ENDPOINTS_ENABLED = _ini.getboolean("agent", "legacy_endpoints", fallback=True)
+# Aplicar migraciones pendientes al arrancar (por defecto NO: usar migrate.py).
+AUTO_MIGRATE = _ini.getboolean("database", "auto_migrate", fallback=False)
+# Tolerancia (h) para fechas "futuras" que manda el agente (relojes/husos).
+AGENT_FUTURE_TOLERANCE_HOURS = _ini.getint("agent", "future_tolerance_hours", fallback=26)
+# Límite de tamaño del cuerpo de las peticiones (bytes). 413 si se supera.
+MAX_BODY_BYTES = _ini.getint("server", "max_body_bytes", fallback=1_048_576)
+AGENT_MAX_BODY_BYTES = _ini.getint("server", "agent_max_body_bytes", fallback=262_144)
+ENROLL_MAX_BODY_BYTES = _ini.getint("server", "enroll_max_body_bytes", fallback=16_384)
 # Orígenes permitidos para CORS (separados por coma). Vacío = sin CORS
 # (el panel dwh_front usa un proxy del lado servidor y no lo necesita).
 CORS_ORIGINS = [
@@ -250,106 +291,91 @@ def agency_token_column_exists() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Resolver identidad completa desde token
+# Resolver identidad (tokens legados) — prioridad única: grupo > agencia > empresa
 # ─────────────────────────────────────────────────────────────────────────────
-def resolve_request_identity(
-    company_token: str = "",
-    group_token: str = "",
-    agency_token: str = "",
-) -> Tuple[str, str]:
-    """
-    Devuelve (company_name, group_name) para enriquecer activity_log.
-    Usado por el middleware para enriquecer el activity_log.
-    """
+from agent_postgres import (  # noqa: E402
+    create_agent_routers,
+    resolve_legacy_principal,
+    scope_where,
+)
+
+
+def resolve_legacy(company_token: str = "", group_token: str = "", agency_token: str = "") -> Optional[Dict[str, Any]]:
+    """Principal de un token legado (o None). Prioridad grupo > agencia > empresa."""
     if not company_token and not group_token and not agency_token:
-        return ("", "")
+        return None
+    if group_token and not group_token_column_exists():
+        group_token = ""
+    if agency_token and not agency_token_column_exists():
+        agency_token = ""
+    conn = get_connection()
     try:
-        if group_token and group_token_column_exists():
-            conn = get_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT '' AS company_name, g.name AS group_name
-                    FROM client_group g
-                    WHERE g.group_token = %s
-                    """,
-                    (group_token,),
-                )
-                row = cur.fetchone()
-                return (row[0], row[1]) if row else ("", "")
-            finally:
-                conn.close()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        return resolve_legacy_principal(
+            cur, company_token=company_token, group_token=group_token, agency_token=agency_token
+        )
+    finally:
+        conn.close()
 
-        if agency_token and agency_token_column_exists():
-            conn = get_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT c.name AS company_name, g.name AS group_name
-                    FROM agency a
-                    JOIN company c ON c.id = a.company_id
-                    JOIN client_group g ON g.id = c.group_id
-                    WHERE a.agency_token = %s
-                    """,
-                    (agency_token,),
-                )
-                row = cur.fetchone()
-                return (row[0], row[1]) if row else ("", "")
-            finally:
-                conn.close()
 
-        if company_token:
-            conn = get_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT c.name AS company_name, g.name AS group_name
-                    FROM company c
-                    JOIN client_group g ON g.id = c.group_id
-                    WHERE c.company_token = %s
-                    """,
-                    (company_token,),
-                )
-                row = cur.fetchone()
-                return (row[0], row[1]) if row else ("", "")
-            finally:
-                conn.close()
-
-        return ("", "")
-    except Exception:
-        return ("", "")
+def _active_legacy_token(company_token: str, group_token: str, agency_token: str) -> str:
+    return group_token or agency_token or company_token
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Middleware – activity_log
+# Middleware – activity_log (sin tokens completos, sin trazas, fuera del loop)
 # ─────────────────────────────────────────────────────────────────────────────
-def _log_activity(
-    token: str, razon_social: str, grupo: str,
-    method: str, endpoint: str, status_code: int,
-    response_ms: int, error_detail: Optional[str], client_ip: str,
+_ERROR_DETAIL_MAX = 1000
+_ERROR_BODY_CAPTURE = 16_384
+
+
+def _record_activity(
+    audit: Dict[str, Any], company_token: str, group_token: str, agency_token: str,
+    method: str, endpoint: str, status_code: int, response_ms: int,
+    error_detail: Optional[str], client_ip: str,
 ) -> None:
+    """Se ejecuta en un threadpool (llamadas BD síncronas)."""
     try:
+        info: Dict[str, Any] = dict(audit or {})
+        legacy_token = _active_legacy_token(company_token, group_token, agency_token)
+        if not info.get("auth_kind"):
+            if legacy_token:
+                kind = "group" if group_token else ("agency" if agency_token else "company")
+                info["auth_kind"] = kind
+                p = None
+                try:
+                    p = resolve_legacy(company_token, group_token, agency_token)
+                except Exception:
+                    p = None
+                if p:
+                    info.update(group_id=p["group_id"], company_id=p["company_id"], agency_id=p["agency_id"],
+                                group_name=p["group_name"], company_name=p["company_name"])
+            elif endpoint.startswith("/admin"):
+                info["auth_kind"] = "admin"
+            elif endpoint.startswith("/monitor"):
+                info["auth_kind"] = "monitor"
+        prefix = info.get("token_prefix") or token_prefix(legacy_token)
         conn = get_connection()
         try:
             cur = conn.cursor()
             cur.execute(
                 """
                 INSERT INTO activity_log
-                    (token, company_name, group_name, method, endpoint,
-                     status_code, response_ms, error_detail, client_ip)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (token, company_name, group_name, method, endpoint, status_code, response_ms,
+                     error_detail, client_ip, auth_kind, group_id, company_id, agency_id, installation_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (token, razon_social, grupo, method, endpoint,
-                 status_code, response_ms, error_detail, client_ip),
+                (prefix, (info.get("company_name") or "")[:255], (info.get("group_name") or "")[:255],
+                 method[:10], endpoint[:255], status_code, response_ms,
+                 (redact_text(error_detail, max_len=_ERROR_DETAIL_MAX) if error_detail else None), client_ip[:45], (info.get("auth_kind") or "")[:20],
+                 info.get("group_id"), info.get("company_id"), info.get("agency_id"),
+                 info.get("installation_id")),
             )
             conn.commit()
         finally:
             conn.close()
-    except Exception:
-        pass
+    except Exception as exc:  # la auditoría nunca debe romper la petición
+        server_log.warning("No se pudo registrar activity_log: %s", type(exc).__name__)
 
 
 @app.middleware("http")
@@ -358,7 +384,6 @@ async def activity_logging_middleware(request: Request, call_next):
     company_token = request.headers.get("x-token", "")
     group_token = request.headers.get("x-group-token", "")
     agency_token = request.headers.get("x-agency-token", "")
-    request_token = group_token or agency_token or company_token
     endpoint  = request.url.path
     method    = request.method
     client_ip = request.client.host if request.client else ""
@@ -374,7 +399,8 @@ async def activity_logging_middleware(request: Request, call_next):
             body = b""
             async for chunk in response.body_iterator:
                 body += chunk
-            error_detail = body.decode("utf-8", errors="replace")
+            # Se sanea en el threadpool (_record_activity), nunca en el event loop.
+            error_detail = body[:_ERROR_BODY_CAPTURE].decode("utf-8", errors="replace")
             from starlette.responses import Response as RawResponse
             response = RawResponse(
                 content=body, status_code=status_code,
@@ -382,21 +408,25 @@ async def activity_logging_middleware(request: Request, call_next):
             )
         return response
 
-    except Exception:
+    except Exception as exc:
         status_code  = 500
-        error_detail = traceback.format_exc()
+        # En BD solo el tipo; la traza (saneada) va a stderr del servidor.
+        error_detail = f"Error interno ({type(exc).__name__})."
+        tb = traceback.format_exc()[-16_000:]
+        await run_in_threadpool(
+            lambda: server_log.error("Excepción no controlada en %s %s:\n%s", method, endpoint,
+                                     redact_text(tb, max_len=8000))
+        )
         return JSONResponse(status_code=500, content={"detail": "Error interno."})
 
     finally:
         elapsed_ms = int((time.time() - start) * 1000)
         # Las validaciones de sesión del panel (/admin/whoami OK) no se registran.
         if not (endpoint == "/admin/whoami" and status_code < 400):
-            company_name, group_name = resolve_request_identity(
-                company_token, group_token, agency_token
-            )
-            _log_activity(
-                request_token, company_name, group_name, method, endpoint,
-                status_code, elapsed_ms, error_detail, client_ip,
+            audit = getattr(request.state, "audit", None) or {}
+            await run_in_threadpool(
+                _record_activity, audit, company_token, group_token, agency_token,
+                method, endpoint, status_code, elapsed_ms, error_detail, client_ip,
             )
 
 
@@ -409,9 +439,17 @@ def _require_monitor_token(token: str) -> None:
             status_code=503,
             detail="Monitor no configurado: agrega [monitor] token=... en config.ini del servidor.",
         )
-    if token != MONITOR_TOKEN:
+    # Comparación en tiempo constante.
+    if not token or not hmac.compare_digest(token.encode("utf-8"), MONITOR_TOKEN.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Token de monitor no válido.")
 
+
+def _require_legacy_enabled() -> None:
+    if not LEGACY_ENDPOINTS_ENABLED:
+        raise HTTPException(
+            status_code=410,
+            detail="Endpoint legado deshabilitado: actualice el agente (API /agent con enrolamiento).",
+        )
 
 def resolve_company_token(company_token: str) -> Dict[str, Any]:
     """
@@ -849,6 +887,8 @@ def health() -> dict:
 
 @app.get("/configs", response_model=CompanyConfigsResponse)
 def get_configs(x_token: str = Header(...)) -> CompanyConfigsResponse:
+    """[LEGADO] Los agentes nuevos usan GET /agent/tasks con credencial de instalación."""
+    _require_legacy_enabled()
     token_state = resolve_company_token(x_token)
 
     if not token_state["found"]:
@@ -874,6 +914,8 @@ def get_configs(x_token: str = Header(...)) -> CompanyConfigsResponse:
 
 @app.get("/group-configs", response_model=GroupConfigsResponse)
 def get_group_configs(x_group_token: str = Header(...)) -> GroupConfigsResponse:
+    """[LEGADO] Ver GET /agent/tasks."""
+    _require_legacy_enabled()
     group_state = resolve_group_token(x_group_token)
     if not group_state["found"]:
         raise HTTPException(status_code=401, detail="Group token no válido.")
@@ -898,6 +940,8 @@ def get_group_configs(x_group_token: str = Header(...)) -> GroupConfigsResponse:
 def get_agency_configs(
     x_agency_token: str = Header(..., alias="x-agency-token"),
 ) -> CompanyConfigsResponse:
+    """[LEGADO] Ver GET /agent/tasks."""
+    _require_legacy_enabled()
     if not agency_token_column_exists():
         raise HTTPException(
             status_code=503,
@@ -947,54 +991,37 @@ def _resolve_task_access(
     group_token: Optional[str],
     agency_token: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Tarea + principal si config_id pertenece al alcance del token legado.
+    Misma prioridad que el resto del backend: grupo > agencia > empresa.
+    """
+    principal = resolve_legacy(company_token or "", group_token or "", agency_token or "")
+    if not principal:
+        return None
+    where, params = scope_where(
+        principal["kind"], principal["group_id"], principal["company_id"], principal["agency_id"]
+    )
     conn = get_connection()
     try:
-        cur = conn.cursor()
-        if agency_token and agency_token_column_exists():
-            cur.execute(
-                """
-                SELECT at.id, c.name AS company_name, g.name AS group_name
-                FROM agency_task at
-                JOIN agency a ON a.id = at.agency_id
-                JOIN company c ON c.id = a.company_id
-                JOIN client_group g ON g.id = c.group_id
-                WHERE at.id = %s AND a.agency_token = %s
-                """,
-                (config_id, agency_token),
-            )
-        elif company_token:
-            cur.execute(
-                """
-                SELECT at.id, c.name AS company_name, g.name AS group_name
-                FROM agency_task at
-                JOIN agency a ON a.id = at.agency_id
-                JOIN company c ON c.id = a.company_id
-                JOIN client_group g ON g.id = c.group_id
-                WHERE at.id = %s AND c.company_token = %s
-                """,
-                (config_id, company_token),
-            )
-        elif group_token and group_token_column_exists():
-            cur.execute(
-                """
-                SELECT at.id, c.name AS company_name, g.name AS group_name
-                FROM agency_task at
-                JOIN agency a ON a.id = at.agency_id
-                JOIN company c ON c.id = a.company_id
-                JOIN client_group g ON g.id = c.group_id
-                WHERE at.id = %s AND g.group_token = %s
-                """,
-                (config_id, group_token),
-            )
-        else:
-            return None
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT at.id AS config_id, at.agency_id, a.company_id, c.group_id,
+                   c.name AS company_name, g.name AS group_name, a.name AS agency_name
+            FROM agency_task at
+            JOIN agency a ON a.id = at.agency_id
+            JOIN company c ON c.id = a.company_id
+            JOIN client_group g ON g.id = c.group_id
+            WHERE at.id = %s AND {where}
+            """,
+            (config_id, *params),
+        )
         row = cur.fetchone()
     finally:
         conn.close()
-
     if not row:
         return None
-    return {"config_id": row[0], "company_name": row[1], "group_name": row[2]}
+    return {**dict(row), "principal": principal}
 
 
 @app.put("/configs/{config_id}/last_run")
@@ -1004,6 +1031,7 @@ def update_last_run(
     x_group_token: Optional[str] = Header(None),
     x_agency_token: Optional[str] = Header(None, alias="x-agency-token"),
 ) -> dict:
+    _require_legacy_enabled()
     if not x_token and not x_group_token and not x_agency_token:
         raise HTTPException(
             status_code=401,
@@ -1029,8 +1057,42 @@ def update_last_run(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Endpoint — clientes reportan eventos (éxito O error)
+# Endpoint legado — clientes reportan eventos (éxito O error)
 # ─────────────────────────────────────────────────────────────────────────────
+_LEGACY_DETAIL_MAX = 4000
+
+
+def _scope_secret_values(company_id: Optional[int], group_id: int) -> List[str]:
+    """Credenciales del alcance, para quitarlas del detalle si vinieran en una traza."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT warehouse_host, warehouse_database, warehouse_username, warehouse_password
+               FROM client_group WHERE id = %s""",
+            (group_id,),
+        )
+        vals = list(cur.fetchone() or [])
+        if company_id:
+            cur.execute(
+                """SELECT source_host, source_database, source_username, source_password, source_dsn
+                   FROM company WHERE id = %s""",
+                (company_id,),
+            )
+            vals += list(cur.fetchone() or [])
+    finally:
+        conn.close()
+    out: List[str] = []
+    for v in vals:
+        try:
+            dv = decrypt_config_secret(v or "")
+        except Exception:
+            dv = ""
+        if dv:
+            out.append(dv)
+    return out
+
+
 @app.post("/client-event")
 def report_client_event(
     payload: dict,
@@ -1039,62 +1101,54 @@ def report_client_event(
     x_agency_token: Optional[str] = Header(None, alias="x-agency-token"),
 ) -> dict:
     """
-    Cada vez que un cliente termina de ejecutar una tarea (bien o mal),
-    reporta aquí. El backend resuelve grupo + RS desde el token y los guarda.
+    [LEGADO] Reporte de resultado de una tarea. Los agentes nuevos usan
+    /agent/executions. Reglas:
+      * config_id debe ser una tarea del alcance del token (si no, 403).
+      * detail se sanea (sin SQL, filas, hosts ni credenciales) y se recorta.
+      * No se guarda el token completo (solo prefijo + ids resueltos).
 
     Payload:
       config_id   : str  — ID de la tarea
-      task_name   : str  — nombre descriptivo (grupo | RS | agencia)
+      task_name   : str  — (ignorado; el nombre se resuelve en el servidor)
       event_type  : str  — "ok" | "error"
-      detail      : str  — resumen si ok, traceback si error (opcional)
+      detail      : str  — resumen si ok, traza si error (opcional)
       rows_loaded : int  — filas cargadas (solo en ok, opcional)
     """
+    _require_legacy_enabled()
     if not x_token and not x_group_token and not x_agency_token:
         raise HTTPException(
             status_code=401,
             detail="Falta x-token, x-group-token o x-agency-token.",
         )
+    principal = resolve_legacy(x_token or "", x_group_token or "", x_agency_token or "")
+    if not principal:
+        raise HTTPException(status_code=401, detail="Token no válido.")
 
-    event_type  = str(payload.get("event_type", "error"))
-    config_id   = str(payload.get("config_id", ""))
-    task_name   = str(payload.get("task_name", ""))
-    detail      = str(payload.get("detail", ""))
-    rows_loaded = int(payload.get("rows_loaded", 0))
+    event_type = str(payload.get("event_type", "error"))
+    if event_type not in ("ok", "error"):
+        raise HTTPException(status_code=422, detail="event_type debe ser 'ok' o 'error'.")
+    config_id = str(payload.get("config_id", "")).strip()
+    if not config_id.isdigit() or len(config_id) > 9:
+        raise HTTPException(status_code=422, detail="config_id no válido.")
+    try:
+        rows_loaded = max(0, min(int(payload.get("rows_loaded", 0) or 0), 2_147_483_647))
+    except (TypeError, ValueError):
+        rows_loaded = 0
+
+    task = _resolve_task_access(int(config_id), x_token, x_group_token, x_agency_token)
+    if not task:
+        raise HTTPException(status_code=403, detail="La tarea no pertenece al alcance del token.")
+
+    raw_detail = str(payload.get("detail", "") or "")[:16_384]  # recorte ANTES de sanear
+    detail = redact_text(
+        raw_detail,
+        secrets=_scope_secret_values(task["company_id"], task["group_id"])
+        + [x_token or "", x_group_token or "", x_agency_token or ""],
+        max_len=_LEGACY_DETAIL_MAX,
+    )
 
     # Los eventos "ok" se auto-reconocen (no generan alerta pendiente).
-    # Los eventos "error" quedan acknowledged=0 hasta que el monitor los revise.
     acknowledged = 1 if event_type == "ok" else 0
-
-    task_access = None
-    if config_id.isdigit():
-        task_access = _resolve_task_access(
-            int(config_id), x_token, x_group_token, x_agency_token
-        )
-
-    if x_group_token:
-        group_state = resolve_group_token(x_group_token)
-        if not group_state["found"]:
-            raise HTTPException(status_code=401, detail="Group token no válido.")
-        group_name = task_access["group_name"] if task_access else group_state["group_name"]
-        company_name = task_access["company_name"] if task_access else ""
-        request_token = x_group_token
-    elif x_agency_token:
-        if not agency_token_column_exists():
-            raise HTTPException(status_code=503, detail="Columna agency_token no disponible.")
-        ag_state = resolve_agency_token(x_agency_token)
-        if not ag_state["found"]:
-            raise HTTPException(status_code=401, detail="Agency token no válido.")
-        group_name = ag_state["group_name"]
-        company_name = ag_state["company_name"]
-        request_token = x_agency_token
-    else:
-        token_state = resolve_company_token(x_token or "")
-        if not token_state["found"]:
-            raise HTTPException(status_code=401, detail="Token no válido.")
-        group_name = token_state["group_name"]
-        company_name = token_state["company_name"]
-        request_token = x_token or ""
-
     try:
         conn = get_connection()
         try:
@@ -1102,27 +1156,33 @@ def report_client_event(
             cur.execute(
                 """
                 INSERT INTO client_events
-                    (token, group_name, company_name, config_id,
-                     task_name, event_type, detail, rows_loaded, is_acknowledged)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (token, group_name, company_name, config_id, task_name, event_type, detail,
+                     rows_loaded, is_acknowledged, source, auth_kind, group_id, company_id, agency_id, task_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'legacy', %s, %s, %s, %s, %s)
                 """,
                 (
-                    request_token,
-                    group_name,
-                    company_name,
+                    token_prefix(_active_legacy_token(x_token or "", x_group_token or "", x_agency_token or "")),
+                    task["group_name"],
+                    task["company_name"],
                     config_id,
-                    task_name,
+                    f"{task['group_name']} | {task['company_name']} | {task['agency_name']}"[:512],
                     event_type,
                     detail,
                     rows_loaded,
                     acknowledged,
+                    principal["kind"],
+                    task["group_id"],
+                    task["company_id"],
+                    task["agency_id"],
+                    task["config_id"],
                 ),
             )
             conn.commit()
         finally:
             conn.close()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except psycopg2.Error as exc:
+        server_log.error("No se pudo registrar client_event: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Error interno al registrar el evento.")
 
     return {"status": "ok"}
 
@@ -1190,8 +1250,10 @@ def get_events(
 @app.get("/monitor/clients")
 def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
     """
-    Resumen por cliente: grupo, RS, última conexión,
-    ejecuciones totales, errores pendientes y errores en la última hora.
+    Resumen por empresa: grupo, RS, última conexión, ejecuciones totales,
+    errores pendientes y errores en la última hora. Agrupa por ids resueltos
+    (company_id), así cuenta también lo reportado con token de grupo/agencia o
+    por instalaciones. Las instalaciones se ven en /monitor/installations.
     """
     _require_monitor_token(x_monitor_token)
 
@@ -1206,36 +1268,36 @@ def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
                 c.company_token                                         AS token,
                 c.is_enabled                                            AS rs_enabled,
                 g.is_enabled                                            AS grupo_enabled,
-                MAX(al.created_at)                                      AS last_seen,
-                COUNT(al.id)                                            AS requests_total,
-                COALESCE(SUM(CASE WHEN al.status_code >= 400 THEN 1 ELSE 0 END), 0) AS http_errors_total,
-                COALESCE(SUM(CASE WHEN al.created_at >= NOW() - INTERVAL '1 hour'
-                    AND al.status_code >= 400 THEN 1 ELSE 0 END), 0)    AS http_errors_1h,
-                (SELECT COUNT(*)
-                 FROM client_events ce
-                 WHERE ce.token = c.company_token)                     AS executions_total,
-                (SELECT COUNT(*)
-                 FROM client_events ce
-                 WHERE ce.token = c.company_token
-                   AND ce.event_type = 'error')                         AS exec_errors_total,
-                (SELECT COUNT(*)
-                 FROM client_events ce
-                 WHERE ce.token = c.company_token
-                   AND ce.event_type = 'error'
-                   AND ce.is_acknowledged = 0)                          AS exec_errors_pending,
-                (SELECT COUNT(*)
-                 FROM client_events ce
-                 WHERE ce.token = c.company_token
-                   AND ce.event_type = 'error'
-                   AND ce.created_at >= NOW() - INTERVAL '1 hour')      AS exec_errors_1h,
-                (SELECT MAX(ce.created_at)
-                 FROM client_events ce
-                 WHERE ce.token = c.company_token)                      AS last_execution
+                al.last_seen, COALESCE(al.requests_total, 0), COALESCE(al.http_errors_total, 0),
+                COALESCE(al.http_errors_1h, 0),
+                COALESCE(ce.executions_total, 0), COALESCE(ce.exec_errors_total, 0),
+                COALESCE(ce.exec_errors_pending, 0), COALESCE(ce.exec_errors_1h, 0),
+                ce.last_execution
             FROM company c
             JOIN client_group g ON g.id = c.group_id
-            LEFT JOIN activity_log al ON al.token = c.company_token
-            GROUP BY c.id, c.name, c.company_token, c.is_enabled,
-                     g.id, g.name, g.is_enabled
+            LEFT JOIN (
+                SELECT company_id,
+                       MAX(created_at) AS last_seen,
+                       COUNT(*) AS requests_total,
+                       SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS http_errors_total,
+                       SUM(CASE WHEN created_at >= NOW() - INTERVAL '1 hour' AND status_code >= 400
+                                THEN 1 ELSE 0 END) AS http_errors_1h
+                FROM activity_log
+                WHERE company_id IS NOT NULL AND auth_kind NOT IN ('admin', 'monitor')
+                GROUP BY company_id
+            ) al ON al.company_id = c.id
+            LEFT JOIN (
+                SELECT company_id,
+                       COUNT(*) AS executions_total,
+                       SUM(CASE WHEN event_type = 'error' THEN 1 ELSE 0 END) AS exec_errors_total,
+                       SUM(CASE WHEN event_type = 'error' AND is_acknowledged = 0 THEN 1 ELSE 0 END) AS exec_errors_pending,
+                       SUM(CASE WHEN event_type = 'error' AND created_at >= NOW() - INTERVAL '1 hour'
+                                THEN 1 ELSE 0 END) AS exec_errors_1h,
+                       MAX(created_at) AS last_execution
+                FROM client_events
+                WHERE company_id IS NOT NULL
+                GROUP BY company_id
+            ) ce ON ce.company_id = c.id
             ORDER BY g.name, c.name
             """
         )
@@ -1282,7 +1344,7 @@ def get_activity_log(
             f"""
             SELECT id, created_at, group_name AS grupo, company_name AS razon_social, token,
                    method, endpoint, status_code, response_ms,
-                   error_detail, client_ip
+                   error_detail, client_ip, auth_kind, installation_id
             FROM activity_log
             {where}
             ORDER BY created_at DESC
@@ -1307,6 +1369,8 @@ def get_activity_log(
             "response_ms":  r[8],
             "error_detail": r[9],
             "client_ip":    r[10],
+            "auth_kind":    r[11],
+            "installation_id": str(r[12]) if r[12] else None,
         }
         for r in rows
     ]
@@ -1353,7 +1417,6 @@ def acknowledge_all_events(x_monitor_token: str = Header(...)) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 from admin_postgres import create_admin_router  # noqa: E402
 from fastapi.exceptions import RequestValidationError  # noqa: E402
-from fastapi.exception_handlers import request_validation_exception_handler  # noqa: E402
 
 
 @app.exception_handler(RequestValidationError)
@@ -1363,8 +1426,8 @@ async def _validation_handler(request: Request, exc: RequestValidationError):
     422: podría ser una contraseña y el middleware guarda el cuerpo del error
     en activity_log. El resto de endpoints conserva la respuesta estándar.
     """
-    if not request.url.path.startswith("/admin"):
-        return await request_validation_exception_handler(request, exc)
+    # En NINGUNA ruta se devuelve el valor recibido (podría ser un secreto o un
+    # texto enorme que luego se sanea y registra).
     errors = [
         {"type": e.get("type"), "loc": list(e.get("loc", ())), "msg": e.get("msg")}
         for e in exc.errors()
@@ -1383,6 +1446,110 @@ app.include_router(
     )
 )
 
+_agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers(
+    get_connection=get_connection,
+    decrypt_config_secret=decrypt_config_secret,
+    admin_token=ADMIN_TOKEN,
+    monitor_token=MONITOR_TOKEN,
+    config_max_age_seconds=AGENT_CONFIG_MAX_AGE,
+    rotation_grace_seconds=AGENT_ROTATION_GRACE,
+    heartbeat_retention_days=AGENT_HEARTBEAT_RETENTION_DAYS,
+    download_log_retention_days=AGENT_DOWNLOAD_LOG_RETENTION_DAYS,
+    future_tolerance_hours=AGENT_FUTURE_TOLERANCE_HOURS,
+)
+app.include_router(_agent_router)
+app.include_router(_agent_admin_router)
+app.include_router(_agent_monitor_router)
+
+
+def check_migrations() -> None:
+    """Al arrancar: aplica (auto_migrate) o avisa de migraciones pendientes."""
+    try:
+        import migrate as _migrate
+
+        conn = get_connection()
+        try:
+            if AUTO_MIGRATE:
+                _migrate.run_migrations(conn, log=server_log.info)
+            pending = _migrate.pending_migrations(conn)
+        finally:
+            conn.close()
+        if pending:
+            server_log.error(
+                "Hay migraciones PENDIENTES en la BD de configuración: %s. "
+                "Ejecuta: python migrate.py (o [database] auto_migrate = true).",
+                ", ".join(pending),
+            )
+    except Exception as exc:
+        server_log.error("No se pudo verificar migraciones: %s", type(exc).__name__)
+
+
+class BodySizeLimitMiddleware:
+    """
+    Límite de tamaño del cuerpo (ASGI puro, externo al resto): 413 si el
+    Content-Length lo supera o si el cuerpo recibido en streaming lo supera.
+    /agent/enroll (sin autenticar) tiene el límite más bajo.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    @staticmethod
+    def _limit(path: str) -> int:
+        if path == "/agent/enroll":
+            return ENROLL_MAX_BODY_BYTES
+        if path.startswith("/agent/"):
+            return AGENT_MAX_BODY_BYTES
+        return MAX_BODY_BYTES
+
+    @staticmethod
+    async def _reject(send: Any) -> None:
+        body = b'{"detail":{"code":"body_too_large","message":"Cuerpo de la peticion demasiado grande."}}'
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = self._limit(scope.get("path", ""))
+        for k, v in scope.get("headers") or []:
+            if k == b"content-length":
+                try:
+                    if int(v) > limit:
+                        await self._reject(send)
+                        return
+                except ValueError:
+                    await self._reject(send)
+                    return
+        state = {"received": 0, "exceeded": False, "started": False}
+
+        async def limited_receive() -> Any:
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                state["received"] += len(msg.get("body", b""))
+                if state["received"] > limit:
+                    state["exceeded"] = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            return msg
+
+        async def guarded_send(msg: Any) -> None:
+            if state["exceeded"]:
+                if msg.get("type") == "http.response.start" and not state["started"]:
+                    state["started"] = True
+                    await self._reject(send)
+                return  # se descarta la respuesta original
+            if msg.get("type") == "http.response.start":
+                state["started"] = True
+            await send(msg)
+
+        await self.app(scope, limited_receive, guarded_send)
+
+
+app.add_middleware(BodySizeLimitMiddleware)
+
+
 # Solo si hay orígenes configurados. Se agrega al final para que quede como
 # middleware más externo.
 if CORS_ORIGINS:
@@ -1392,6 +1559,7 @@ if CORS_ORIGINS:
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["content-type", "x-admin-token", "x-monitor-token"],
+        # /agent/* no se expone a navegadores (sin CORS para x-installation-*).
     )
 
 
@@ -1405,4 +1573,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     print(f"Nexus Server (PostgreSQL) iniciando en {args.host}:{args.port} ...")
-    uvicorn.run(app, host=args.host, port=args.port)
+    check_migrations()
+    uvicorn.run(app, host=args.host, port=args.port, h11_max_incomplete_event_size=65_536)

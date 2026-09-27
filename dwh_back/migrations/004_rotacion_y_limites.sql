@@ -1,0 +1,11 @@
+-- ============================================================================
+-- 004 — Rotación de credencial sin cadena de secuestro
+-- ============================================================================
+-- pending_secret_enc: el secreto NUEVO emitido en la última rotación, cifrado
+--   con una clave derivada del secreto ANTERIOR (solo quien tiene el anterior
+--   puede recuperarlo). Si la respuesta de la rotación se pierde, el agente que
+--   todavía usa el secreto anterior recibe OTRA VEZ el mismo secreto nuevo
+--   (idempotente): no se emiten secretos adicionales ni se extiende la gracia.
+--   Se borra en cuanto el agente usa el secreto nuevo o vence la gracia.
+-- ============================================================================
+ALTER TABLE installation ADD COLUMN IF NOT EXISTS pending_secret_enc TEXT;
