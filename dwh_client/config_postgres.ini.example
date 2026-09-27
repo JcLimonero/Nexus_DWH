@@ -1,20 +1,69 @@
+; ============================================================================
+; Agente ETL Nexus DWH v5 (client_postgres.py) — copiar como config.ini
+; ============================================================================
 [nexus]
-; Company token (legacy/current flow).
-; Use this when the client should execute only one company / reason_social.
-token = TU_TOKEN_AQUI
+; URL base de Nexus. HTTPS obligatorio salvo localhost/127.0.0.1/::1.
+api_url = https://nexus.midominio.com
 
-; Group token (new special flow).
-; If present, the client will call /group-configs and execute tasks from every
-; company that belongs to the group. Leave empty to keep company mode.
-; Takes priority over agency_token and token.
+; Tokens de ENROLAMIENTO: solo se usan la primera vez (o con --enroll) para dar
+; de alta esta máquina y obtener su credencial de instalación.
+; Prioridad: group_token > agency_token > token (empresa). Deje uno solo.
+; RECOMENDACIÓN: bórrelos de este archivo después de enrolar.
+token =
 group_token =
-
-; Agency token (single branch / dealership).
-; If set (and group_token is empty), the client calls /agency-configs and only
-; runs tasks linked to that agency row. Requires agency.agency_token in the config DB.
-; Takes priority over company token.
 agency_token =
 
-; Base URL of the backend API.
-; Use HTTPS in real deployments. HTTP is acceptable only for localhost/dev.
-api_url = http://127.0.0.1:8000
+; Opcional: bundle de CA propio (PEM) para validar el certificado de Nexus.
+; ca_bundle = C:\NexusAgent\ca.pem
+
+; production (defecto) | development
+; mode = production
+; Solo con mode = development: permite http:// hacia hosts no locales.
+; allow_insecure_http = false
+
+; Nombre que verá el panel (defecto: nombre de la máquina).
+; installation_name =
+
+[agent]
+; Carpeta de datos (credencial protegida, cola local SQLite, agenda).
+; Defecto: agent_data junto a este archivo. Proteja su ACL (cuenta del servicio).
+; data_dir =
+; log_dir =
+; log_retention_days = 7
+; DPAPI: user (defecto, solo la cuenta del servicio) | machine
+; credential_scope = user
+
+; heartbeat_seconds = 60
+; config_max_age_seconds = 900
+; http_connect_timeout = 10
+; http_read_timeout = 30
+; api_retry_base_seconds = 2
+; api_retry_max_seconds = 300
+
+; run_all_on_start = false
+; task_retry_attempts = 2
+; task_retry_backoff_seconds = 60
+; shutdown_grace_seconds = 60
+
+; queue_max_items = 10000
+; queue_retention_days = 14
+; queue_backoff_base_seconds = 2
+; queue_backoff_max_seconds = 300
+; "Mensaje veneno": HTTP 500 exactos seguidos de un mismo reporte, tiempo mínimo desde el
+; primero y con Nexus respondiendo a otras llamadas. Las caídas (502/503/504, red) nunca cuentan.
+; queue_max_server_errors = 10
+; queue_poison_min_seconds = 1800
+; Reintento de reportes críticos estacionados (nunca se descartan).
+; queue_parked_retry_seconds = 3600
+
+; db_connect_timeout_seconds = 15
+; source_statement_timeout_seconds = 3600
+; dwh_statement_timeout_seconds = 3600
+; dwh_lock_timeout_seconds = 300
+; fetch_chunk_rows = 20000
+
+; source (defecto) | agent_local | agent_utc
+; watermark_clock = source
+; watermark_overlap_seconds = 120
+; Solapamiento de la primera corrida tras migrar desde v3/v4 (last_run_at legado).
+; legacy_watermark_overlap_seconds = 3600

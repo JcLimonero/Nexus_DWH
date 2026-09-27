@@ -848,7 +848,7 @@ def create_admin_router(
                c.group_id, g.name AS group_name,
                t.object_catalog_id, o.name AS object_name, o.destination_table,
                t.extract_sql, t.schedule_seconds, t.is_active, t.run_on_company_token,
-               t.last_run_at, t.created_at, t.updated_at,
+               t.last_run_at, t.created_at, t.updated_at, t.query_version, t.query_hash,
                (t.is_active AND a.is_enabled AND o.is_enabled
                  AND c.is_enabled AND g.is_enabled) AS effective_active
         FROM agency_task t
@@ -947,11 +947,25 @@ def create_admin_router(
 
     @router.post("/tasks/{task_id}/reset-last-run")
     def reset_task_last_run(task_id: int) -> dict:
-        """Pone last_run_at en NULL: la próxima ejecución hará carga completa ('{last_run}' = 1900-01-01)."""
+        """
+        Pone last_run_at en NULL y reinicia el watermark de task_sync_state: la
+        próxima ejecución hará carga completa ('{last_run}' = 1900-01-01).
+        watermark_reset_at evita que un checkpoint de una ejecución que empezó
+        antes del reinicio vuelva a fijar el watermark.
+        """
         with tx() as cur:
             cur.execute("UPDATE agency_task SET last_run_at = NULL WHERE id = %s", (task_id,))
             if cur.rowcount == 0:
                 raise not_found("Tarea")
+            cur.execute(
+                """
+                INSERT INTO task_sync_state (task_id, watermark, watermark_kind, watermark_reset_at)
+                VALUES (%s, NULL, NULL, NOW())
+                ON CONFLICT (task_id) DO UPDATE
+                   SET watermark = NULL, watermark_kind = NULL, watermark_reset_at = NOW(), updated_at = NOW()
+                """,
+                (task_id,),
+            )
         return get_task_or_404(task_id)
 
     # ── Helpers compartidos (definidos al final; usan closures de arriba) ────

@@ -47,3 +47,10 @@ Thumbs.db
 node_modules/
 .next/
 *.tsbuildinfo
+
+# Agente ETL: credencial de instalación, cola local y estado (nunca versionar)
+agent_data/
+*.dpapi
+agent_credential.json
+agent_state.db*
+.pytest_cache/
