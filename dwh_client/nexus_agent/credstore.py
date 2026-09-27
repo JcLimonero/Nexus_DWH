@@ -176,6 +176,22 @@ class CredentialStore:
         d = json.loads(raw.decode("utf-8"))
         return InstallationCredential(**{k: d.get(k, "") for k in InstallationCredential.__dataclass_fields__})
 
+    def self_check(self) -> tuple:
+        """
+        Comprueba que el backend de protección funciona con la cuenta ACTUAL
+        (cifra y descifra un valor aleatorio en memoria; no escribe a disco).
+        Útil al arrancar como servicio: con una cuenta virtual (NT SERVICE\\...)
+        confirma que DPAPI de usuario está disponible. Devuelve (ok, detalle).
+        """
+        if self.backend != "dpapi":
+            return True, "archivo 0600 (sin cifrar; solo desarrollo)"
+        probe = os.urandom(16)
+        try:
+            ok = self._unprotect(self._protect(probe, self.machine), self.machine) == probe
+        except Exception as exc:  # noqa: BLE001
+            return False, f"DPAPI ({'machine' if self.machine else 'user'}) falló: {type(exc).__name__}"
+        return ok, f"DPAPI ({'machine' if self.machine else 'user'}) {'OK' if ok else 'devolvió datos distintos'}"
+
     def delete(self) -> None:
         try:
             os.unlink(self.path)

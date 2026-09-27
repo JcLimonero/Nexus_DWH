@@ -24,7 +24,6 @@ from nexus_agent.logsetup import setup_logging
 from nexus_agent.settings import load_settings
 
 DBNAME = "nexus_test_cfg_client"
-CLIENT_PY = os.path.join(support.CLIENT_DIR, ".venv", "bin", "python")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,7 +337,7 @@ def test_10_heartbeat_sigue_durante_tarea_larga(env):
 
 
 def _run_cli(ini, *args, wait=True):
-    cmd = [CLIENT_PY, os.path.join(support.CLIENT_DIR, "client_postgres.py"), "--config", ini, *args]
+    cmd = [*support.agent_cmd(), "--config", ini, *args]
     if wait:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

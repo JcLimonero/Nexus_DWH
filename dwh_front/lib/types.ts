@@ -272,6 +272,9 @@ export interface Installation {
   enrolled_via: InstallationScope;
   enrollment_token_prefix: string;
   client_version: string;
+  /** [agent] latest_version del backend (null = sin versión publicada configurada). */
+  latest_version?: string | null;
+  version_status?: "current" | "outdated" | "unknown";
   last_seen_at: string | null;
   last_ip?: string;
   last_heartbeat: InstallationHeartbeat | null;

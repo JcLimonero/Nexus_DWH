@@ -54,3 +54,12 @@ agent_data/
 agent_credential.json
 agent_state.db*
 .pytest_cache/
+
+# Firma y publicación del agente: claves privadas y certificados NUNCA se versionan
+*.ed25519
+*.pfx
+*.p12
+release_private*.pem
+
+# Worktrees y datos locales de Claude Code
+.claude/

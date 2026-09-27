@@ -6,6 +6,7 @@ Documento único para entender y operar el **stack DWH de Nexus**:
 - `dwh_client/` — **cliente ETL** que corre en cada sede y carga datos al DWH.
 - `dwh_api/` — app de **monitoreo** (consume los endpoints `/monitor/*` del backend).
 - `dwh_front/` — **panel web de administración** (Next.js) para dar de alta grupos, empresas, agencias, catálogo y tareas, y ver el monitor (solo variante PostgreSQL; ver sección 16).
+- Distribución del agente (Nuitka, servicio de Windows, firma y actualizaciones): sección 21. Resumen de entrega del endurecimiento (fases 1–5): [ENTREGA_ENDURECIMIENTO.md](ENTREGA_ENDURECIMIENTO.md).
 - **Encriptación de secretos** con Fernet (opcional, recomendada en producción).
 
 El stack existe en **dos variantes** equivalentes:
@@ -403,8 +404,8 @@ App complementaria que consume `/monitor/*` con el token de monitor:
   - `fastapi`, `uvicorn`, `psycopg2-binary`, `requests`, `cryptography`.
 - `dwh_client/requirements.txt` (MySQL):
   - `pyodbc`, `PyMySQL`, `cryptography`, `requests`.
-- `dwh_client/requirements_postgres.txt` (PostgreSQL):
-  - `pyodbc`, `pymysql`, `psycopg2-binary`, `requests`.
+- `dwh_client/requirements_postgres.txt` (PostgreSQL, agente v5):
+  - `pyodbc`, `pymysql`, `psycopg2-binary`, `requests`, `fdb` (Firebird sin DSN), `cryptography` (validación de actualizaciones), `pywin32` (solo Windows, servicio). Build: `requirements_build.txt` (Nuitka).
 - `dwh_api/requirements.txt`:
   - `requests`.
 
@@ -492,7 +493,7 @@ python client.py              # MySQL
 python client_postgres.py     # PostgreSQL
 ```
 
-> En producción conviene correr el cliente como **servicio de Windows** (usando los `.spec` de PyInstaller para compilar a `.exe` y el Administrador de servicios / NSSM).
+> **Agente PostgreSQL (v5) en producción**: no se instala con Python ni con PyInstaller. Se distribuye compilado con **Nuitka** (`NexusAgent.exe`, sin fuentes) y se instala como **servicio de Windows con cuenta virtual de mínimo privilegio** con `scripts\install_service.ps1`; las actualizaciones se validan (firma del manifiesto, versión, SHA-256, Authenticode) con `scripts\update_agent.ps1`. Ver **sección 21**. Ejecutar con `python client_postgres.py` queda para desarrollo y pruebas. El cliente MySQL legado (`client.py`) sigue con PyInstaller/NSSM.
 
 ### 10.6. Desplegar el monitor (opcional)
 
@@ -507,15 +508,17 @@ python nexus_monitor.py
 
 ---
 
-## 11. Compilar a ejecutables (PyInstaller)
+## 11. Compilar a ejecutables
 
-Plantillas incluidas:
+**Agente PostgreSQL v5**: se compila con **Nuitka** (`dwh_client/packaging/build_agent.ps1` en Windows o el job `agente-windows` del CI) → `dwh_client/build/dist/NexusAgent/`. Evaluación de herramientas, contenido del paquete, firma y actualizaciones: **sección 21**. **PyInstaller no protege el código** (empaqueta bytecode que se extrae y descompila en minutos): no se usa para el agente v5.
+
+**Legado (PyInstaller)** — solo backend MySQL, utilidades, cliente MySQL `client.py` y monitor. Plantillas existentes en el repositorio: `dwh_client/mgd_client.spec` (compila `client.py`, MySQL), `dwh_back/mgd_server.spec` (`main.py`, MySQL) y `dwh_api/mgd_monitor.spec`. Las demás que se mencionaban antes:
 
 - Backend MySQL: `mgd_server.exe.spec`, `mgd_server.spec`.
 - Backend PostgreSQL: `mgd_server_postgres.exe.spec`, `mgd_server_postgres.spec`.
 - Utilidad de cifrado: `encrypter.exe.spec`, `mgd_encrypt_config_secret.spec`.
 - Cliente MySQL: `mgd_client.exe.spec`, `mgd_client.spec`.
-- Cliente PostgreSQL: `mgd_client_postgres.exe.spec`, `mgd_client_postgres.spec`.
+- ~~Cliente PostgreSQL: `mgd_client_postgres.exe.spec`, `mgd_client_postgres.spec`~~ (reemplazado por Nuitka, sección 21).
 - Monitor: `dwh_api/mgd_monitor.spec`.
 
 Scripts auxiliares de build:
@@ -574,6 +577,9 @@ Si el IDE falla con “Maven artifact ... cannot be resolved”, descarga el JAR
 - [ ] Agentes actualizados a v5 y **tokens de enrolamiento borrados** de los `config.ini` tras enrolar; cuando no queden agentes legados, `[agent] legacy_endpoints = false`.
 - [ ] Carpeta `agent_data` del agente con ACL solo para la cuenta del servicio y administradores.
 - [ ] `api_url` del agente con HTTPS y `mode = production` (sin `allow_insecure_http`).
+- [ ] Agente instalado como servicio con `install_service.ps1` (cuenta `NT SERVICE\NexusAgent`, sin privilegios de administrador, `C:\ProgramData\NexusAgent` sin acceso para Usuarios); logins de BD dedicados (origen solo lectura, DWH dueño solo de sus esquemas) (§21.3).
+- [ ] Paquetes del agente con firma Authenticode y manifiesto firmado (Ed25519) cuando existan certificado y clave; `[agent] latest_version` del backend al día para ver versiones desactualizadas (§21.5–21.6).
+- [ ] Política de Windows Error Reporting / volcados de memoria revisada por el cliente (§21.2).
 - [ ] Panel: usuarios nominales con el rol mínimo y alcance por grupo; `[admin] allow_static_token = false`; revisar **Auditoría** periódicamente; `DWH_COOKIE_SECURE=true` detrás de HTTPS.
 - [ ] Panel detrás de un proxy inverso (nginx) que **sobrescriba** `X-Real-IP` con `DWH_CLIENT_IP_HEADER=x-real-ip`, `DWH_PANEL_PROXY_KEY` = `[auth] panel_proxy_key` (aleatoria, distinta por entorno) y `DWH_PUBLIC_ORIGIN` con la URL pública; sin esto no hay límite de login por IP (§20.3).
 
@@ -818,9 +824,10 @@ python client_postgres.py                 # servicio: bucle continuo
 python client_postgres.py --once          # ejecuta lo vencido, vacía la cola y sale
 python client_postgres.py --enroll        # fuerza un enrolamiento nuevo (borra la credencial local)
 python client_postgres.py --config RUTA --data-dir RUTA
+python client_postgres.py --selftest      # drivers/TLS/SQLite sin red (también NexusAgent.exe --selftest)
 ```
 
-Códigos de salida: 0 ok, 1 error inesperado (el gestor del servicio debe reiniciar), 2 configuración, 3 credencial revocada/inválida.
+Códigos de salida: 0 ok, 1 error inesperado (el gestor del servicio debe reiniciar), 2 configuración, 3 credencial revocada/inválida, 4 paquete de actualización rechazado (`--verify-update`). En producción el agente corre compilado como servicio de Windows (sección 21); ahí el enrolamiento lo hace el servicio con un token de un solo uso, **no** `--enroll` desde una consola de administrador.
 
 ### 17.12. Pruebas automatizadas
 
@@ -1242,3 +1249,164 @@ Panel (servidor Next): script de prueba de CSRF y proxy (cabecera obligatoria, O
 ### 20.13. Pendiente / fuera de alcance
 
 SSO y MFA (TOTP) — futuros; límites de tasa distribuidos (hoy en memoria por proceso); los nombres por defecto de bases monitoreadas incluyen el grupo que las registró.
+
+---
+
+## 21. Distribución del agente: compilación, servicio de Windows, firma y actualizaciones
+
+Fase 5. Resumen de entrega de todas las fases: [ENTREGA_ENDURECIMIENTO.md](ENTREGA_ENDURECIMIENTO.md).
+
+### 21.1. Herramienta de compilación: evaluación y decisión
+
+| Opción | Qué hace con el código | Protección real | Drivers (psycopg2, pyodbc, pymysql, fdb, cryptography) | Decisión |
+|---|---|---|---|---|
+| **PyInstaller** (specs actuales `mgd_*.spec`) | Empaqueta el **bytecode** `.pyc` en un archivo dentro del `.exe` | Casi nula: `pyinstxtractor` + un descompilador recuperan el código en minutos | Sí | Solo para los clientes **legados** (MySQL `client.py`); no es protección |
+| **Nuitka** (standalone) | Traduce el Python a **C** y lo compila a código máquina; no quedan `.pyc` propios | Media: obliga a ingeniería inversa de código nativo; las cadenas constantes (mensajes, consultas de catálogo) siguen siendo legibles | Sí (probado: el binario compilado pasa `--selftest` y las pruebas de proceso) | **Elegida** |
+| Nuitka comercial | Además cifra constantes y trazas, anti-depuración | Algo mayor | Sí | Opcional, requiere licencia; no incluido |
+| PyArmor | Ofusca bytecode con runtime propio | Media; licencia comercial por uso; runtime detectable/rompible | Sí, con PyInstaller | No requerido (capa opcional si se licencia) |
+| Cython (manual) | Compila módulos a `.pyd` | Parecida a Nuitka | Sí, pero hay que empaquetar igual | Más trabajo de mantenimiento sin ventaja |
+
+**Decisión**: Nuitka `--mode=standalone` (carpeta con `NexusAgent.exe` + DLL/PYD de terceros), **no** `onefile`: onefile se autoextrae en `%TEMP%` en cada arranque (deja archivos, arranca más lento, más falsos positivos de antivirus y no se puede validar/firmar archivo por archivo). Opciones relevantes (`packaging/build_agent.py`): `--python-flag=no_site,isolated,safe_path` (el ejecutable ignora `PYTHONPATH`/`PYTHONHOME`, `site-packages` y el directorio actual), `--python-flag=no_docstrings` (el binario no lleva docstrings; `verify_package.py` lo comprueba), `--nofollow-import-to` pruebas/pytest/pip, `--noinclude-{pytest,setuptools,unittest}-mode=nofollow`, `--remove-output`, `--report` (inventario de lo compilado), metadatos de versión de Windows (compañía, producto, versión = `AGENT_VERSION`) y MSVC. Un **único ejecutable de consola** sirve para todos los modos: `--service` (lo usa el SCM; en la sesión 0 no hay ventana), `--selftest`, `--version`, `--verify-update`, `--once`, `--enroll`.
+
+### 21.2. Qué lleva (y qué no) el paquete
+
+`build/dist/NexusAgent/`: `NexusAgent.exe`, runtime de Python y extensiones/DLL de terceros, `certifi/cacert.pem`, `config.example.ini` (plantilla **sin valores**), `LEEME.txt`, `scripts\` (instalar, desinstalar, actualizar, token de enrolamiento) y `release.json` (+ `release.json.sig` cuando se firma).
+
+`packaging/verify_package.py` (lo ejecuta el build y el CI) **falla** si encuentra: `.py/.pyc/.pyo` o `__pycache__` (los propios siempre; los de terceros también salvo `--allow-third-party-py`), texto de nuestro **código fuente** incrustado en binarios (líneas "canario" que solo existen en las fuentes), `.sql`, carpetas/archivos de pruebas, `config.ini` u otro `.ini`, una plantilla con valores en claves sensibles (`token`, `password`, `secret`…), datos locales del agente (`agent_data`, `*.dpapi`, `agent_credential*`, `agent_state.db*`, `enrollment_token*`), logs, volcados (`*.dmp`), `.env`, llaves privadas PEM, `.pfx/.p12/.key`, o archivos que no coincidan con `release.json`. También falla si encuentra **docstrings** propios (el build compila sin ellos). Las demás **cadenas constantes** (mensajes de log y error, nombres de tablas/campos, consultas al catálogo de PostgreSQL del inventario, URLs de la API) **siguen siendo legibles** con `strings`: es inherente a cualquier compilador. Resultado real del build de prueba en macOS: 71 archivos, 0 `.py/.pyc`, 0 canarios de código ni de docstrings.
+
+**SQL y catálogo**: el paquete no contiene SQL de negocio ni el catálogo de consultas; el agente descarga **solo** las tareas autorizadas para su alcance y las mantiene **en memoria** (fase 1: la config caduca a los `config_max_age_seconds`, nunca se escribe a disco, la cola SQLite rechaza claves como `extract_sql`). El empaquetado no agrega cachés: no hay fuentes que generen `__pycache__` (y `client_postgres.py` fija `sys.dont_write_bytecode`), la carpeta del programa es de solo lectura para el servicio y Nuitka standalone no extrae nada a `%TEMP%`.
+
+**Volcados de memoria (Windows Error Reporting)**: si el proceso fallara, WER puede generar un volcado que contenga memoria del proceso (SQL o credenciales recibidas de Nexus) y, según la política de la máquina, enviarlo a Microsoft o guardarlo en `%ProgramData%\Microsoft\Windows\WER`. El agente **no** habilita volcados propios, no usa `faulthandler` a archivo y el instalador **no modifica** WER (es una política del cliente). Recomendación para el administrador de la sede: revisar `HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting` (consentimiento y `LocalDumps`) según su política; si se habilitan `LocalDumps` para `NexusAgent.exe`, proteger la carpeta de volcados como información sensible.
+
+### 21.3. Servicio de Windows con mínimo privilegio
+
+`scripts\install_service.ps1` (PowerShell como administrador):
+
+| Elemento | Configuración |
+|---|---|
+| Programa | `C:\Program Files\NexusAgent` — Administradores/SYSTEM control total; servicio y Usuarios **solo lectura/ejecución** (el servicio no puede modificar su binario ni sus DLL) |
+| Datos | `C:\ProgramData\NexusAgent\config.ini` (servicio: solo lectura), `data\` (credencial DPAPI, cola SQLite, token de un solo uso) y `logs\` (servicio: modificación). **Sin acceso para Usuarios**; herencia cortada |
+| Cuenta | **Cuenta virtual `NT SERVICE\NexusAgent`**: no es administrador, no tiene contraseña que gestionar, SID propio para las ACL; en red sale como la cuenta de equipo |
+| Privilegios | `sc privs` = solo `SeChangeNotifyPrivilege` (se quitan `SeImpersonatePrivilege`, `SeCreateGlobalPrivilege`, etc.). Sin `SeDebug`, sin derechos de administrador |
+| SID del servicio | `unrestricted` (el tipo `restricted`, más estricto, queda como endurecimiento a validar en Windows real) |
+| Inicio | Automático retrasado |
+| Recuperación | Reinicio a 1, 5 y 15 min (contador a 24 h) **solo ante caídas** (`failureflag 0`) |
+| Red | Solo conexiones **salientes** (HTTPS a Nexus, origen y DWH). No se crean reglas de firewall ni puertos de entrada |
+| No hace | No toca Defender, firewall, registro de eventos, auditoría ni WER; no oculta el proceso (aparece como `NexusAgent.exe` / servicio "Nexus DWH Agent") |
+
+- **binPath**: `"C:\Program Files\NexusAgent\NexusAgent.exe" --service --config "C:\ProgramData\NexusAgent\config.ini" --data-dir "C:\ProgramData\NexusAgent\data"`.
+- **Parada** (Detener o apagado del equipo): el servicio informa `STOP_PENDING` con un `waitHint` = `shutdown_grace_seconds` + 50 s y llama `agent.stop()`: la tarea en curso termina o hace `ROLLBACK` (sin cargas parciales) y la cola queda en disco. En un apagado del equipo Windows concede pocos segundos: la carga en curso se revierte y se repite en el siguiente arranque (idempotente con claves de upsert, §17.4).
+- **Códigos de salida** del servicio (`sc query NexusAgent` → `SERVICE_EXIT_CODE`): 0 parada normal; **2** configuración (p. ej. sin credencial ni token) y **3** credencial revocada o token rechazado: el servicio queda **detenido** (no se reinicia en bucle; el operador corrige). Un error inesperado (1) termina el proceso sin informar `STOPPED` para que el SCM aplique la recuperación.
+- **Enrolamiento**: debe hacerlo la **cuenta del servicio** para que DPAPI quede ligado a ella. Por eso **no** se usa `NexusAgent.exe --enroll` desde una consola de administrador (la credencial quedaría cifrada para el administrador). Flujo: `install_service.ps1 -TokenType agency|company|group` (o después `scripts\set_enrollment_token.ps1`) pide el token **sin mostrarlo** y lo escribe en `data\enrollment_token.ini` (ACL de `data\`); al arrancar, el servicio se enrola, guarda su credencial y **borra** ese archivo (si Nexus rechaza el token, lo sobrescribe y borra —el token rechazado **no** queda en claro—, deja una marca `enrollment_token.ini.rechazado` con solo fecha y código, registra que hay que re-enrolar y se detiene con código 3; si al arrancar ya hay credencial y queda un token sin consumir, lo borra). Re-enrolar: `set_enrollment_token.ps1 -Reenroll` (detiene, borra la credencial local, entrega un token nuevo y arranca; revoque la instalación anterior en el panel). El archivo se borra con `unlink` (en SSD no se garantiza el borrado físico): el token de enrolamiento debe tratarse como de corta vida y regenerarse si hay duda.
+- **DPAPI y la cuenta**: con `credential_scope = user` (defecto) solo `NT SERVICE\NexusAgent` descifra la credencial. Al arrancar, el servicio registra `Cuenta: … | protección de la credencial: DPAPI (user) OK` (autoprueba en memoria). Los errores que detienen el servicio (configuración, credencial revocada) van al log del agente **y** al Registro de eventos de Windows (Aplicación); si `config.ini` ni siquiera se puede leer, el motivo se escribe en `<DataRoot>\logs\nexus_agent.log`; si fallara con la cuenta virtual, use `credential_scope = machine` (cualquier proceso **de esa máquina** puede descifrar; se compensa con la ACL de `data\`). En ambos casos un **administrador local** puede obtener la credencial (§21.7).
+- **Privilegios en las bases** (fuera del agente, a configurar por el DBA):
+  - **Origen (DMS)**: login dedicado de **solo lectura** con `SELECT` únicamente sobre los objetos de las consultas (SQL Server: usuario en `db_datareader` o `GRANT SELECT` por objeto; sin `db_owner`, sin `sysadmin`). El origen PostgreSQL ya se abre en modo solo lectura.
+  - **DWH**: login dedicado **dueño solo del/los esquema(s) destino** (`CREATE`, `INSERT`, `UPDATE`, `SELECT`, `ALTER` de sus tablas; `CREATE` en la base solo si el agente debe crear esquemas nuevos). Sin superusuario ni `CREATEROLE`.
+  - **Inventario**: hoy usa las credenciales DWH del grupo en sesión de solo lectura (§19.1). Un rol de inventario separado (`CONNECT` + `USAGE`) por grupo queda **pendiente** (requiere columnas cifradas nuevas en `client_group`, API, panel y agente).
+
+### 21.4. Compilar
+
+Equipo de build Windows x64: Python 3.12 x64 (python.org) y Visual Studio 2022 Build Tools ("Desktop development with C++").
+
+```powershell
+cd dwh_client
+powershell -ExecutionPolicy Bypass -File packaging\build_agent.ps1        # venv aislado + Nuitka + verificación
+# → build\dist\NexusAgent\  y  build\NexusAgent-<versión>-windows-x64-SIN-FIRMAR.zip
+```
+
+Dependencias fijadas: `requirements_postgres.txt` (ejecución: pyodbc, pymysql, psycopg2-binary, requests, **fdb**, **cryptography**, **pywin32** solo Windows) y `requirements_build.txt` (Nuitka 4.2.2). `packaging/build_agent.sh` hace lo mismo en macOS/Linux **solo como prueba de humo** de la configuración de Nuitka (no se distribuye). El CI compila en `windows-latest` (§21.10). Requisitos externos de la máquina destino que **no** van en el paquete: driver ODBC del origen (SQL Server 17/18, Pervasive, Firebird ODBC) y, para Firebird sin DSN, el cliente Firebird (`fbclient.dll`).
+
+### 21.5. Firma de código (Authenticode) — pendiente de certificado
+
+- `packaging/windows/sign_release.ps1` firma `NexusAgent.exe` y `scripts\*.ps1` con **signtool**, SHA-256 y **sello de tiempo RFC 3161** obligatorio (`-TimestampUrl`), verifica (`signtool verify /pa` y `Get-AuthenticodeSignature`) y regenera `release.json` declarando firmante (sujeto y huella). **No crea certificados ni simula firmas**: sin certificado, falla.
+- Desde junio de 2023 las claves de firma de código deben estar en **hardware** (token/HSM) o en un servicio de firma: modos `-Mode CertStore -CertThumbprint …` (certificado del almacén con clave en token/HSM, típico en un runner propio) y `-Mode TrustedSigning -DlibPath … -MetadataPath …` (Azure Trusted Signing). `-IncludeThirdPartyBinaries` firma además DLL/PYD de terceros sin firma (para políticas WDAC/AppLocker).
+- CI: la firma es un job separado (`firma-windows`) que **nunca corre en pull requests**, usa el entorno protegido `firma-codigo` (configure en GitHub revisores/ramas permitidas) y los valores le llegan por variables de entorno (no se interpolan en el script). Solo corre si el repositorio define `vars.NEXUS_SIGN_MODE` (+ `NEXUS_SIGN_TIMESTAMP_URL`, `NEXUS_SIGN_CERT_THUMBPRINT` o `NEXUS_SIGN_DLIB`/`NEXUS_SIGN_METADATA`, y los secretos `AZURE_CLIENT_ID/TENANT_ID/CLIENT_SECRET` para Trusted Signing). Sin eso el artefacto se llama `NexusAgent-<versión>-windows-x64-SIN-FIRMAR` y `release.json` declara `"authenticode": {"signed": false, "note": "SIN FIRMAR"}`.
+- **Hoy no hay certificado**: todos los paquetes son **SIN FIRMAR**. Consecuencias: SmartScreen/directivas pueden bloquear el `.exe` y los `.ps1` (ejecutar con `-ExecutionPolicy Bypass`), y la autenticidad solo la da la firma Ed25519 del manifiesto (§21.6), también pendiente de clave.
+
+### 21.6. Manifiesto de publicación y validación de actualizaciones
+
+- `release.json`: formato `nexus-agent-release/1`, producto, versión, plataforma (`windows-x64`), `min_from_version` opcional, datos del build (fecha, commit, Python, Nuitka), estado Authenticode y **SHA-256 + tamaño de cada archivo**.
+- `release.json.sig`: firma **Ed25519** de los bytes exactos de `release.json` con la clave **de publicación** de Nexus. Las claves **públicas** confiables se compilan dentro del agente (`nexus_agent/release_keys.py`): el paquete nuevo lo valida el binario **ya instalado**, así que el ancla de confianza es la versión anterior y no el paquete que se quiere instalar.
+- Validación (`NexusAgent.exe --verify-update CARPETA`, `nexus_agent/updates.py`): firma con clave confiable (`--allow-unsigned-manifest` es un modo de transición que solo existe mientras el agente **no** tenga claves compiladas: verifica integridad, **no** autenticidad; en cuanto `release_keys.py` tenga una clave, un manifiesto sin firma se rechaza siempre, sin opción de saltarlo) → formato y plataforma → versión **mayor** que la instalada (sin downgrade; misma versión solo con `--allow-same-version`) y `min_from_version` → **sin enlaces simbólicos ni junctions** (archivos, carpetas o la raíz) → rutas seguras en Windows (sin `..`, sin `:` de flujos alternativos NTFS, sin nombres de dispositivo `CON/PRN/AUX/NUL/COM1-9/LPT1-9` con o sin extensión, sin punto o espacio final, sin duplicados que solo difieran en mayúsculas) → entradas bien formadas (tamaño entero, SHA-256 de 64 hex; un manifiesto hostil da rechazo controlado, sin traza) → cada archivo existe con su tamaño y SHA-256, **ningún archivo extra** (evita DLL plantadas) → si declara Authenticode, firma válida (`WinVerifyTrust`) de los ejecutables. Código de salida 4 = rechazado.
+- Pipeline de publicación: `build_agent.ps1` → `sign_release.ps1` (Authenticode; regenera `release.json`) → `tools/sign_manifest.py --package … --key …` en la máquina que custodia la clave (pide la frase de paso sin eco; avisa si la clave no está en `release_keys.py`) → comprimir y distribuir.
+- **Clave de publicación** (`tools/gen_release_key.py --out <fuera del repo>`): Ed25519, PEM PKCS#8 **cifrado** con frase de paso; imprime la línea para `release_keys.py`. Custodia recomendada: fuera del repositorio y del CI público (HSM/bóveda o medio fuera de línea con respaldo, dos personas); rotación = agregar la nueva en una versión, publicar con ella y retirar la vieja en la siguiente. `.gitignore` excluye `*.ed25519`, `*.pfx`, `*.p12`. **Pendiente**: generar la clave de producción y agregar su pública a `release_keys.py`; hasta entonces `release_keys.py` está vacío y toda actualización exige `-AllowUnsignedManifest`.
+- El agente **no se auto-actualiza** (no descarga ni ejecuta nada por su cuenta). Actualiza el operador con `update_agent.ps1` (§21.9). El panel marca **Desactualizada** a las instalaciones que reportan una versión menor que `[agent] latest_version` del backend (solo informativo).
+
+### 21.7. Límites de la protección (léase)
+
+- La compilación con Nuitka **dificulta** leer y modificar el programa; **no** es cifrado ni DRM. Las cadenas constantes (mensajes, consultas al catálogo de PostgreSQL del inventario, nombres de campos) son legibles en el binario, y las trazas incluyen nombres de módulo y líneas.
+- **No impide** extraer de la **memoria** del proceso las consultas SQL, las credenciales de origen/DWH ni el secreto de la instalación que el agente recibe de Nexus para trabajar: cualquiera con privilegios de administrador (o `SeDebugPrivilege`) en la máquina puede volcar la memoria, adjuntar un depurador o leer la credencial DPAPI.
+- **No impide** capturar las consultas en el **motor** de base de datos (SQL Server Profiler/Extended Events, `pg_stat_statements`, `log_statement`, auditoría del DBMS) ni en la red interna hacia el origen/DWH si esas conexiones no usan TLS.
+- El agente **no** oculta su proceso, **no** desactiva ni interfiere con antivirus, EDR, auditoría o herramientas del cliente, y no pide privilegios de administrador. Es intencional.
+- Lo que sí aporta: sin fuentes ni catálogo completo en disco, SQL solo en memoria y solo lo autorizado, credencial por instalación revocable, ACL y cuenta de mínimo privilegio, integridad/autenticidad de actualizaciones (cuando existan la clave y el certificado) y trazabilidad en Nexus (quién descargó qué tarea y cuándo, `task_download_log`).
+
+### 21.8. Instalación nueva (paso a paso)
+
+1. En el panel: crear la agencia/empresa y copiar su token de enrolamiento (prefiera agencia/empresa sobre grupo, §17.9).
+2. Copiar el paquete (zip) a la máquina, verificar su origen (SHA-256 publicado junto al zip o firma Authenticode cuando exista) y descomprimirlo en una carpeta **solo para Administradores** (no `C:\Temp` ni el Escritorio), p. ej.:
+   ```powershell
+   mkdir C:\NexusAgentPkg
+   icacls C:\NexusAgentPkg /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F
+   ```
+   Los scripts, además, **copian primero** el paquete a su propia carpeta protegida y validan solo esa copia (evita que alguien cambie archivos entre la validación y el uso).
+3. PowerShell **como administrador**, en la carpeta del paquete:
+   ```powershell
+   NexusAgent.exe --selftest
+   powershell -ExecutionPolicy Bypass -File .\scripts\install_service.ps1 -PackageDir . `
+       -ApiUrl https://nexus.midominio.com -TokenType agency  [-AllowUnsignedManifest]
+   ```
+   El instalador crea `C:\Program Files\NexusAgent` nueva (propietario Administradores, solo Administradores/SYSTEM), copia y valida ahí; crea el servicio **deshabilitado**, lo configura (cuenta, SID, privilegios, recuperación, ACL, token) y solo al final lo pasa a automático retrasado; ante cualquier fallo elimina el servicio y la carpeta del programa. Si `C:\ProgramData\NexusAgent` ya existía, el instalador **aborta** cuando algún elemento no pertenece a Administradores/SYSTEM o hay enlaces/junctions (una carpeta precreada por un usuario sin privilegios podría traer un `config.ini` con otro `api_url`); en una reinstalación se aceptan además, solo dentro de `data\` y `logs\`, los archivos cuyo propietario es el SID del propio servicio (`NT SERVICE\NexusAgent`: credencial, cola, logs), y se restablecen los permisos conservando la credencial y la cola. El token de enrolamiento se escribe con `CreateNew` y se borra si la instalación falla. Con un paquete firmado, `-ExpectedSignerThumbprint` fija el firmante (la huella nunca se toma del manifiesto). `-AllowUnsignedManifest` es necesario mientras no exista la clave de publicación. Opcional: `-CredentialScope machine`, `-InstallDir`, `-DataRoot`, `-ExpectedSignerThumbprint`, `-NoStart`.
+4. Revisar `C:\ProgramData\NexusAgent\logs\nexus_agent.log` (enrolamiento, `DPAPI (user) OK`) y el panel (Instalaciones → aparece la máquina; Salud → latido). Ajustar `C:\ProgramData\NexusAgent\config.ini` si hace falta (`[agent] …`, §17.10) y reiniciar el servicio.
+5. Desinstalar: `scripts\uninstall_service.ps1` (conserva datos) o con `-RemoveProgram -RemoveData`; revocar la instalación en el panel.
+
+### 21.9. Actualización y transición desde instalaciones existentes
+
+**Agente ya instalado con este servicio** (5.2.0 en adelante):
+
+```powershell
+# Descomprimir el paquete nuevo en una carpeta solo para Administradores (§21.8) y, como administrador,
+# ejecutar SIEMPRE el script de la versión INSTALADA (nunca el que trae el paquete nuevo):
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\NexusAgent\scripts\update_agent.ps1" `
+    -PackageDir C:\NexusAgentPkg\NexusAgent-5.3.0  [-AllowUnsignedManifest] [-ExpectedSignerThumbprint <huella>]
+```
+
+Pasos del script: copia el paquete a `…\NexusAgent.new-<fecha>` creada nueva **solo para Administradores/SYSTEM** (propietario Administradores) y hace **todas** las comprobaciones sobre esa copia: `--verify-update` **con el binario instalado** → Authenticode (instalada firmada: mismo firmante o `-ExpectedSignerThumbprint`; instalada sin firma y nueva firmada —**primer paquete firmado**—: exige `-ExpectedSignerThumbprint`, la huella no se toma del manifiesto; instalada firmada y nueva sin firma: rechazo salvo `-AllowSignatureDowngrade`) → permisos definitivos → detiene el servicio y espera a que el proceso salga (si no para, no cambia nada y lo vuelve a arrancar) → `NexusAgent` → `NexusAgent.prev`, nuevo → `NexusAgent` con **reintentos con espera** si algo tiene la carpeta abierta (mensaje claro: consola/Explorador dentro de la carpeta) → arranca y comprueba salud (servicio en ejecución `-HealthSeconds` y una línea de arranque de la versión nueva **escrita después de este arranque**). **Cualquier** fallo o excepción (incluido un `Start-Service` que falla o un cambio de nombre que no se puede hacer) lleva a la **restauración**: detiene (y si hace falta termina) el proceso nuevo, mueve la versión fallida a `NexusAgent.failed-<fecha>`, devuelve la anterior a su lugar, arranca el servicio y comprueba que corre la versión anterior (código 3). Si la restauración misma no queda completa, lo dice en rojo con el estado y los pasos manuales (código 1): nunca deja el programa ausente ni el servicio detenido en silencio. Códigos: 0 ok, 1 error, 3 restaurado, 4 paquete rechazado. Los datos (`config.ini`, credencial, cola, agenda) no se tocan y son compatibles dentro de 5.x.
+
+**Desde instalaciones anteriores** (compatibilidad):
+
+| Hoy corre… | Transición |
+|---|---|
+| Agente v5 con fuentes (`python client_postgres.py`) o `.exe` de PyInstaller, con `agent_data` propio | 1) Detener el proceso/servicio anterior (NSSM, tarea programada…). 2) `install_service.ps1` (datos nuevos en `C:\ProgramData\NexusAgent`). 3) La credencial DPAPI anterior está ligada a **otra cuenta**: enrolar de nuevo con `-TokenType` y **revocar** la instalación vieja en el panel. El watermark y el estado de sincronización viven en Nexus (`task_sync_state`), así que la nueva instalación continúa donde quedó; la agenda local se reconstruye con `last_success_at`. 4) Si la cola anterior tenía reportes pendientes, dejar que el agente viejo la vacíe antes (`--once`) o aceptar que esos reportes se pierdan (la carga ya confirmada en el DWH no se repite porque el watermark confirmado es el de Nexus; las no confirmadas se recargan: idempotente con claves de upsert; sin claves puede duplicar, §17.4). |
+| Agentes v3/v4 (tokens, endpoints legados) | Igual que arriba; siguen funcionando mientras `[agent] legacy_endpoints = true`. La primera corrida v5 usa el `last_run_at` legado con `legacy_watermark_overlap_seconds` (§17.4). Cuando no quede ninguno (panel → Clientes legados), `legacy_endpoints = false`. |
+| Cliente MySQL (`client.py`, `mgd_client.spec`) | Fuera de alcance: sigue con PyInstaller (sin protección) y sus endpoints. |
+
+El backend acepta agentes 5.1 y 5.2 a la vez (la API `/agent/*` no cambió en esta fase); no hay migración de BD nueva en la fase 5.
+
+### 21.10. CI (`.github/workflows/ci.yml`)
+
+- Permisos `contents: read`, acciones fijadas a versión mayor, sin secretos en los logs; se ejecuta en PR, push a `main` y manual.
+- **backend-agente** (ubuntu): levanta los tres PostgreSQL con los mismos nombres/puertos del entorno local (§17.12), crea `.venv` y corre `dwh_back/tests` y `dwh_client/tests`. El soporte de pruebas acepta `NEXUS_TEST_CFG_HOST/PORT/PASSWORD`, `NEXUS_TEST_SRC_HOST/PORT/CONTAINER`, `NEXUS_TEST_DWH_HOST/PORT/CONTAINER`, `NEXUS_TEST_BACK_PY`, `NEXUS_TEST_CLIENT_PY` y `NEXUS_TEST_AGENT_EXE` (ejecuta las pruebas de proceso contra el **binario compilado**).
+- **panel** (ubuntu): `pnpm install --frozen-lockfile`, `typecheck`, `lint`, `build`.
+- **agente-windows** (windows-latest): pruebas de empaquetado (incluye **DPAPI real** en ambos alcances y **WinVerifyTrust**), compilación Nuitka + `verify_package.py`, `--version/--selftest/--verify-update`, y prueba del **servicio real**: instalación con cuenta virtual (comprueba cuenta, privilegios, recuperación, código 2 sin token, `DPAPI (user) OK` con `NT SERVICE\NexusAgent`, ACL), token de un solo uso con Nexus inaccesible (servicio en ejecución reintentando, token ausente del log), `config.ini` inválido → detenido con 2 y motivo en el log (y Registro de eventos, aviso si no aparece), sin acceso de Usuarios a `data\`, actualizaciones con la copia **instalada** de `update_agent.ps1`: paquete cuya versión no arranca como la declarada → **vuelta atrás** (3); paquete cuyo ejecutable no arranca como servicio (`Start-Service` lanza excepción) → **vuelta atrás** (3) y carpeta `failed-*`; carpeta del programa bloqueada por un proceso con el directorio actual dentro → sin pérdida del programa y servicio de nuevo en ejecución; paquete alterado → rechazado (4); tras cada caso, versión original en ejecución y sin carpetas de trabajo; desinstalación. Publica el paquete **SIN FIRMAR** y el informe de Nuitka. **firma-windows**: job aparte (nunca en PR, entorno protegido `firma-codigo`) que descarga ese artefacto, firma, regenera el manifiesto, verifica y publica `…-firmado`.
+- **Estado**: definido y revisado, pero **no ejecutado todavía** (se ejecutará al subir la rama). La compilación Windows, el servicio y DPAPI con cuenta virtual solo se validan ahí.
+
+### 21.11. Variables nuevas
+
+- Agente (`NexusAgent.exe` / `client_postgres.py`): argumentos `--service`, `--selftest`, `--verify-update CARPETA`, `--allow-unsigned-manifest`, `--allow-same-version`. Archivo opcional `<data_dir>\enrollment_token.ini` (`[nexus] group_token|agency_token|token`, un solo uso). Sin claves nuevas en `config.ini`.
+- Backend: `[agent] latest_version` (informativo, vacío = sin comparación). La API de instalaciones devuelve además `latest_version` y `version_status` (`current|outdated|unknown`).
+- Instalador: parámetros de los scripts (`-ApiUrl`, `-TokenType`, `-CredentialScope`, `-InstallDir`, `-DataRoot`, `-AllowUnsignedManifest`, `-ExpectedSignerThumbprint`, `-HealthSeconds`…).
+- CI (opcionales, del repositorio): `vars.NEXUS_SIGN_MODE`, `NEXUS_SIGN_TIMESTAMP_URL`, `NEXUS_SIGN_CERT_THUMBPRINT`, `NEXUS_SIGN_DLIB`, `NEXUS_SIGN_METADATA`; secretos `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`.
+- Pruebas: `NEXUS_TEST_*` (§21.10).
+
+### 21.12. Pruebas
+
+```
+cd dwh_client && .venv/bin/python -m pytest tests/test_packaging.py -q
+cd dwh_client && NEXUS_TEST_AGENT_EXE=build/dist/NexusAgent/NexusAgent .venv/bin/python -m pytest tests/test_integration.py tests/test_health_integration.py -q
+```
+
+`test_packaging.py`: manifiesto firmado válido (claves **efímeras** generadas en la prueba, no una firma de producción), archivo alterado (tamaño y hash), manifiesto modificado tras firmar, clave desconocida, sin claves confiables, downgrade/misma versión/`min_from_version`, sin firma solo en modo explícito (y aun así con integridad), DLL no declarada, rutas con `..`, Authenticode declarado (válido/inválido/sin firma/no comprobable), plataforma, `--verify-update` por CLI (códigos 0/4), `make_manifest.py` tras firmar; `verify_package.py` (paquete limpio, manifiesto, 14 casos prohibidos, plantilla con valores, terceros tolerados solo en modo explícito, plantilla del repo sin valores); servicio (waitHint, códigos de salida, parada antes/después de crear el agente, `--service` fuera de Windows, `run_agent` en hilo no principal sin señales ni consola); token de un solo uso (prioridad, BOM, se borra al enrolar, se aparta si se rechaza); autoprueba de la credencial; `--version`/`--selftest`; con claves confiables no hay modo sin firma (API y CLI); rutas prohibidas en Windows (18 casos: `:`/ADS, dispositivos reservados, punto/espacio final, unidad, UNC, `..`, vacías, control) y permitidas parecidas (`console.dll`, `com10.dll`); duplicados por mayúsculas; 8 entradas y 5 manifiestos hostiles con rechazo controlado (código 4, sin traza); enlaces simbólicos (archivo, carpeta hacia fuera, raíz); docstrings detectados por `verify_package.py`; token rechazado sin quedar en claro y token sobrante borrado con credencial existente; error de configuración en modo servicio escrito en `<data_dir>/../logs`; en Windows: DPAPI real (`user` y `machine`) y `WinVerifyTrust`.
+
+### 21.13. Pendiente
+
+No probado por falta de certificado: las ramas de Authenticode de los scripts (firmante fijado, primer paquete firmado, rechazo de firmado→sin firmar) solo están revisadas, no ejecutadas. Certificado de firma de código (token/HSM o Azure Trusted Signing) y su configuración en el CI; clave Ed25519 de publicación de producción y su custodia; primera ejecución del job `agente-windows` (compilación, servicio con cuenta virtual, DPAPI) y prueba en un Windows Server real de la sede (drivers ODBC SQL Server/Pervasive/Firebird y `fbclient.dll`); SID de servicio `restricted`; credencial de inventario separada por grupo; `pip --require-hashes` para el build (hoy versiones fijadas sin hashes); instalador MSI (hoy scripts PowerShell).

@@ -33,13 +33,30 @@ import requests
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BACK_DIR = os.path.join(ROOT, "dwh_back")
 CLIENT_DIR = os.path.join(ROOT, "dwh_client")
-BACK_PY = os.path.join(BACK_DIR, ".venv", "bin", "python")
+# Todo es configurable por entorno (CI); los valores por defecto son los del entorno Docker local.
+_E = os.environ.get
+BACK_PY = _E("NEXUS_TEST_BACK_PY") or os.path.join(BACK_DIR, ".venv", "bin", "python")
+CLIENT_PY = _E("NEXUS_TEST_CLIENT_PY") or os.path.join(CLIENT_DIR, ".venv", "bin", "python")
 
-CFG_PG = {"host": "127.0.0.1", "port": 5546, "user": "postgres", "password": os.environ.get("NEXUS_TEST_CFG_PASSWORD", "devpass")}
-SRC = {"container": "nexus_dwh_test_src", "host": "127.0.0.1", "port": 5547, "database": "dms_test",
+CFG_PG = {"host": _E("NEXUS_TEST_CFG_HOST", "127.0.0.1"), "port": int(_E("NEXUS_TEST_CFG_PORT", "5546")),
+          "user": "postgres", "password": _E("NEXUS_TEST_CFG_PASSWORD", "devpass")}
+SRC = {"container": _E("NEXUS_TEST_SRC_CONTAINER", "nexus_dwh_test_src"), "host": _E("NEXUS_TEST_SRC_HOST", "127.0.0.1"),
+       "port": int(_E("NEXUS_TEST_SRC_PORT", "5547")), "database": "dms_test",
        "username": "postgres", "password": "src-test-pass-7Qx"}
-DWH = {"container": "nexus_dwh_test_dwh", "host": "127.0.0.1", "port": 5548, "database": "dwh_test",
+DWH = {"container": _E("NEXUS_TEST_DWH_CONTAINER", "nexus_dwh_test_dwh"), "host": _E("NEXUS_TEST_DWH_HOST", "127.0.0.1"),
+       "port": int(_E("NEXUS_TEST_DWH_PORT", "5548")), "database": "dwh_test",
        "username": "postgres", "password": "dwh-test-pass-9Kz"}
+
+
+def agent_cmd() -> list:
+    """
+    Comando del agente para las pruebas de proceso. Con ``NEXUS_TEST_AGENT_EXE`` se prueba el
+    EJECUTABLE COMPILADO (Nuitka) en lugar de las fuentes.
+    """
+    exe = _E("NEXUS_TEST_AGENT_EXE")
+    if exe:
+        return [exe]
+    return [CLIENT_PY, os.path.join(CLIENT_DIR, "client_postgres.py")]
 
 if BACK_DIR not in sys.path:
     sys.path.insert(0, BACK_DIR)

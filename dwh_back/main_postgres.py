@@ -109,6 +109,8 @@ AGENT_CONFIG_MAX_AGE = _ini.getint("agent", "config_max_age_seconds", fallback=9
 AGENT_ROTATION_GRACE = _ini.getint("agent", "rotation_grace_seconds", fallback=3600)
 AGENT_HEARTBEAT_RETENTION_DAYS = _ini.getint("agent", "heartbeat_retention_days", fallback=7)
 AGENT_DOWNLOAD_LOG_RETENTION_DAYS = _ini.getint("agent", "download_log_retention_days", fallback=30)
+# Última versión publicada del agente (solo informativo: el panel marca "Desactualizada" a las más viejas).
+AGENT_LATEST_VERSION = _ini.get("agent", "latest_version", fallback="").strip()
 # Endpoints legados (/configs, /group-configs, /agency-configs, /client-event,
 # /configs/{id}/last_run). true = siguen activos (compatibilidad); false = 410.
 LEGACY_ENDPOINTS_ENABLED = _ini.getboolean("agent", "legacy_endpoints", fallback=True)
@@ -1575,6 +1577,7 @@ _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers
     future_tolerance_hours=AGENT_FUTURE_TOLERANCE_HOURS,
     health=HEALTH_ENGINE,
     inventory=INVENTORY_ENGINE,
+    latest_agent_version=AGENT_LATEST_VERSION,
 )
 app.include_router(_agent_router)
 app.include_router(_agent_admin_router)

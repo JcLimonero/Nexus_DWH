@@ -36,6 +36,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -365,6 +366,23 @@ class AgentRateLimits:
         )
 
 
+_VERSION_RE = re.compile(r"^\d{1,5}(?:\.\d{1,5}){0,3}$")
+
+
+def agent_version_status(client_version: Optional[str], latest_version: Optional[str]) -> str:
+    """
+    Compara la versión que reporta el agente con ``[agent] latest_version``:
+      current   igual o más nueva
+      outdated  más vieja (el panel muestra "Desactualizada")
+      unknown   sin versión publicada configurada o versión no numérica (agentes legados)
+    """
+    cv, lv = (client_version or "").strip(), (latest_version or "").strip()
+    if not lv or not _VERSION_RE.match(lv) or not _VERSION_RE.match(cv):
+        return "unknown"
+    pad = lambda v: tuple(int(x) for x in v.split(".")) + (0,) * (4 - len(v.split(".")))  # noqa: E731
+    return "outdated" if pad(cv) < pad(lv) else "current"
+
+
 def rate_limited(retry_after: float, message: str) -> HTTPException:
     return HTTPException(status_code=429, detail={"code": "rate_limited", "message": message,
                                                   "retry_after": int(retry_after) + 1},
@@ -385,6 +403,7 @@ def create_agent_routers(
     future_tolerance_hours: int = 26,
     health: Optional[Any] = None,
     inventory: Optional[Any] = None,
+    latest_agent_version: str = "",
 ) -> Tuple[APIRouter, APIRouter, APIRouter]:
     """
     Devuelve (agent_router, admin_router, monitor_router).
@@ -1068,6 +1087,8 @@ def create_agent_routers(
         out = dict(r)
         out["id"] = str(r["id"])
         out["legacy"] = False
+        out["latest_version"] = latest_agent_version or None
+        out["version_status"] = agent_version_status(r.get("client_version"), latest_agent_version)
         for k in ("last_seen_at", "credential_rotated_at", "revoked_at", "created_at", "updated_at", "last_execution_at"):
             out[k] = iso(r.get(k))
         return out
