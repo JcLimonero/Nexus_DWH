@@ -164,8 +164,11 @@ if ($manifest.authenticode.signed) {
 
 # Permisos definitivos (la cuenta del servicio solo lee/ejecuta su programa).
 try {
+  # Solo en la raíz, con herencia; el contenido la hereda (/reset). Aplicar /inheritance:r +
+  # /grant:r con /T a cada archivo terminaba en "Acceso denegado" al ejecutar NexusAgent.exe.
   Invoke-Icacls @($staging, '/inheritance:r', '/grant:r', "${admins}:(OI)(CI)F", "${system}:(OI)(CI)F",
-    "${account}:(OI)(CI)RX", "${users}:(OI)(CI)RX", '/T', '/C', '/Q')
+    "${account}:(OI)(CI)RX", "${users}:(OI)(CI)RX", '/Q')
+  Invoke-Icacls @((Join-Path $staging '*'), '/reset', '/T', '/C', '/Q')
 } catch { Remove-Staging; Fail "No se pudieron fijar los permisos: $($_.Exception.Message)" }
 
 # -- 4. Parada ----------------------------------------------------------------

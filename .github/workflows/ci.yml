@@ -157,6 +157,9 @@ jobs:
                 Where-Object { $_.Level -le 2 -or $_.Message -match 'Nexus' } | Select-Object -First 25 |
                 Format-List TimeCreated, ProviderName, Id, Message | Out-Host
               Get-ChildItem -Recurse -Force C:\ProgramData\NexusAgent -ErrorAction SilentlyContinue | Select-Object FullName, Length | Out-Host
+              foreach ($a in @($installed, "$installed\NexusAgent.exe", 'C:\ProgramData\NexusAgent', 'C:\ProgramData\NexusAgent\data', 'C:\ProgramData\NexusAgent\logs')) {
+                if (Test-Path $a) { icacls $a | Out-Host }
+              }
               if (Test-Path $log) { Get-Content -Tail 60 -Encoding UTF8 $log | Out-Host }
             } catch { Write-Host "Diagnóstico incompleto: $($_.Exception.Message)" }
           }

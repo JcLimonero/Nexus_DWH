@@ -147,7 +147,10 @@ try {
   foreach ($d in @($DataRoot, $dataDir, $logDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
   # Primero cerrar la carpeta de datos (solo Administradores/SYSTEM) y después escribir en ella.
   Invoke-Native 'icacls.exe' @($DataRoot, '/setowner', $admins, '/T', '/C', '/Q')
-  Invoke-Native 'icacls.exe' @($DataRoot, '/inheritance:r', '/grant:r', "${admins}:(OI)(CI)F", "${system}:(OI)(CI)F", '/T', '/C', '/Q')
+  # La ACL se fija SOLO en la raíz y el contenido la hereda (/reset). Aplicar /inheritance:r +
+  # /grant:r con /T a cada archivo terminaba en "Acceso denegado" al ejecutar NexusAgent.exe.
+  Invoke-Native 'icacls.exe' @($DataRoot, '/inheritance:r', '/grant:r', "${admins}:(OI)(CI)F", "${system}:(OI)(CI)F", '/Q')
+  Invoke-Native 'icacls.exe' @((Join-Path $DataRoot '*'), '/reset', '/T', '/C', '/Q')
   if (-not (Test-Path $configPath)) {
     if (-not $ApiUrl) { throw 'Indique -ApiUrl (no existe config.ini todavía).' }
     $tpl = Get-Content -Raw -Encoding UTF8 (Join-Path $InstallDir 'config.example.ini')
@@ -176,11 +179,13 @@ try {
   if ($svc.StartName -ne $account) { throw "No se pudo asignar la cuenta $account (quedó '$($svc.StartName)')." }
 
   # -- 4. Permisos de la cuenta del servicio (SID de grupos: no depende del idioma) --
+  # Solo en las raíces, con herencia (OI)(CI); el contenido hereda (/reset): ver el paso 2.
   Invoke-Native 'icacls.exe' @($InstallDir, '/inheritance:r', '/grant:r', "${admins}:(OI)(CI)F", "${system}:(OI)(CI)F",
-    "${account}:(OI)(CI)RX", "${users}:(OI)(CI)RX", '/T', '/C', '/Q')
-  Invoke-Native 'icacls.exe' @($DataRoot, '/grant', "${account}:(OI)(CI)RX", '/T', '/C', '/Q')
+    "${account}:(OI)(CI)RX", "${users}:(OI)(CI)RX", '/Q')
+  Invoke-Native 'icacls.exe' @((Join-Path $InstallDir '*'), '/reset', '/T', '/C', '/Q')
+  Invoke-Native 'icacls.exe' @($DataRoot, '/grant', "${account}:(OI)(CI)RX", '/Q')
   foreach ($d in @($dataDir, $logDir)) {
-    Invoke-Native 'icacls.exe' @($d, '/grant', "${account}:(OI)(CI)M", '/T', '/C', '/Q')
+    Invoke-Native 'icacls.exe' @($d, '/grant', "${account}:(OI)(CI)M", '/Q')
   }
 
   # -- 5. Token de enrolamiento de un solo uso --
