@@ -131,7 +131,32 @@ jobs:
           $update = "$installed\scripts\update_agent.ps1"   # siempre la copia INSTALADA del script
           $log = 'C:\ProgramData\NexusAgent\logs\nexus_agent.log'
           $cfg = 'C:\ProgramData\NexusAgent\config.ini'
-          function Assert($cond, $msg) { if (-not $cond) { Write-Error $msg; exit 1 } }
+          $t0 = Get-Date
+          # Los scripts se ejecutan como en producción (DWH_README §21: "powershell -ExecutionPolicy
+          # Bypass"), en un proceso aparte de Windows PowerShell 5.1: el código de salida es el del
+          # script y su "exit" no altera la sesión del paso (en proceso, pwsh 7 dejaba roto el
+          # siguiente comando nativo: "StandardOutputEncoding is only supported when standard output
+          # is redirected"). -EncodedCommand evita problemas de comillas en rutas con espacios.
+          $winps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          function Invoke-Script([string]$Invocation) {
+            $cmd = "try { `$global:LASTEXITCODE = `$null; $Invocation; if (`$null -eq `$LASTEXITCODE) { exit 99 }; exit `$LASTEXITCODE } " +
+                   "catch { Write-Host ('ERROR no controlado: ' + `$_.Exception.Message); exit 1 }"
+            & $winps -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd)))
+          }
+          function Show-Diagnostics {
+            try {
+              Write-Host '--- Diagnóstico del servicio ---'
+              sc.exe query NexusAgent | Out-Host
+              Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; StartTime = $t0 } -ErrorAction SilentlyContinue |
+                Select-Object -First 25 | Format-List TimeCreated, Id, Message | Out-Host
+              Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $t0 } -ErrorAction SilentlyContinue |
+                Where-Object { $_.Level -le 2 -or $_.Message -match 'Nexus' } | Select-Object -First 25 |
+                Format-List TimeCreated, ProviderName, Id, Message | Out-Host
+              Get-ChildItem -Recurse -Force C:\ProgramData\NexusAgent -ErrorAction SilentlyContinue | Select-Object FullName, Length | Out-Host
+              if (Test-Path $log) { Get-Content -Tail 60 -Encoding UTF8 $log | Out-Host }
+            } catch { Write-Host "Diagnóstico incompleto: $($_.Exception.Message)" }
+          }
+          function Assert($cond, $msg) { if (-not $cond) { Show-Diagnostics; Write-Host "::error::$msg"; exit 1 } }
           function Assert-OldVersionRunning($label) {
             Start-Sleep -Seconds 5
             Assert ((Get-Service NexusAgent).Status -eq 'Running') "${label}: el servicio no está en ejecución tras la vuelta atrás"
@@ -141,8 +166,7 @@ jobs:
           }
 
           # 1) Instalación sin token: arranca, comprueba DPAPI con su cuenta y se detiene con código 2.
-          $t0 = Get-Date
-          & "$pkg\scripts\install_service.ps1" -PackageDir $pkg -ApiUrl 'http://127.0.0.1:9' -AllowUnsignedManifest
+          Invoke-Script "& '$pkg\scripts\install_service.ps1' -PackageDir '$pkg' -ApiUrl 'http://127.0.0.1:9' -AllowUnsignedManifest"
           Assert ($LASTEXITCODE -eq 2) "install_service.ps1 debía terminar con 2 (sin token), fue $LASTEXITCODE"
           $script:origVersion = (& "$installed\NexusAgent.exe" --version).Trim()
           sc.exe qc NexusAgent; sc.exe qprivs NexusAgent; sc.exe qfailure NexusAgent; sc.exe query NexusAgent
@@ -187,7 +211,7 @@ jobs:
           $m = Get-Content -Raw -Encoding UTF8 "$fake\release.json" | ConvertFrom-Json
           $m.version = '9.9.9'
           [IO.File]::WriteAllText("$fake\release.json", ($m | ConvertTo-Json -Depth 10))
-          & $update -PackageDir $fake -AllowUnsignedManifest -HealthSeconds 20
+          Invoke-Script "& '$update' -PackageDir '$fake' -AllowUnsignedManifest -HealthSeconds 20"
           Assert ($LASTEXITCODE -eq 3) "Salud fallida: update_agent.ps1 debía restaurar (3), fue $LASTEXITCODE"
           Assert-OldVersionRunning 'Salud fallida'
 
@@ -201,7 +225,7 @@ jobs:
           $mb = Get-Content -Raw -Encoding UTF8 "$broken\release.json" | ConvertFrom-Json
           $mb.version = '9.9.8'
           [IO.File]::WriteAllText("$broken\release.json", ($mb | ConvertTo-Json -Depth 10))
-          & $update -PackageDir $broken -AllowUnsignedManifest -HealthSeconds 20
+          Invoke-Script "& '$update' -PackageDir '$broken' -AllowUnsignedManifest -HealthSeconds 20"
           Assert ($LASTEXITCODE -eq 3) "Ejecutable que no arranca: se esperaba 3, fue $LASTEXITCODE"
           Assert-OldVersionRunning 'Ejecutable que no arranca'
           Assert (Test-Path 'C:\Program Files\NexusAgent.failed-*') 'No quedó la versión fallida para diagnóstico'
@@ -210,7 +234,7 @@ jobs:
           #     los reintentos -> no se pierde el programa y el servicio vuelve a correr.
           $holder = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 300' `
             -WorkingDirectory "$installed\scripts" -PassThru -WindowStyle Hidden
-          & $update -PackageDir $fake -AllowUnsignedManifest -HealthSeconds 10
+          Invoke-Script "& '$update' -PackageDir '$fake' -AllowUnsignedManifest -HealthSeconds 10"
           $rc = $LASTEXITCODE
           Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
           Assert ($rc -eq 3 -or $rc -eq 1) "Carpeta bloqueada: se esperaba 3 (o 1 con mensaje), fue $rc"
@@ -220,26 +244,26 @@ jobs:
           $bad = Join-Path $env:RUNNER_TEMP 'pkgbad'
           Copy-Item -Recurse $fake $bad
           Add-Content -Path "$bad\LEEME.txt" -Value 'alterado'
-          & $update -PackageDir $bad -AllowUnsignedManifest -HealthSeconds 20
+          Invoke-Script "& '$update' -PackageDir '$bad' -AllowUnsignedManifest -HealthSeconds 20"
           Assert ($LASTEXITCODE -eq 4) "Paquete alterado: se esperaba 4, fue $LASTEXITCODE"
           Assert-OldVersionRunning 'Paquete alterado'
 
           # 5) Reinstalación conservando datos: los archivos que creó el servicio (propietario
           #    NT SERVICE\NexusAgent) en data\ y logs\ no deben hacer abortar al instalador.
           Assert (Test-Path 'C:\ProgramData\NexusAgent\logs\nexus_agent.log') 'El servicio no dejó log propio antes de reinstalar'
-          & "$installed\scripts\uninstall_service.ps1" -RemoveProgram -Confirm:$false
+          Invoke-Script "& '$installed\scripts\uninstall_service.ps1' -RemoveProgram -Confirm:`$false"
           Assert ($LASTEXITCODE -eq 0) 'uninstall_service.ps1 (conservando datos) falló'
           # El token del paso 2 nunca se consumió (Nexus inaccesible): se quita para esperar el código 2.
           Remove-Item -LiteralPath 'C:\ProgramData\NexusAgent\data\enrollment_token.ini' -Force -ErrorAction SilentlyContinue
           # sc delete puede dejar el servicio "marcado para eliminación" unos segundos.
           for ($i = 0; $i -lt 30 -and (Get-Service NexusAgent -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
           Assert (-not (Get-Service NexusAgent -ErrorAction SilentlyContinue)) 'El servicio sigue registrado antes de reinstalar'
-          & "$pkg\scripts\install_service.ps1" -PackageDir $pkg -AllowUnsignedManifest *>&1 | Tee-Object -Variable reinstallOut
+          Invoke-Script "& '$pkg\scripts\install_service.ps1' -PackageDir '$pkg' -AllowUnsignedManifest" *>&1 | Tee-Object -Variable reinstallOut
           Assert (-not (($reinstallOut | Out-String) -match 'pertenece a')) 'La reinstalación abortó por propietario de archivos del servicio'
           Assert ($LASTEXITCODE -eq 2) "Reinstalación con datos conservados: se esperaba 2 (sin token), fue $LASTEXITCODE"
 
           # 6) Desinstalación completa.
-          & "$installed\scripts\uninstall_service.ps1" -RemoveProgram -RemoveData -Confirm:$false
+          Invoke-Script "& '$installed\scripts\uninstall_service.ps1' -RemoveProgram -RemoveData -Confirm:`$false"
           Assert ($LASTEXITCODE -eq 0) 'uninstall_service.ps1 falló'
           Assert (-not (Get-Service NexusAgent -ErrorAction SilentlyContinue)) 'El servicio sigue registrado'
           exit 0
