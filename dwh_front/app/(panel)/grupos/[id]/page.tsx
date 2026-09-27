@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, Copy, Plus, RefreshCw, Search } from "lucide-react";
 import { useApi } from "@/lib/api";
-import type { Agency, Group, ListResponse, TaskHealth } from "@/lib/types";
+import type { Agency, Company, Group, ListResponse, TaskHealth } from "@/lib/types";
 import { cx, fmtNumber, tzLabel } from "@/lib/format";
 import { Badge, Button, Card, IconButton, Input, PageHeader, StatusBadge, Switch } from "@/components/ui/primitives";
 import { DataState, EmptyState, NotFoundState } from "@/components/ui/states";
@@ -31,15 +31,19 @@ export default function GrupoDetallePage() {
   const id = /^\d+$/.test(params.id ?? "") ? params.id : null;
   const group = useApi<Group>(id ? `admin/groups/${id}` : null);
   const agencies = useApi<ListResponse<Agency>>(id ? `admin/agencies?group_id=${id}` : null);
+  // Empresas del grupo: para mostrar también las que aún no tienen agencias.
+  const companyList = useApi<ListResponse<Company>>(id ? `admin/companies?group_id=${id}` : null);
   const health = useApi<{ items: TaskHealth[] }>(id ? `admin/health/tasks?group_id=${id}` : null);
   const { can } = useSession();
   const [f, setF, clearF] = useUrlFilters(FILTER_KEYS);
   const reloadHealth = health.reload;
   const reloadAgencies = agencies.reload;
+  const reloadCompanies = companyList.reload;
   const reloadAll = useCallback(() => {
     void reloadHealth();
     void reloadAgencies();
-  }, [reloadHealth, reloadAgencies]);
+    void reloadCompanies();
+  }, [reloadHealth, reloadAgencies, reloadCompanies]);
   useAutoRefresh(reloadHealth);
   const { run, busy } = useActions(reloadHealth);
 
@@ -85,8 +89,14 @@ export default function GrupoDetallePage() {
       c.agencies.push(a);
       out.set(a.company_id, c);
     });
+    // Sin filtros, las empresas sin agencias también aparecen (con su aviso y el alta de agencia).
+    if (!filtering) {
+      (companyList.data?.items ?? []).forEach((c) => {
+        if (!out.has(c.id)) out.set(c.id, { id: c.id, name: c.name, agencies: [] });
+      });
+    }
     return Array.from(out.values()).sort((x, y) => x.name.localeCompare(y.name, "es"));
-  }, [agencies.data, byAgency, filtering, f.status, f.q]);
+  }, [agencies.data, companyList.data, byAgency, filtering, f.status, f.q]);
 
   // Alta de extractor (agencia preseleccionada o a elegir dentro del grupo) y clonado.
   const [newFor, setNewFor] = useState<string | null>(null);
@@ -235,7 +245,17 @@ export default function GrupoDetallePage() {
                         {c.agencies.length} agencia(s) · {cCount} extractor(es)
                       </span>
                     </button>
-                    {cOpen && (
+                    {cOpen && c.agencies.length === 0 && (
+                      <Card className="px-4 py-4 text-sm text-slate-500">
+                        Esta empresa aún no tiene agencias, así que no puede tener extractores.{" "}
+                        {canCfg && (
+                          <Link href={`/agencias?group_id=${g.id}&company_id=${c.id}&nueva=1`} className="font-medium text-brand-600 hover:text-brand-700">
+                            Nueva agencia
+                          </Link>
+                        )}
+                      </Card>
+                    )}
+                    {cOpen && c.agencies.length > 0 && (
                       <div className="space-y-3">
                         {c.agencies.map((a) => (
                           <AgencyBlock

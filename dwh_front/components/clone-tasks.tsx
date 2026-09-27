@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Search } from "lucide-react";
 import { api, useApi } from "@/lib/api";
-import type { Agency, CloneResponse, CloneResult, ListResponse, Task } from "@/lib/types";
+import type { Agency, CloneResponse, CloneResult, ListResponse } from "@/lib/types";
 import { cx } from "@/lib/format";
 import { Badge, Button, Input, Select, Switch } from "@/components/ui/primitives";
 import { Modal } from "@/components/ui/modal";
@@ -59,8 +59,8 @@ export function CloneTasksModal({
   const { can } = useSession();
   const toast = useToast();
   const agenciesApi = useApi<ListResponse<Agency>>(open ? "admin/agencies" : null);
-  // Para marcar qué agencias ya tienen el extractor (mismo objeto por nombre).
-  const tasksApi = useApi<ListResponse<Task>>(open ? "admin/tasks" : null);
+  // Para marcar qué agencias ya tienen el extractor (mismo objeto por nombre): lista ligera, sin SQL.
+  const tasksApi = useApi<ListResponse<{ id: number; agency_id: number; object_name: string }>>(open ? "admin/tasks?light=true" : null);
   const [targets, setTargets] = useState<Set<number>>(new Set());
   const [taskIds, setTaskIds] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState("");
@@ -326,6 +326,8 @@ function CloneSummary({ res }: { res: CloneResponse }) {
       {s.object_conflict > 0 && <Badge tone="amber">{s.object_conflict} conflicto(s)</Badge>}
       {s.error > 0 && <Badge tone="red">{s.error} error(es)</Badge>}
       {s.objects_created > 0 && <Badge tone="slate">{s.objects_created} objeto(s) {pre ? "por copiar" : "copiado(s)"}</Badge>}
+      {s.objects_updated > 0 && <Badge tone="red">{s.objects_updated} objeto(s) {pre ? "por sobrescribir" : "sobrescrito(s)"}</Badge>}
+      {s.targets_disabled > 0 && <Badge tone="amber">{s.targets_disabled} en destino deshabilitado</Badge>}
     </div>
   );
 }
@@ -364,7 +366,15 @@ function CloneResults({ res, compact = false }: { res: CloneResponse; compact?: 
                   <Td className="py-2">
                     <Badge tone={st.tone}>{pre ? st.preview : st.done}</Badge>
                     {r.object_action && r.status !== "error" && <p className="mt-0.5 text-[11px] text-slate-500">{OBJECT_ACTION[r.object_action]}</p>}
-                    {r.message && r.status !== "created" && <p className="mt-0.5 max-w-xs text-[11px] text-slate-500">{r.message}</p>}
+                    {r.affected_tasks ? (
+                      <p className={cx("mt-0.5 max-w-xs text-[11px]", r.object_action === "updated" ? "font-medium text-red-700" : "text-slate-500")}>
+                        {r.object_action === "updated" ? (pre ? "Afectará" : "Afectó") : "Lo usan"} otros {r.affected_tasks} extractor(es) de esa empresa.
+                      </p>
+                    ) : null}
+                    {r.target_disabled && r.status !== "error" && (
+                      <p className="mt-0.5 max-w-xs text-[11px] text-amber-700">Destino deshabilitado: no se ejecutará hasta habilitarlo.</p>
+                    )}
+                    {r.message && r.status !== "created" && !(r.target_disabled && r.status === "updated") && <p className="mt-0.5 max-w-xs text-[11px] text-slate-500">{r.message}</p>}
                     {r.warnings
                       .filter((w) => WARNING[w])
                       .map((w) => (

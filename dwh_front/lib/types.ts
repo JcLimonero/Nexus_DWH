@@ -831,7 +831,11 @@ export interface CloneResult {
   task_id: number | null;
   object_action: CloneObjectAction | null;
   object_id: number | null;
-  /** static_columns_review, o los campos distintos en un object_conflict */
+  /** Otros extractores de la empresa destino que usan ese objeto (conflicto o sobrescritura). */
+  affected_tasks: number | null;
+  /** La agencia, empresa o grupo destino está deshabilitado (el extractor no se ejecutará). */
+  target_disabled: boolean;
+  /** static_columns_review, target_disabled, o los campos distintos en un object_conflict */
   warnings: string[];
   message: string | null;
 }
@@ -847,6 +851,7 @@ export interface CloneResponse {
     error: number;
     objects_created: number;
     objects_updated: number;
+    targets_disabled: number;
   };
   target_group_ids: number[];
 }

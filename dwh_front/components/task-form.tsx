@@ -54,8 +54,8 @@ const PRESETS = [
 
 /** Textos según cómo se llame la entidad en la página que abre el formulario. */
 const NOUNS = {
-  tarea: { create: "Nueva tarea", edit: "Editar tarea", submit: "Crear tarea", created: "Tarea creada.", updated: "Tarea actualizada.", active: "Tarea activa" },
-  extractor: { create: "Nuevo extractor", edit: "Editar extractor", submit: "Crear extractor", created: "Extractor creado.", updated: "Extractor actualizado.", active: "Extractor activo" },
+  tarea: { create: "Nueva tarea", edit: "Editar tarea", view: "Ver tarea", submit: "Crear tarea", created: "Tarea creada.", updated: "Tarea actualizada.", active: "Tarea activa" },
+  extractor: { create: "Nuevo extractor", edit: "Editar extractor", view: "Ver extractor", submit: "Crear extractor", created: "Extractor creado.", updated: "Extractor actualizado.", active: "Extractor activo" },
 } as const;
 
 export type TaskNoun = keyof typeof NOUNS;
@@ -175,7 +175,7 @@ export function TaskFormModal({
       open={open}
       onClose={onClose}
       size="xl"
-      title={task ? `${t.edit} #${task.id}` : t.create}
+      title={task ? `${readOnly ? t.view : t.edit} #${task.id}` : t.create}
       footer={
         <>
           <Button variant="secondary" onClick={onClose}>

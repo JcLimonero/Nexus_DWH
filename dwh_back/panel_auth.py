@@ -615,7 +615,7 @@ class AuthService:
             (ctx.auth_kind if ctx else "anonymous")[:20],
             action[:120], (target_type or None) and target_type[:60], (target_id or None) and str(target_id)[:80],
             group_id if group_id is not None else (ctx.audit_group if ctx else None),
-            status_code, json.dumps(details or {}, default=str)[:4000], (ip or "")[:45],
+            status_code, audit_details_json(details), (ip or "")[:45],
         )
         sql = """INSERT INTO panel_audit_log (actor_user_id, actor_name, auth_kind, action, target_type, target_id,
                                               group_id, status_code, details, ip)
@@ -632,6 +632,16 @@ class AuthService:
                 conn.close()
         except Exception as exc:  # noqa: BLE001
             log.warning("No se pudo registrar panel_audit_log: %s", type(exc).__name__)
+            # Nunca se pierde el registro: fila mínima (sin detalles) en una conexión propia.
+            try:
+                conn = self.get_connection()
+                try:
+                    conn.cursor().execute(sql, (*row[:8], json.dumps({"details_error": type(exc).__name__}), row[9]))
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as exc2:  # noqa: BLE001
+                log.error("panel_audit_log: tampoco se pudo registrar la fila mínima: %s", type(exc2).__name__)
 
     def record_request(self, ctx: AuthContext, method: str, route_path: str, path_params: Dict[str, Any],
                        status_code: int, ip: str) -> None:
@@ -645,6 +655,35 @@ class AuthService:
         self.audit(ctx, action=f"{method} {route_path}"[:120], ip=ip, status_code=status_code,
                    target_type=target_type, target_id=target_id,
                    details={"static_token": True} if ctx.auth_kind == "static_token" else None)
+
+
+AUDIT_DETAILS_MAX = 4000
+
+
+def audit_details_json(details: Optional[Dict[str, Any]], limit: int = AUDIT_DETAILS_MAX) -> str:
+    """
+    JSON de los detalles de auditoría, SIEMPRE válido y ≤ limit caracteres. Cortar el texto
+    produciría JSON inválido (el ::jsonb fallaría y se perdería el registro): si no cabe, se
+    recortan las listas y, como último recurso, se guardan solo las claves.
+    """
+    d = details or {}
+    s = json.dumps(d, default=str)
+    if len(s) <= limit:
+        return s
+    for cap in (100, 20, 5, 0):
+        shrunk: Dict[str, Any] = {"truncated": True, "original_length": len(s)}
+        for k, v in d.items():
+            if isinstance(v, (list, tuple)) and len(v) > cap:
+                shrunk[k] = list(v)[:cap]
+                shrunk[k + "_total"] = len(v)
+            elif isinstance(v, str) and len(v) > 500:
+                shrunk[k] = v[:500] + "…"
+            else:
+                shrunk[k] = v
+        s2 = json.dumps(shrunk, default=str)
+        if len(s2) <= limit:
+            return s2
+    return json.dumps({"truncated": True, "original_length": len(s), "keys": [str(k)[:60] for k in d][:40]})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

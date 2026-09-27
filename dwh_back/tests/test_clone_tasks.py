@@ -253,3 +253,86 @@ def test_clonar_extractores_de_una_agencia(cenv):
                {"target_agency_ids": [aa2["id"]]}, expect=200).json()
     assert {r["code"] for r in out["results"]} == {"same_agency"}
     assert q("SELECT COUNT(*) FROM panel_audit_log WHERE action = 'agencies.clone_tasks'")[0][0] >= 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regresiones (validación)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_auditoria_no_se_pierde_con_muchos_destinos(cenv):
+    """499 ids inexistentes + 1 válido: antes el JSON truncado a 4000 era inválido y se perdía el registro."""
+    e = cenv
+    t_cli = e["ids"]["t_cli"]
+    ok = new_agency(e, e["ids"]["company_a"]["id"])
+    n0 = q("SELECT COUNT(*) FROM panel_audit_log WHERE action = 'tasks.clone'")[0][0]
+    out = clone(e, "cfg_a", t_cli["id"], [ok["id"]] + list(range(900001, 900500)))
+    assert out["summary"]["created"] == 1 and out["summary"]["error"] == 499
+    assert q("SELECT COUNT(*) FROM panel_audit_log WHERE action = 'tasks.clone'")[0][0] == n0 + 1
+    d = q("SELECT details FROM panel_audit_log WHERE action = 'tasks.clone' ORDER BY id DESC LIMIT 1")[0][0]
+    assert d["target_agency_total"] == 500 and len(d["target_agency_ids"]) == 100
+    assert d["summary"]["created"] == 1 and d["task_ids_written_total"] == 1
+
+
+def test_detalles_de_auditoria_siempre_json_valido():
+    import json
+    import panel_auth
+    s = panel_auth.audit_details_json({"ids": list(range(20000)), "texto": "x" * 50000, "n": 1})
+    d = json.loads(s)
+    assert len(s) <= panel_auth.AUDIT_DETAILS_MAX and d["truncated"] is True and d["ids_total"] == 20000
+    s = panel_auth.audit_details_json({f"k{i}": "y" * 400 for i in range(200)})
+    assert json.loads(s)["truncated"] is True and len(s) <= panel_auth.AUDIT_DETAILS_MAX
+
+
+def test_tope_de_combinaciones_422(cenv):
+    e = cenv
+    r = call(e, "cfg_a", "POST", f"/admin/tasks/{e['ids']['t_cli']['id']}/clone",
+             {"target_agency_ids": list(range(1, 2002))})
+    assert r.status_code == 422, r.text[:300]
+
+
+def test_vista_previa_no_consume_secuencias(cenv):
+    e = cenv
+    comp = e["b"].admin("POST", "/admin/companies", {"group_id": e["A"], "name": "Empresa A6"}, expect=201)
+    t1, t2 = new_agency(e, comp["id"]), new_agency(e, comp["id"])
+    seqs = "SELECT (SELECT last_value FROM agency_task_id_seq), (SELECT last_value FROM object_catalog_id_seq)"
+    before = q(seqs)[0]
+    out = clone(e, "cfg_a", e["ids"]["t_cli"]["id"], [t1["id"], t2["id"]], dry_run=True)
+    assert q(seqs)[0] == before
+    # El objeto se "copia" una sola vez para la empresa; el segundo destino lo reutiliza (igual que al ejecutar)
+    acts = [r["object_action"] for r in out["results"]]
+    assert acts == ["created", "reused"] and out["summary"]["objects_created"] == 1
+    real = clone(e, "cfg_a", e["ids"]["t_cli"]["id"], [t1["id"], t2["id"]])
+    assert [r["object_action"] for r in real["results"]] == acts
+    assert [r["status"] for r in real["results"]] == [r["status"] for r in out["results"]]
+    msg = clone(e, "cfg_a", e["ids"]["t_cli"]["id"], [t1["id"]], dry_run=True)["results"][0]["message"]
+    assert "se omitirá" in msg
+
+
+def test_conflicto_informa_extractores_afectados(cenv):
+    e = cenv
+    comp = e["b"].admin("POST", "/admin/companies", {"group_id": e["A"], "name": "Empresa A7"}, expect=201)
+    other, target = new_agency(e, comp["id"]), new_agency(e, comp["id"])
+    obj = e["b"].admin("POST", "/admin/objects", {"company_id": comp["id"], "name": "Clientes",
+                                                  "destination_table": "otra", "upsert_keys": "id"}, expect=201)
+    e["b"].admin("POST", "/admin/tasks", {"agency_id": other["id"], "object_catalog_id": obj["id"],
+                                          "extract_sql": "SELECT 1"}, expect=201)
+    r = clone(e, "cfg_a", e["ids"]["t_cli"]["id"], [target["id"]])["results"][0]
+    assert r["status"] == "object_conflict" and r["affected_tasks"] == 1
+    r = clone(e, "cfg_a", e["ids"]["t_cli"]["id"], [target["id"]], on_conflict="update", overwrite_objects=True,
+              dry_run=True)["results"][0]
+    assert r["object_action"] == "updated" and r["affected_tasks"] == 1
+    assert q("SELECT destination_table FROM object_catalog WHERE id = %s", (obj["id"],))[0][0] == "otra"
+
+
+def test_aviso_si_el_destino_esta_deshabilitado(cenv):
+    e = cenv
+    target = new_agency(e, e["ids"]["company_a"]["id"])
+    e["b"].admin("POST", f"/admin/agencies/{target['id']}/disable", expect=200)
+    r = clone(e, "cfg_a", e["ids"]["t_lenta"]["id"], [target["id"]])["results"][0]
+    assert r["status"] == "created" and r["target_disabled"] is True and "target_disabled" in r["warnings"]
+
+
+def test_lista_ligera_de_tareas_sin_sql(cenv):
+    e = cenv
+    items = call(e, "lector_a", "GET", "/admin/tasks?light=true", expect=200).json()["items"]
+    assert items and set(items[0]) == {"id", "agency_id", "group_id", "object_catalog_id", "object_name"}
+    assert "extract_sql" not in str(items) and {i["group_id"] for i in items} == {e["A"]}
