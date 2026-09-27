@@ -1,0 +1,12 @@
+# Contexto de la imagen del panel (Coolify: base directory /dwh_front).
+node_modules
+.next
+out
+*.tsbuildinfo
+# Variables de entorno y secretos: NUNCA dentro de la imagen (se pasan en tiempo de ejecución).
+.env
+.env.*
+npm-debug.log*
+pnpm-debug.log*
+Dockerfile
+.dockerignore

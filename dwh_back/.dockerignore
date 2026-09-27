@@ -1,0 +1,29 @@
+# Contexto de la imagen del backend (Coolify: base directory /dwh_back). Solo lo necesario
+# para main_postgres.py, migrate.py, manage_users.py y encrypt_config_secret.py.
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+tests
+logs
+**/*.log
+# Configuración y secretos: NUNCA dentro de la imagen (se pasan por variables de entorno).
+**/*.ini
+!config_postgres.ini.example
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+# Variante MySQL, empaquetado y desarrollo (no se usan en el contenedor)
+main.py
+run_server.py
+requirements.txt
+requirements_dev.txt
+config.ini.example
+mgd_server.spec
+seed_dev_postgres.sql
+build
+dist
+Dockerfile
+.dockerignore
