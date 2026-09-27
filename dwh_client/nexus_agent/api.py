@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from . import AGENT_VERSION
+from . import AGENT_FEATURES, AGENT_VERSION
 from .credstore import InstallationCredential
 from .sanitize import ConfigError, redact_text
 from .settings import Settings
@@ -117,6 +117,9 @@ class NexusApi:
         # Nunca False: True (CAs del sistema/certifi) o bundle propio.
         self.session.verify = settings.ca_bundle or True
         self.session.headers["User-Agent"] = f"nexus-dwh-agent/{AGENT_VERSION}"
+        # Capacidades (sección 22): sin "destination-v2" Nexus retiene las tareas que este agente
+        # no podría ejecutar bien (destino por empresa, SSL obligatorio).
+        self.session.headers["x-nexus-agent-features"] = ",".join(AGENT_FEATURES)
         self.timeout = (settings.http_connect_timeout, settings.http_read_timeout)
 
     def close(self) -> None:
@@ -220,3 +223,10 @@ class NexusApi:
 
     def inventory_snapshot(self, payload: Dict[str, Any], compress: bool = True) -> Dict[str, Any]:
         return self.request("POST", "/agent/inventory/snapshots", json_body=payload, compress=compress)
+
+    # Prueba de conexión pedida desde el panel (sección 22)
+    def claim_connection_test(self) -> Dict[str, Any]:
+        return self.request("POST", "/agent/connection-tests/claim")
+
+    def report_connection_test(self, test_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.request("POST", f"/agent/connection-tests/{test_id}/result", json_body=payload)

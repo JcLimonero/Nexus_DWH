@@ -59,6 +59,9 @@ except ImportError:  # pragma: no cover
     Fernet = None
     InvalidToken = Exception
 
+from destination_postgres import (
+    connection_signature, effective_columns_sql, needs_destination_v2, qualify_table, warehouse_from_row,
+)
 from redact import redact_text, token_prefix
 
 log = logging.getLogger("nexus.agent")
@@ -294,6 +297,8 @@ class HeartbeatBody(_In):
     config_age_seconds: Optional[int] = Field(None, ge=-1, le=BIGINT_MAX)
     agent_seq: Optional[int] = Field(None, ge=0, le=BIGINT_MAX)
     event_time: Optional[datetime] = None
+    # Capacidades del agente (>= 5.3): "destination-v2", "connection-test".
+    features: List[Annotated[str, StringConstraints(max_length=40)]] = Field(default_factory=list, max_length=20)
 
 
 class AgentEventBody(_In):
@@ -404,6 +409,7 @@ def create_agent_routers(
     health: Optional[Any] = None,
     inventory: Optional[Any] = None,
     latest_agent_version: str = "",
+    connection_tests: Optional[Any] = None,
 ) -> Tuple[APIRouter, APIRouter, APIRouter]:
     """
     Devuelve (agent_router, admin_router, monitor_router).
@@ -552,7 +558,9 @@ def create_agent_routers(
         """Valores sensibles del alcance de una tarea (para sanear mensajes)."""
         cur.execute(
             """SELECT c.source_host, c.source_database, c.source_username, c.source_password, c.source_dsn,
-                      g.warehouse_host, g.warehouse_database, g.warehouse_username, g.warehouse_password
+                      g.warehouse_host, g.warehouse_database, g.warehouse_username, g.warehouse_password,
+                      c.warehouse_host AS c_wh_host, c.warehouse_database AS c_wh_db,
+                      c.warehouse_username AS c_wh_user, c.warehouse_password AS c_wh_pass
                FROM company c JOIN client_group g ON g.id = c.group_id WHERE c.id = %s""",
             (task["company_id"],),
         )
@@ -640,19 +648,40 @@ def create_agent_routers(
         }
 
     # ── Tareas ──────────────────────────────────────────────────────────────
+    def top_level_warehouse(cur: Any, ctx: InstallationCtx) -> Dict[str, Any]:
+        """
+        Destino "principal" de la instalación (campo ``warehouse`` de /agent/tasks, el único
+        que entienden los agentes < 5.3): alcance grupo → DWH del grupo; alcance empresa o
+        agencia → destino EFECTIVO de su empresa (propio o heredado).
+        """
+        if ctx.company_id:
+            cur.execute(f"""SELECT {effective_columns_sql()} FROM company c JOIN client_group g ON g.id = c.group_id
+                            WHERE c.id = %s""", (ctx.company_id,))
+            r = cur.fetchone()
+            if r:
+                return warehouse_from_row(r, decrypt_config_secret)
+        cur.execute("""SELECT warehouse_host AS eff_wh_host, warehouse_port AS eff_wh_port,
+                              warehouse_database AS eff_wh_database, warehouse_username AS eff_wh_username,
+                              warehouse_password AS eff_wh_password, warehouse_schema AS eff_wh_schema,
+                              warehouse_sslmode AS eff_wh_sslmode, warehouse_sslrootcert AS eff_wh_sslrootcert
+                       FROM client_group WHERE id = %s""", (ctx.group_id,))
+        return warehouse_from_row(cur.fetchone() or {}, decrypt_config_secret, source="group")
+
+    def agent_features(request: Request) -> set:
+        raw = request.headers.get("x-nexus-agent-features") or ""
+        return {f.strip().lower() for f in raw.split(",")[:20] if f.strip()}
+
     @agent.get("/tasks")
     def get_tasks(request: Request, ctx: InstallationCtx = Depends(authenticate)) -> dict:
         where, params = scope_where(ctx.scope_type, ctx.group_id, ctx.company_id, ctx.agency_id)
+        # Agentes >= 5.3 declaran "destination-v2": destino por tarea, esquema y SSL/TLS.
+        dest_v2 = "destination-v2" in agent_features(request)
         with tx() as cur:
-            cur.execute(
-                """SELECT warehouse_host, warehouse_port, warehouse_database, warehouse_username, warehouse_password
-                   FROM client_group WHERE id = %s""",
-                (ctx.group_id,),
-            )
-            g = cur.fetchone()
+            top_wh = top_level_warehouse(cur, ctx)
             cur.execute(
                 f"""
-                SELECT at.id AS task_id, at.agency_id, a.company_id, c.group_id, at.object_catalog_id,
+                SELECT {effective_columns_sql()},
+                       at.id AS task_id, at.agency_id, a.company_id, c.group_id, at.object_catalog_id,
                        g.name AS group_name, c.name AS company_name, a.name AS agency_name,
                        c.verbose_logging, c.refresh_seconds,
                        c.source_type, c.source_dsn, c.source_host, c.source_port, c.source_database,
@@ -676,6 +705,20 @@ def create_agent_routers(
                 params,
             )
             rows = cur.fetchall()
+            top_signature = connection_signature(top_wh)
+            withheld = []
+            delivered = []
+            for r in rows:
+                r["_wh"] = warehouse_from_row(r, decrypt_config_secret)
+                why = None if dest_v2 else needs_destination_v2(
+                    r["_wh"], top_signature, r["destination_table"], r["create_table_sql"],
+                    r["create_constraint_sql"])
+                if why:
+                    # Un agente anterior cargaría en el destino equivocado o sin exigir SSL: no se le entrega.
+                    withheld.append({"task_id": r["task_id"], "reason": why})
+                else:
+                    delivered.append(r)
+            rows = delivered
             ip = request.client.host if request.client else ""
             if rows:
                 psycopg2.extras.execute_values(
@@ -683,10 +726,19 @@ def create_agent_routers(
                     "INSERT INTO task_download_log (installation_id, task_id, query_version, client_ip) VALUES %s",
                     [(str(ctx.id), r["task_id"], r["query_version"], ip) for r in rows],
                 )
+        # Visible en el panel (Instalaciones): tareas retenidas por versión del agente.
+        with tx() as cur:
+            cur.execute("""UPDATE installation SET withheld_tasks = %s, withheld_at = CASE WHEN %s THEN NOW() END
+                           WHERE id = %s AND withheld_tasks IS DISTINCT FROM %s::jsonb""",
+                        (json.dumps(withheld), bool(withheld), str(ctx.id), json.dumps(withheld)))
+        if withheld:
+            log.warning("Instalación %s: %d tarea(s) retenidas (requieren agente >= 5.3: destino por empresa "
+                        "o SSL obligatorio).", ctx.id, len(withheld))
         tasks = []
         refresh = []
         verbose = False
         for r in rows:
+            wh = r["_wh"]
             verbose = verbose or bool(r["verbose_logging"])
             if r["refresh_seconds"]:
                 refresh.append(int(r["refresh_seconds"]))
@@ -699,7 +751,10 @@ def create_agent_routers(
                 "name": f"{r['group_name']} | {r['company_name']} | {r['agency_name']}",
                 "group_id": r["group_id"], "company_id": r["company_id"], "agency_id": r["agency_id"],
                 "object_catalog_id": r["object_catalog_id"],
-                "load_table": r["destination_table"],
+                # Sin esquema en el catálogo → esquema destino efectivo (los agentes anteriores ya
+                # entienden "esquema.tabla").
+                "load_table": qualify_table(r["destination_table"], wh["schema"]),
+                "warehouse": wh,
                 "upsert_keys": [k.strip() for k in (r["upsert_keys"] or "").split(",") if k.strip()],
                 "create_table_sql": r["create_table_sql"] or None,
                 "constraint_name": r["constraint_name"] or None,
@@ -737,14 +792,9 @@ def create_agent_routers(
             "refresh_seconds": min(refresh) if refresh else 60,
             "log_verbose": verbose,
             "credential_rotation_required": ctx.rotation_required,
-            "warehouse": {
-                "host": decrypt_config_secret((g or {}).get("warehouse_host") or ""),
-                "port": (g or {}).get("warehouse_port") or 5432,
-                "database": decrypt_config_secret((g or {}).get("warehouse_database") or ""),
-                "username": decrypt_config_secret((g or {}).get("warehouse_username") or ""),
-                "password": decrypt_config_secret((g or {}).get("warehouse_password") or ""),
-            },
+            "warehouse": top_wh,
             "tasks": tasks,
+            "withheld_tasks": withheld,
         }
 
     # ── Ejecuciones ─────────────────────────────────────────────────────────
@@ -966,7 +1016,9 @@ def create_agent_routers(
             "running": running,
             "config_age_seconds": body.config_age_seconds, "agent_seq": body.agent_seq,
             "event_time": iso(to_utc(body.event_time)), "received_at": iso(utcnow()),
+            "features": sorted({f.strip().lower() for f in body.features if f.strip()})[:20],
         }
+        pending_tests = 0
         with tx() as cur:
             cur.execute(
                 """UPDATE installation SET last_heartbeat = %s,
@@ -986,8 +1038,14 @@ def create_agent_routers(
                 # El latido resuelve la desconexión (solo esa categoría).
                 health.on_heartbeat(cur, str(ctx.id))
             maybe_cleanup(cur)
+            if connection_tests is not None:
+                try:
+                    pending_tests = connection_tests.pending_for(cur, ctx)
+                except Exception:  # noqa: BLE001 — el latido nunca falla por esto
+                    pending_tests = 0
         return {"status": "ok", "server_time": iso(utcnow()),
-                "credential_rotation_required": ctx.rotation_required}
+                "credential_rotation_required": ctx.rotation_required,
+                "connection_tests_pending": pending_tests}
 
     @agent.post("/events")
     def agent_event(body: AgentEventBody, ctx: InstallationCtx = Depends(authenticate)) -> dict:
@@ -1019,6 +1077,11 @@ def create_agent_routers(
     if inventory is not None:
         from inventory_postgres import register_agent_inventory_routes
         register_agent_inventory_routes(agent, authenticate, inventory)
+
+    # ── Prueba de conexión (sección 22) ─────────────────────────────────────
+    if connection_tests is not None:
+        from connection_tests_postgres import register_agent_connection_test_routes
+        register_agent_connection_test_routes(agent, authenticate, connection_tests)
 
     # ── Rotación de credencial ──────────────────────────────────────────────
     @agent.post("/credentials/rotate")
@@ -1074,6 +1137,7 @@ def create_agent_routers(
                i.last_seen_at, i.last_ip, i.last_heartbeat, i.credential_rotated_at, i.rotation_required,
                (i.previous_credential_hash IS NOT NULL AND i.previous_valid_until > NOW()) AS rotation_in_grace,
                i.revoked_at, i.revoked_reason, i.created_at, i.updated_at, i.last_agent_seq,
+               i.withheld_tasks, i.withheld_at,
                (SELECT COUNT(*) FROM task_execution e WHERE e.installation_id = i.id
                   AND e.status = 'failed' AND e.received_at >= NOW() - INTERVAL '24 hours') AS failures_24h,
                (SELECT MAX(e.finished_at) FROM task_execution e WHERE e.installation_id = i.id) AS last_execution_at
@@ -1089,7 +1153,9 @@ def create_agent_routers(
         out["legacy"] = False
         out["latest_version"] = latest_agent_version or None
         out["version_status"] = agent_version_status(r.get("client_version"), latest_agent_version)
-        for k in ("last_seen_at", "credential_rotated_at", "revoked_at", "created_at", "updated_at", "last_execution_at"):
+        out["withheld_tasks"] = r.get("withheld_tasks") or []
+        for k in ("last_seen_at", "credential_rotated_at", "revoked_at", "created_at", "updated_at", "last_execution_at",
+                  "withheld_at"):
             out[k] = iso(r.get(k))
         return out
 

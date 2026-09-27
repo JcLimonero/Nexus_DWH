@@ -514,11 +514,11 @@ def resolve_company_token(company_token: str) -> Dict[str, Any]:
                 g.id              AS group_id,
                 g.name            AS group_name,
                 g.is_enabled      AS group_enabled,
-                g.warehouse_host  AS warehouse_host,
-                g.warehouse_port  AS warehouse_port,
-                g.warehouse_database AS warehouse_database,
-                g.warehouse_username AS warehouse_username,
-                g.warehouse_password AS warehouse_password
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_host ELSE g.warehouse_host END) AS warehouse_host,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_port ELSE g.warehouse_port END) AS warehouse_port,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_database ELSE g.warehouse_database END) AS warehouse_database,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_username ELSE g.warehouse_username END) AS warehouse_username,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_password ELSE g.warehouse_password END) AS warehouse_password
             FROM company c
             JOIN client_group g ON g.id = c.group_id
             WHERE c.company_token = %s
@@ -630,11 +630,11 @@ def resolve_agency_token(agency_token: str) -> Dict[str, Any]:
                 g.id AS group_id,
                 g.name AS group_name,
                 g.is_enabled AS group_enabled,
-                g.warehouse_host AS warehouse_host,
-                g.warehouse_port AS warehouse_port,
-                g.warehouse_database AS warehouse_database,
-                g.warehouse_username AS warehouse_username,
-                g.warehouse_password AS warehouse_password
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_host ELSE g.warehouse_host END) AS warehouse_host,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_port ELSE g.warehouse_port END) AS warehouse_port,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_database ELSE g.warehouse_database END) AS warehouse_database,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_username ELSE g.warehouse_username END) AS warehouse_username,
+                (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_password ELSE g.warehouse_password END) AS warehouse_password
             FROM agency a
             JOIN company c ON c.id = a.company_id
             JOIN client_group g ON g.id = c.group_id
@@ -691,7 +691,7 @@ def fetch_company_task_configs(company_token: str) -> List[SyncTaskConfig]:
                 g.name AS group_name,
                 c.name AS company_name,
                 a.name AS agency_name,
-                oc.destination_table AS destination_table,
+                (CASE WHEN position('.' in oc.destination_table) > 0 OR (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_schema ELSE g.warehouse_schema END) = 'public' THEN oc.destination_table ELSE (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_schema ELSE g.warehouse_schema END) || '.' || oc.destination_table END) AS destination_table,
                 oc.upsert_keys,
                 oc.create_table_sql AS create_table_sql,
                 oc.constraint_name AS constraint_name,
@@ -756,7 +756,7 @@ def fetch_agency_task_configs(agency_token: str) -> List[SyncTaskConfig]:
                 g.name AS group_name,
                 c.name AS company_name,
                 a.name AS agency_name,
-                oc.destination_table AS destination_table,
+                (CASE WHEN position('.' in oc.destination_table) > 0 OR (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_schema ELSE g.warehouse_schema END) = 'public' THEN oc.destination_table ELSE (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_schema ELSE g.warehouse_schema END) || '.' || oc.destination_table END) AS destination_table,
                 oc.upsert_keys,
                 oc.create_table_sql AS create_table_sql,
                 oc.constraint_name AS constraint_name,
@@ -837,7 +837,7 @@ def fetch_group_task_configs(group_token: str) -> Tuple[List[GroupSyncTaskConfig
                 c.source_database AS source_database,
                 c.source_username AS source_username,
                 c.source_password AS source_password,
-                oc.destination_table AS destination_table,
+                (CASE WHEN position('.' in oc.destination_table) > 0 OR (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_schema ELSE g.warehouse_schema END) = 'public' THEN oc.destination_table ELSE (CASE WHEN c.warehouse_mode = 'custom' THEN c.warehouse_schema ELSE g.warehouse_schema END) || '.' || oc.destination_table END) AS destination_table,
                 oc.upsert_keys,
                 oc.create_table_sql AS create_table_sql,
                 oc.constraint_name AS constraint_name,
@@ -855,6 +855,9 @@ def fetch_group_task_configs(group_token: str) -> Tuple[List[GroupSyncTaskConfig
             JOIN company c ON c.id = a.company_id
             JOIN client_group g ON g.id = c.group_id
             WHERE g.group_token = %s
+              -- Las empresas con destino propio NO van por /group-configs (su contrato tiene un único
+              -- DWH): requieren el agente v5.3+ o un token de empresa/agencia.
+              AND c.warehouse_mode <> 'custom'
               AND at.is_active = TRUE
               AND a.is_enabled = TRUE
               AND oc.is_enabled = TRUE
@@ -1112,7 +1115,8 @@ def _scope_secret_values(company_id: Optional[int], group_id: int) -> List[str]:
         vals = list(cur.fetchone() or [])
         if company_id:
             cur.execute(
-                """SELECT source_host, source_database, source_username, source_password, source_dsn
+                """SELECT source_host, source_database, source_username, source_password, source_dsn,
+                          warehouse_host, warehouse_database, warehouse_username, warehouse_password
                    FROM company WHERE id = %s""",
                 (company_id,),
             )
@@ -1564,6 +1568,18 @@ INVENTORY_MAX_JSON_CONTAINERS = _ini.getint(
     fallback=max(10_000, 30 * INVENTORY_ENGINE.s.max_objects_per_snapshot))
 app.include_router(create_inventory_admin_router(engine=INVENTORY_ENGINE, auth=AUTH))
 
+# Prueba de conexión ejecutada por el agente (sección 22 de DWH_README.md)
+from connection_tests_postgres import (  # noqa: E402
+    ConnectionTestEngine, ConnectionTestSettings, create_connection_test_admin_router,
+)
+
+CONNECTION_TEST_ENGINE = ConnectionTestEngine(
+    get_connection=get_connection,
+    decrypt_config_secret=decrypt_config_secret,
+    settings=ConnectionTestSettings.from_ini(_ini),
+)
+app.include_router(create_connection_test_admin_router(engine=CONNECTION_TEST_ENGINE, auth=AUTH))
+
 _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers(
     get_connection=get_connection,
     decrypt_config_secret=decrypt_config_secret,
@@ -1578,6 +1594,7 @@ _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers
     health=HEALTH_ENGINE,
     inventory=INVENTORY_ENGINE,
     latest_agent_version=AGENT_LATEST_VERSION,
+    connection_tests=CONNECTION_TEST_ENGINE,
 )
 app.include_router(_agent_router)
 app.include_router(_agent_admin_router)

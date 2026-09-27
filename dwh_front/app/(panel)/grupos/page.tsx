@@ -10,32 +10,54 @@ import { Modal } from "@/components/ui/modal";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { TokenField } from "@/components/ui/token";
-import { PasswordInput, SecretNotice } from "@/components/password-input";
+import { SecretNotice } from "@/components/password-input";
+import {
+  ConnectionTestPanel,
+  DestinationChangeNotice,
+  warehouseLocation,
+  EMPTY_WAREHOUSE,
+  WarehouseFields,
+  sslLabel,
+  validateWarehouse,
+  warehouseBody,
+  type WarehouseForm,
+} from "@/components/destination";
 import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
 import { useSession } from "@/components/session";
 
 interface FormState {
   name: string;
-  warehouse_host: string;
-  warehouse_port: string;
-  warehouse_database: string;
-  warehouse_username: string;
-  warehouse_password: string;
-  clear_password: boolean;
+  warehouse: WarehouseForm;
   is_enabled: boolean;
 }
 
 const EMPTY: FormState = {
   name: "",
-  warehouse_host: "",
-  warehouse_port: "5432",
-  warehouse_database: "",
-  warehouse_username: "",
-  warehouse_password: "",
-  clear_password: false,
+  warehouse: EMPTY_WAREHOUSE,
   is_enabled: true,
 };
+
+function warehouseOf(g: Group): WarehouseForm {
+  return {
+    host: g.warehouse_host ?? "",
+    port: String(g.warehouse_port),
+    database: g.warehouse_database ?? "",
+    username: g.warehouse_username ?? "",
+    password: "",
+    clear_password: false,
+    schema: g.warehouse_schema || "public",
+    sslmode: g.warehouse_sslmode || "prefer",
+    sslrootcert: g.warehouse_sslrootcert ?? "",
+  };
+}
+
+/** ¿El formulario tiene cambios de conexión sin guardar? (la prueba usa lo guardado) */
+function warehouseDirty(g: Group | null, w: WarehouseForm): boolean {
+  if (!g) return true;
+  const saved = warehouseOf(g);
+  return (Object.keys(saved) as (keyof WarehouseForm)[]).some((k) => k !== "clear_password" && saved[k] !== w[k]) || w.clear_password;
+}
 
 export default function GruposPage() {
   const { data, loading, error, reload } = useApi<ListResponse<Group>>("admin/groups");
@@ -47,10 +69,14 @@ export default function GruposPage() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [saving, setSaving] = useState(false);
+  const [resetSync, setResetSync] = useState(true);
   const items = data?.items ?? [];
   // En el formulario: configuración (nombre/activo) y credenciales del DWH van por permisos distintos.
   const formCfg = editing ? can("config.manage", editing.id) : canCreate;
   const formCred = editing ? can("credentials.manage", editing.id) : canGlobal("credentials.manage");
+
+  // ¿Cambia la ubicación física del destino (host/puerto/base/esquema)? → aviso de reinicio de carga.
+  const locationChanged = Boolean(editing && formCred && !editing.secrets_hidden && warehouseLocation(warehouseOf(editing)) !== warehouseLocation(form.warehouse));
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -61,41 +87,33 @@ export default function GruposPage() {
   }
   function openEdit(g: Group) {
     setEditing(g);
-    setForm({
-      name: g.name,
-      warehouse_host: g.warehouse_host ?? "",
-      warehouse_port: String(g.warehouse_port),
-      warehouse_database: g.warehouse_database ?? "",
-      warehouse_username: g.warehouse_username ?? "",
-      warehouse_password: "",
-      clear_password: false,
-      is_enabled: g.is_enabled,
-    });
+    setForm({ name: g.name, warehouse: warehouseOf(g), is_enabled: g.is_enabled });
+    setResetSync(true);
     setOpen(true);
   }
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
-    const port = Number(form.warehouse_port);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      toast.error("El puerto debe ser un número entre 1 y 65535.");
-      return;
-    }
     const body: Record<string, unknown> = {};
     if (formCfg) {
       body.name = form.name.trim();
       body.is_enabled = form.is_enabled;
     }
     if (formCred) {
-      body.warehouse_port = port;
-      const undecryptable = editing?.decrypt_errors ?? [];
-      (["warehouse_host", "warehouse_database", "warehouse_username"] as const).forEach((k) => {
-        // Si no se pudo descifrar y el campo quedó vacío, se conserva el valor actual.
-        if (undecryptable.includes(k) && !form[k]) return;
-        body[k] = form[k].trim();
-      });
-      if (form.warehouse_password) body.warehouse_password = form.warehouse_password;
-      if (editing && form.clear_password && !form.warehouse_password) body.clear_password = true;
+      const problem = validateWarehouse(form.warehouse);
+      if (problem) {
+        toast.error(problem);
+        return;
+      }
+      Object.assign(
+        body,
+        warehouseBody(form.warehouse, {
+          isEdit: Boolean(editing),
+          hasPassword: Boolean(editing?.has_password),
+          undecryptable: editing?.decrypt_errors,
+        }),
+      );
+      if (locationChanged) body.reset_sync = resetSync;
     }
     if (!editing) body.name = form.name.trim();
 
@@ -171,6 +189,14 @@ export default function GruposPage() {
                         </p>
                       </>
                     )}
+                    <p className="text-xs text-slate-500">
+                      esquema <span className="font-mono text-slate-700">{g.warehouse_schema}</span> · ssl {sslLabel(g.warehouse_sslmode)}
+                      {g.custom_destination_count > 0 && (
+                        <span className="ml-1 text-brand-700" title="Empresas del grupo que usan un destino propio">
+                          · {g.custom_destination_count} empresa(s) con destino propio
+                        </span>
+                      )}
+                    </p>
                   </Td>
                   <Td>
                     <TokenField
@@ -247,8 +273,9 @@ export default function GruposPage() {
       <Modal
         open={open}
         onClose={() => setOpen(false)}
+        size="lg"
         title={editing ? `Editar grupo: ${editing.name}` : "Nuevo grupo"}
-        description="La conexión al DWH es compartida por todas las empresas del grupo."
+        description="Destino (DWH) predeterminado de todas las empresas del grupo; cada empresa puede usar uno propio."
         footer={
           <>
             <Button variant="secondary" onClick={() => setOpen(false)}>
@@ -265,38 +292,35 @@ export default function GruposPage() {
             <Input id="g-name" required maxLength={255} disabled={!formCfg} value={form.name} onChange={(e) => set("name", e.target.value)} />
           </Field>
           <div className="sm:col-span-6">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Data Warehouse (PostgreSQL)</h3>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Destino: Data Warehouse (PostgreSQL)</h3>
             {!formCred && (
               <p className="mt-1 text-xs text-slate-500">Sin permiso «Administrar credenciales»: la conexión no se muestra ni se puede cambiar.</p>
             )}
           </div>
-          <fieldset disabled={!formCred} className="contents">
-          <Field label="Host" className="sm:col-span-4" htmlFor="g-host">
-            <Input id="g-host" value={form.warehouse_host} onChange={(e) => set("warehouse_host", e.target.value)} placeholder="dwh.midominio.com" />
-          </Field>
-          <Field label="Puerto" className="sm:col-span-2" htmlFor="g-port">
-            <Input id="g-port" inputMode="numeric" value={form.warehouse_port} onChange={(e) => set("warehouse_port", e.target.value)} />
-          </Field>
-          <Field label="Base de datos" className="sm:col-span-3" htmlFor="g-db">
-            <Input id="g-db" value={form.warehouse_database} onChange={(e) => set("warehouse_database", e.target.value)} />
-          </Field>
-          <Field label="Usuario" className="sm:col-span-3" htmlFor="g-user">
-            <Input id="g-user" autoComplete="off" value={form.warehouse_username} onChange={(e) => set("warehouse_username", e.target.value)} />
-          </Field>
-          <Field
-            label="Contraseña"
-            className="sm:col-span-6"
-            htmlFor="g-pass"
-            hint={editing ? "Déjala vacía para conservar la contraseña actual." : "Se guarda cifrada si el backend tiene clave Fernet."}
-          >
-            <PasswordInput id="g-pass" value={form.warehouse_password} onChange={(v) => set("warehouse_password", v)} hasPassword={Boolean(editing?.has_password)} isEdit={Boolean(editing)} />
-          </Field>
-          {editing?.has_password && (
+          <WarehouseFields
+            idPrefix="g"
+            value={form.warehouse}
+            onChange={(w) => set("warehouse", w)}
+            disabled={!formCred}
+            isEdit={Boolean(editing)}
+            hasPassword={Boolean(editing?.has_password)}
+            hasCa={editing?.has_sslrootcert}
+          />
+          {editing && locationChanged && (
             <div className="sm:col-span-6">
-              <Switch checked={form.clear_password} disabled={!formCred} onChange={(v) => set("clear_password", v)} label="Borrar la contraseña guardada" />
+              <DestinationChangeNotice tasks={editing.inherited_task_count} reset={resetSync} onReset={setResetSync} />
             </div>
           )}
-          </fieldset>
+          {editing && (
+            <div className="sm:col-span-6">
+              <ConnectionTestPanel
+                targetKind="group_dwh"
+                groupId={editing.id}
+                canRun={can("config.manage", editing.id)}
+                disabledReason={formCred && warehouseDirty(editing, form.warehouse) ? "Hay cambios sin guardar: la prueba usa la configuración guardada." : null}
+              />
+            </div>
+          )}
           <div className="sm:col-span-6">
             <Switch checked={form.is_enabled} disabled={!formCfg} onChange={(v) => set("is_enabled", v)} label="Grupo habilitado" description="Si se deshabilita, ningún cliente del grupo recibe configuración." />
           </div>

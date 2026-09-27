@@ -139,6 +139,10 @@ def _classify(exc: BaseException, side: str) -> str:
         if code.startswith("3D"):
             return prefix + "DATABASE_NOT_FOUND"
         if code.startswith("08") or (name in ("OperationalError", "InterfaceError") and not code):
+            # SSL/TLS: servidor sin SSL con sslmode=require, certificado no verificable, CA inválida…
+            if any(k in text for k in ("does not support ssl", "certificate", "root cert", "sslmode",
+                                       "ssl error", "ssl negotiation", "sslrootcert")):
+                return prefix + "SSL_ERROR"
             if "password authentication failed" in text or "authentication" in text:
                 return prefix + "AUTH_FAILED"
             if "timeout" in text:

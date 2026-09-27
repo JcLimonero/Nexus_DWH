@@ -36,6 +36,9 @@ import psycopg2.extras
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
+from destination_postgres import (
+    DEFAULT_SCHEMA, DEFAULT_SSLMODE, check_schema, check_sslrootcert, effective_sql,
+)
 from panel_auth import AuthContext, AuthService, err, group_of
 
 SOURCE_TYPES = ("sqlserver", "mysql", "postgresql", "pervasive", "firebird")
@@ -44,6 +47,11 @@ SourceType = Literal["sqlserver", "mysql", "postgresql", "pervasive", "firebird"
 # Campos sensibles por tabla (se cifran al escribir)
 GROUP_SECRET_FIELDS = ("warehouse_host", "warehouse_database", "warehouse_username", "warehouse_password")
 COMPANY_SECRET_FIELDS = ("source_host", "source_database", "source_username", "source_password", "source_dsn")
+# Destino propio de la empresa (solo con warehouse_mode = 'custom'); mismos campos que el grupo.
+COMPANY_WH_SECRET_FIELDS = GROUP_SECRET_FIELDS
+# Campos de conexión al DWH que no son secretos pero sí parte de la conexión (credentials.manage).
+WH_CONN_FIELDS = ("warehouse_port", "warehouse_schema", "warehouse_sslmode", "warehouse_sslrootcert")
+SslMode = Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
@@ -105,6 +113,8 @@ OptText = Annotated[Optional[str], AfterValidator(_empty_to_none)]
 OptName = Annotated[Optional[str], Field(max_length=255), AfterValidator(_empty_to_none)]
 UpsertKeys = Annotated[Optional[str], AfterValidator(_norm_upsert_keys)]
 Port = Annotated[int, Field(ge=1, le=65535)]
+SchemaStr = Annotated[str, Field(min_length=1, max_length=63), AfterValidator(check_schema)]
+CaPem = Annotated[str, Field(max_length=20000), AfterValidator(check_sslrootcert)]
 
 
 class _Base(BaseModel):
@@ -118,6 +128,9 @@ class GroupCreate(_Base):
     warehouse_database: str = Field("", max_length=255)
     warehouse_username: str = Field("", max_length=255)
     warehouse_password: Optional[str] = Field(None, max_length=512)
+    warehouse_schema: SchemaStr = DEFAULT_SCHEMA
+    warehouse_sslmode: SslMode = DEFAULT_SSLMODE
+    warehouse_sslrootcert: CaPem = ""
     is_enabled: bool = True
 
 
@@ -128,11 +141,34 @@ class GroupUpdate(_Base):
     warehouse_database: Optional[str] = Field(None, max_length=255)
     warehouse_username: Optional[str] = Field(None, max_length=255)
     warehouse_password: Optional[str] = Field(None, max_length=512)
+    warehouse_schema: Optional[SchemaStr] = None
+    warehouse_sslmode: Optional[SslMode] = None
+    warehouse_sslrootcert: Optional[CaPem] = None
     clear_password: bool = False
     is_enabled: Optional[bool] = None
+    # Si cambia el destino (host/puerto/base/esquema) de alguna empresa: reiniciar la carga de sus
+    # extractores (watermark → carga completa en la tabla nueva). Defecto: sí (sección 22.7).
+    reset_sync: bool = True
 
 
-class CompanyCreate(_Base):
+class CompanyWarehouse(_Base):
+    """
+    Destino de la empresa. ``mode = 'inherit'`` (defecto) usa el del grupo y descarta
+    cualquier destino propio guardado; ``'custom'`` exige host, base y usuario.
+    """
+    warehouse_mode: Optional[Literal["inherit", "custom"]] = None
+    warehouse_host: Optional[str] = Field(None, max_length=255)
+    warehouse_port: Optional[Port] = None
+    warehouse_database: Optional[str] = Field(None, max_length=255)
+    warehouse_username: Optional[str] = Field(None, max_length=255)
+    warehouse_password: Optional[str] = Field(None, max_length=512)
+    warehouse_schema: Optional[SchemaStr] = None
+    warehouse_sslmode: Optional[SslMode] = None
+    warehouse_sslrootcert: Optional[CaPem] = None
+    warehouse_clear_password: bool = False
+
+
+class CompanyCreate(CompanyWarehouse):
     group_id: int = Field(..., ge=1)
     name: NameStr
     source_type: SourceType = "sqlserver"
@@ -147,7 +183,7 @@ class CompanyCreate(_Base):
     is_enabled: bool = True
 
 
-class CompanyUpdate(_Base):
+class CompanyUpdate(CompanyWarehouse):
     group_id: Optional[int] = Field(None, ge=1)
     name: Optional[NameStr] = None
     source_type: Optional[SourceType] = None
@@ -158,6 +194,7 @@ class CompanyUpdate(_Base):
     source_password: Optional[str] = Field(None, max_length=512)
     source_dsn: Optional[str] = Field(None, max_length=255)
     clear_password: bool = False
+    reset_sync: bool = True
     verbose_logging: Optional[bool] = None
     refresh_seconds: Optional[int] = Field(None, ge=5, le=86400)
     is_enabled: Optional[bool] = None
@@ -417,6 +454,12 @@ def create_admin_router(
             row["token_hidden"] = False
         return row
 
+    def ca_out(row: Dict[str, Any], column: str, flag: str, allowed: bool) -> None:
+        """El certificado de la CA no es secreto, pero es parte de la conexión: solo con credentials.manage."""
+        row[flag] = bool(row.get(column))
+        if not allowed:
+            row[column] = None
+
     # ── Update genérico ─────────────────────────────────────────────────────
     def apply_update(cur: Any, table: str, row_id: int, values: Dict[str, Any]) -> None:
         if not values:
@@ -478,6 +521,57 @@ def create_admin_router(
         )
         return {k: int(v or 0) for k, v in (row or {}).items()}
 
+    # ── Destino efectivo: ubicación, cambios y reinicio de la carga (sección 22) ──
+    def destination_locations(cur: Any, where: str, params: Tuple) -> Dict[int, Tuple]:
+        """{company_id: (host, puerto, base, esquema)} del destino EFECTIVO (lo que define la tabla física)."""
+        cur.execute(
+            f"""SELECT c.id, {effective_sql('host')} AS h, {effective_sql('port')} AS p,
+                       {effective_sql('database')} AS d, {effective_sql('schema')} AS s
+                FROM company c JOIN client_group g ON g.id = c.group_id WHERE {where}""", params)
+        return {r["id"]: ((_dec(r["h"]) or "").strip().lower(), int(r["p"] or 5432), (_dec(r["d"]) or "").strip(),
+                          r["s"] or DEFAULT_SCHEMA) for r in cur.fetchall()}
+
+    def reset_sync_for_companies(cur: Any, company_ids: List[int]) -> List[int]:
+        """Reinicia watermark/last_run de los extractores de esas empresas (igual que reset-last-run)."""
+        if not company_ids:
+            return []
+        cur.execute("""SELECT t.id FROM agency_task t JOIN agency a ON a.id = t.agency_id
+                       WHERE a.company_id = ANY(%s) ORDER BY t.id""", (company_ids,))
+        ids = [r["id"] for r in cur.fetchall()]
+        if not ids:
+            return []
+        cur.execute("UPDATE agency_task SET last_run_at = NULL WHERE id = ANY(%s)", (ids,))
+        cur.execute(
+            """INSERT INTO task_sync_state (task_id, watermark, watermark_kind, watermark_reset_at)
+               SELECT x, NULL, NULL, NOW() FROM unnest(%s::int[]) AS x
+               ON CONFLICT (task_id) DO UPDATE
+                  SET watermark = NULL, watermark_kind = NULL, watermark_reset_at = NOW(), updated_at = NOW()""",
+            (ids,))
+        if on_watermark_reset is not None:
+            for tid in ids:
+                on_watermark_reset(cur, tid)
+        return ids
+
+    def after_destination_change(cur: Any, ctx: AuthContext, before: Dict[int, Tuple], after: Dict[int, Tuple],
+                                 do_reset: bool, *, target_type: str, target_id: int, group_id: int,
+                                 changed_fields: List[str]) -> Dict[str, Any]:
+        changed = sorted(cid for cid in set(before) | set(after) if before.get(cid) != after.get(cid))
+        if not changed:
+            return {"destination_changed_companies": [], "sync_reset_tasks": 0}
+        tasks = reset_sync_for_companies(cur, changed) if do_reset else []
+        auth.audit(ctx, action="destination.change", status_code=200, target_type=target_type,
+                   target_id=str(target_id), group_id=group_id, cur=cur,
+                   details={"companies": changed[:100], "fields_sent": sorted(changed_fields)[:20],
+                            "sync_reset": bool(do_reset), "tasks_reset": len(tasks), "task_ids": tasks[:100]})
+        return {"destination_changed_companies": changed, "sync_reset_tasks": len(tasks)}
+
+    def check_ca_required(cur: Any, table: str, row_id: int) -> None:
+        cur.execute(f"SELECT warehouse_sslmode, warehouse_sslrootcert FROM {table} WHERE id = %s", (row_id,))
+        r = cur.fetchone()
+        if r and r["warehouse_sslmode"] == "verify-ca" and not (r["warehouse_sslrootcert"] or "").strip():
+            raise HTTPException(status_code=422, detail="verify-ca requiere el certificado de la CA (PEM). "
+                                                        "Con verify-full puede omitirse (se usan las CAs del sistema).")
+
     # ════════════════════════════════════════════════════════════════════════
     # GRUPOS
     # ════════════════════════════════════════════════════════════════════════
@@ -487,7 +581,13 @@ def create_admin_router(
             SELECT g.id, g.name, {token_col} AS group_token,
                    g.warehouse_host, g.warehouse_port, g.warehouse_database,
                    g.warehouse_username, g.warehouse_password,
+                   g.warehouse_schema, g.warehouse_sslmode, g.warehouse_sslrootcert,
                    g.is_enabled, g.created_at, g.updated_at,
+                   (SELECT COUNT(*) FROM company c WHERE c.group_id = g.id
+                      AND c.warehouse_mode = 'custom') AS custom_destination_count,
+                   (SELECT COUNT(*) FROM agency_task t JOIN agency a ON a.id = t.agency_id
+                      JOIN company c ON c.id = a.company_id
+                     WHERE c.group_id = g.id AND c.warehouse_mode = 'inherit') AS inherited_task_count,
                    (SELECT COUNT(*) FROM company c WHERE c.group_id = g.id) AS company_count
             FROM client_group g
         """
@@ -495,6 +595,7 @@ def create_admin_router(
     def group_out(row: Dict[str, Any], ctx: AuthContext) -> Dict[str, Any]:
         allowed = ctx.can("credentials.manage", row["id"])
         hide_token(row, "group_token", allowed)
+        ca_out(row, "warehouse_sslrootcert", "has_sslrootcert", allowed)
         return reveal(row, GROUP_SECRET_FIELDS, "warehouse_password", allowed)
 
     def get_group_or_404(group_id: int, ctx: AuthContext) -> Dict[str, Any]:
@@ -518,7 +619,8 @@ def create_admin_router(
     def create_group(body: GroupCreate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         # Un grupo nuevo no está en el alcance de nadie con alcance por grupo: solo global.
         require_global(ctx, "config.manage")
-        if any(getattr(body, f) for f in GROUP_SECRET_FIELDS):
+        if any(getattr(body, f) for f in GROUP_SECRET_FIELDS) or body.warehouse_sslrootcert \
+                or body.warehouse_schema != DEFAULT_SCHEMA or body.warehouse_sslmode != DEFAULT_SSLMODE:
             require_global(ctx, "credentials.manage")
         values: Dict[str, Any] = {
             "name": body.name,
@@ -527,6 +629,9 @@ def create_admin_router(
             "warehouse_database": encrypt_value(body.warehouse_database, "warehouse_database"),
             "warehouse_username": encrypt_value(body.warehouse_username, "warehouse_username"),
             "warehouse_password": encrypt_value(body.warehouse_password, "warehouse_password"),
+            "warehouse_schema": body.warehouse_schema,
+            "warehouse_sslmode": body.warehouse_sslmode,
+            "warehouse_sslrootcert": body.warehouse_sslrootcert,
             "is_enabled": body.is_enabled,
         }
         if group_token_column_exists():
@@ -536,6 +641,7 @@ def create_admin_router(
         with tx() as cur:
             cur.execute(f"INSERT INTO client_group ({cols}) VALUES ({ph}) RETURNING id", tuple(values.values()))
             new_id = cur.fetchone()["id"]
+            check_ca_required(cur, "client_group", new_id)
         ctx.audit_group = new_id
         return get_group_or_404(new_id, ctx)
 
@@ -543,6 +649,7 @@ def create_admin_router(
     def update_group(group_id: int, body: GroupUpdate, ctx: AuthContext = Depends(VIEW)) -> dict:
         data = body.model_dump(exclude_unset=True)
         clear_pw = data.pop("clear_password", False)
+        do_reset = data.pop("reset_sync", True)
         values: Dict[str, Any] = {}
         touches_secrets = clear_pw
         for k, v in data.items():
@@ -553,7 +660,7 @@ def create_admin_router(
                     continue
                 values[k] = encrypt_value(v, k)
                 touches_secrets = True
-            elif k in GROUP_SECRET_FIELDS or k == "warehouse_port":
+            elif k in GROUP_SECRET_FIELDS or k in WH_CONN_FIELDS:
                 values[k] = encrypt_value(v, k) if k in GROUP_SECRET_FIELDS else v
                 touches_secrets = True
             else:
@@ -562,12 +669,19 @@ def create_admin_router(
             values["warehouse_password"] = ""
         with tx() as cur:
             check(cur, ctx, "view", "group", group_id, "Grupo")
-            if any(k not in GROUP_SECRET_FIELDS and k != "warehouse_port" for k in values):
+            if any(k not in GROUP_SECRET_FIELDS and k not in WH_CONN_FIELDS for k in values):
                 ctx.check("config.manage", group_id, "Grupo")
             if touches_secrets:
                 ctx.check("credentials.manage", group_id, "Grupo")
+            before = destination_locations(cur, "c.group_id = %s", (group_id,))
             apply_update(cur, "client_group", group_id, values)
-        return get_group_or_404(group_id, ctx)
+            check_ca_required(cur, "client_group", group_id)
+            change = after_destination_change(
+                cur, ctx, before, destination_locations(cur, "c.group_id = %s", (group_id,)), do_reset,
+                target_type="groups", target_id=group_id, group_id=group_id, changed_fields=list(values))
+        out = get_group_or_404(group_id, ctx)
+        out.update(change)
+        return out
 
     @router.delete("/groups/{group_id}")
     def delete_group(group_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
@@ -615,20 +729,121 @@ def create_admin_router(
                c.source_type, c.source_host, c.source_port, c.source_database,
                c.source_username, c.source_password, c.source_dsn,
                c.verbose_logging, c.refresh_seconds, c.is_enabled,
+               c.warehouse_mode, c.warehouse_host, c.warehouse_port, c.warehouse_database,
+               c.warehouse_username, c.warehouse_password, c.warehouse_schema, c.warehouse_sslmode,
+               c.warehouse_sslrootcert,
+               g.warehouse_host AS group_warehouse_host, g.warehouse_port AS group_warehouse_port,
+               g.warehouse_database AS group_warehouse_database, g.warehouse_schema AS group_warehouse_schema,
+               g.warehouse_sslmode AS group_warehouse_sslmode,
                g.is_enabled AS group_enabled,
                c.created_at, c.updated_at,
                (SELECT COUNT(*) FROM agency a WHERE a.company_id = c.id)         AS agency_count,
-               (SELECT COUNT(*) FROM object_catalog o WHERE o.company_id = c.id) AS object_count
+               (SELECT COUNT(*) FROM object_catalog o WHERE o.company_id = c.id) AS object_count,
+               (SELECT COUNT(*) FROM agency_task t JOIN agency a ON a.id = t.agency_id
+                 WHERE a.company_id = c.id) AS task_count
         FROM company c
         JOIN client_group g ON g.id = c.group_id
     """
-    # Campos de conexión al origen (credentials.manage); el resto es configuración.
-    COMPANY_CRED_FIELDS = set(COMPANY_SECRET_FIELDS) | {"source_port", "source_type"}
+    # Campos de conexión al origen y al destino propio (credentials.manage); el resto es configuración.
+    COMPANY_WH_FIELDS = set(COMPANY_WH_SECRET_FIELDS) | set(WH_CONN_FIELDS) | {"warehouse_mode"}
+    COMPANY_CRED_FIELDS = set(COMPANY_SECRET_FIELDS) | {"source_port", "source_type"} | COMPANY_WH_FIELDS
+    WH_DEFAULTS = {"warehouse_host": "", "warehouse_port": 5432, "warehouse_database": "",
+                   "warehouse_username": "", "warehouse_password": "", "warehouse_schema": DEFAULT_SCHEMA,
+                   "warehouse_sslmode": DEFAULT_SSLMODE, "warehouse_sslrootcert": ""}
+
+    def _dec(raw: Any) -> Optional[str]:
+        try:
+            return decrypt_config_secret(raw or "")
+        except Exception:
+            return None
 
     def company_out(row: Dict[str, Any], ctx: AuthContext) -> Dict[str, Any]:
         allowed = ctx.can("credentials.manage", row["group_id"])
         hide_token(row, "company_token", allowed)
-        return reveal(row, COMPANY_SECRET_FIELDS, "source_password", allowed)
+        custom = row.get("warehouse_mode") == "custom"
+        # Resumen del destino EFECTIVO (lo que usa el agente); host/base solo con credentials.manage.
+        if custom:
+            eff = {"source": "company", "host": row.get("warehouse_host"), "port": row.get("warehouse_port"),
+                   "database": row.get("warehouse_database"), "schema": row.get("warehouse_schema"),
+                   "sslmode": row.get("warehouse_sslmode")}
+        else:
+            eff = {"source": "group", "host": row.get("group_warehouse_host"),
+                   "port": row.get("group_warehouse_port"), "database": row.get("group_warehouse_database"),
+                   "schema": row.get("group_warehouse_schema"), "sslmode": row.get("group_warehouse_sslmode")}
+        eff["configured"] = bool(_dec(eff["host"]) or "")
+        if allowed:
+            eff["host"], eff["database"] = _dec(eff["host"]), _dec(eff["database"])
+        else:
+            eff["host"] = eff["database"] = None
+        row["effective_warehouse"] = eff
+        for k in ("group_warehouse_host", "group_warehouse_port", "group_warehouse_database",
+                  "group_warehouse_schema", "group_warehouse_sslmode"):
+            row.pop(k, None)
+        # Destino propio (solo tiene sentido en modo custom): contraseña nunca, resto con credentials.manage.
+        wh_encrypted: List[str] = []
+        wh_errors: List[str] = []
+        for f in COMPANY_WH_SECRET_FIELDS:
+            raw = row.get(f)
+            if isinstance(raw, str) and raw.startswith("ENC:"):
+                wh_encrypted.append(f)
+            if f == "warehouse_password":
+                row["warehouse_has_password"] = bool(raw)
+                row.pop(f, None)
+                continue
+            if not allowed:
+                row[f] = None
+                continue
+            val = _dec(raw)
+            if val is None:
+                wh_errors.append(f)
+            row[f] = val
+        ca_out(row, "warehouse_sslrootcert", "warehouse_has_sslrootcert", allowed)
+        out = reveal(row, COMPANY_SECRET_FIELDS, "source_password", allowed)
+        out["encrypted_fields"] = out["encrypted_fields"] + wh_encrypted
+        out["decrypt_errors"] = out["decrypt_errors"] + wh_errors
+        return out
+
+    def company_wh_values(data: Dict[str, Any], clear_pw: bool, current_mode: Optional[str]) -> Dict[str, Any]:
+        """
+        Valores de destino a escribir. Pasar a 'inherit' descarta el destino propio
+        guardado (no quedan credenciales sin uso en la BD).
+        """
+        values: Dict[str, Any] = {}
+        mode = data.get("warehouse_mode") or current_mode or "inherit"
+        if mode == "inherit":
+            # Alta, o paso de 'custom' a 'inherit': se descarta el destino propio. Si ya heredaba, nada.
+            if current_mode is None or current_mode == "custom":
+                values.update(WH_DEFAULTS)
+                values["warehouse_mode"] = "inherit"
+            return values
+        if data.get("warehouse_mode"):
+            values["warehouse_mode"] = mode
+        for k in COMPANY_WH_FIELDS - {"warehouse_mode"}:
+            v = data.get(k)
+            if v is None:
+                continue
+            if k == "warehouse_password":
+                if v != "":
+                    values[k] = encrypt_value(v, k)
+            elif k in COMPANY_WH_SECRET_FIELDS:
+                values[k] = encrypt_value(v.strip(), k)
+            else:
+                values[k] = v
+        if clear_pw and "warehouse_password" not in values:
+            values["warehouse_password"] = ""
+        return values
+
+    def validate_custom_destination(cur: Any, company_id: int) -> None:
+        cur.execute("SELECT warehouse_mode, warehouse_host, warehouse_database, warehouse_username "
+                    "FROM company WHERE id = %s", (company_id,))
+        r = cur.fetchone()
+        if r and r["warehouse_mode"] == "custom":
+            missing = [lbl for f, lbl in (("warehouse_host", "host"), ("warehouse_database", "base de datos"),
+                                          ("warehouse_username", "usuario"))
+                       if not (_dec(r[f]) or "").strip()]
+            if missing:
+                raise HTTPException(status_code=422,
+                                    detail="Destino propio incompleto: falta " + ", ".join(missing) + ".")
 
     def get_company_or_404(company_id: int, ctx: AuthContext) -> Dict[str, Any]:
         row = fetch_one(COMPANY_SELECT + " WHERE c.id = %s", (company_id,))
@@ -665,6 +880,13 @@ def create_admin_router(
         }
         for f in COMPANY_SECRET_FIELDS:
             values[f] = encrypt_value(getattr(body, f), f)
+        wh_data = body.model_dump(include=COMPANY_WH_FIELDS, exclude_none=True)
+        wh_values = company_wh_values(wh_data, body.warehouse_clear_password, None)
+        if wh_values.get("warehouse_mode") != "custom" and any(
+                (wh_data.get(f) or "").strip() for f in COMPANY_WH_SECRET_FIELDS):
+            raise HTTPException(status_code=422, detail="Para usar un destino propio indique "
+                                                        "warehouse_mode = 'custom'.")
+        values.update(wh_values)
         cols = ", ".join(values)
         ph = ", ".join(["%s"] * len(values))
         with tx() as cur:
@@ -672,16 +894,21 @@ def create_admin_router(
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Grupo no encontrado.")
             ctx.check("config.manage", body.group_id, "Grupo")
-            if any(getattr(body, f) for f in COMPANY_SECRET_FIELDS):
+            if any(getattr(body, f) for f in COMPANY_SECRET_FIELDS) or wh_values.get("warehouse_mode") == "custom":
                 ctx.check("credentials.manage", body.group_id, "Grupo")
             cur.execute(f"INSERT INTO company ({cols}) VALUES ({ph}) RETURNING id", tuple(values.values()))
             new_id = cur.fetchone()["id"]
+            validate_custom_destination(cur, new_id)
+            check_ca_required(cur, "company", new_id)
         return get_company_or_404(new_id, ctx)
 
     @router.put("/companies/{company_id}")
     def update_company(company_id: int, body: CompanyUpdate, ctx: AuthContext = Depends(VIEW)) -> dict:
         data = body.model_dump(exclude_unset=True)
         clear_pw = data.pop("clear_password", False)
+        wh_clear_pw = data.pop("warehouse_clear_password", False)
+        do_reset = data.pop("reset_sync", True)
+        wh_data = {k: data.pop(k) for k in list(data) if k in COMPANY_WH_FIELDS}
         values: Dict[str, Any] = {}
         for k, v in data.items():
             if v is None:
@@ -698,6 +925,19 @@ def create_admin_router(
             values["source_password"] = ""
         with tx() as cur:
             gid = check(cur, ctx, "view", "company", company_id, "Empresa")
+            if wh_data or wh_clear_pw:
+                cur.execute("SELECT warehouse_mode FROM company WHERE id = %s", (company_id,))
+                cur_mode = cur.fetchone()["warehouse_mode"]
+                if {k: v for k, v in wh_data.items() if v is not None} or wh_clear_pw:
+                    wh_values = company_wh_values({k: v for k, v in wh_data.items() if v is not None},
+                                                  wh_clear_pw, cur_mode)
+                    # Solo campos que cambian algo (ej. 'inherit' → 'inherit' no toca nada).
+                    values.update(wh_values)
+                    if not wh_values and wh_data:
+                        # Datos de destino propio con la empresa en 'inherit': se exige elegir 'custom'.
+                        if cur_mode == "inherit" and wh_data.get("warehouse_mode") != "inherit":
+                            raise HTTPException(status_code=422, detail="Para usar un destino propio indique "
+                                                                        "warehouse_mode = 'custom'.")
             if any(k not in COMPANY_CRED_FIELDS for k in values):
                 ctx.check("config.manage", gid, "Empresa")
             if any(k in COMPANY_CRED_FIELDS for k in values):
@@ -709,8 +949,17 @@ def create_admin_router(
                     raise HTTPException(status_code=404, detail="Grupo no encontrado.")
                 ctx.check("config.manage", values["group_id"], "Grupo")
                 ctx.check("credentials.manage", [gid, values["group_id"]], "Grupo")
+            before = destination_locations(cur, "c.id = %s", (company_id,))
             apply_update(cur, "company", company_id, values)
-        return get_company_or_404(company_id, ctx)
+            validate_custom_destination(cur, company_id)
+            check_ca_required(cur, "company", company_id)
+            change = after_destination_change(
+                cur, ctx, before, destination_locations(cur, "c.id = %s", (company_id,)), do_reset,
+                target_type="companies", target_id=company_id, group_id=values.get("group_id") or gid,
+                changed_fields=list(values))
+        out = get_company_or_404(company_id, ctx)
+        out.update(change)
+        return out
 
     @router.delete("/companies/{company_id}")
     def delete_company(company_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:

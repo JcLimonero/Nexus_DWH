@@ -11,6 +11,8 @@ Hilos:
   * sender: vacía la cola local (SQLite) en orden de agent_seq, con backoff.
   * inventory: inventario estructural de solo lectura de las bases que Nexus le
     asigne (lease), con su propia sesión HTTP y frecuencia independiente del ETL.
+  * connection-tests: toma y ejecuta las pruebas "Probar conexión" pedidas desde el
+    panel (sección 22), con su propia sesión HTTP; nunca bloquea al ETL.
 
 Autorización con caducidad: la config (credenciales + SQL) vive SOLO en
 memoria y vale ``config_max_age_seconds``. Si Nexus no responde durante más
@@ -31,7 +33,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from . import AGENT_VERSION
+from . import AGENT_FEATURES, AGENT_VERSION
 from .api import (
     ApiAuthError,
     ApiError,
@@ -43,6 +45,9 @@ from .api import (
     installation_info,
 )
 from .credstore import CredentialStore, InstallationCredential
+from .destination import (
+    connection_key, prune_ca_files, register_warehouse_secrets, run_connection_test, task_warehouse,
+)
 from .inventory import InventoryRunner
 from .etl import RunContext, TaskResult, parse_watermark, register_task_secrets, run_task, watermark_iso
 from .localstate import LocalState, OutboxItem
@@ -125,6 +130,10 @@ class Agent:
         self._sender_stop_deadline = float("inf")
         self._last_auth_warn = 0.0
         self._last_api_ok = 0.0
+        self._tests_wakeup = threading.Event()
+        self._test_times: List[float] = []            # inicios de pruebas (monotónico), último minuto
+        self._test_last_by_target: Dict[str, float] = {}
+        self.last_connection_test: Optional[Dict[str, Any]] = None
 
     # ═════════════════════════════════════════════════════════════════════════
     # Credencial
@@ -287,6 +296,7 @@ class Agent:
 
         self.mark_api_ok()
         warehouse = data.get("warehouse") or {}
+        register_warehouse_secrets(warehouse)
         for t in data.get("tasks") or []:
             register_task_secrets(t, warehouse)
             sync = t.get("sync") or {}
@@ -297,6 +307,14 @@ class Agent:
             self._config_at = time.monotonic()
         self._stale_reported = False
         self._log_changes(old, data)
+        withheld = data.get("withheld_tasks") or []
+        if withheld:
+            log.warning("Nexus retuvo %d tarea(s) para este agente: %s.", len(withheld),
+                        ", ".join(sorted({str(w.get("reason")) for w in withheld})))
+        try:
+            prune_ca_files(self.settings, data)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Certificados: no se pudo limpiar (%s).", type(exc).__name__)
         if data.get("credential_rotation_required"):
             self.rotate_credential()
         return True
@@ -690,6 +708,8 @@ class Agent:
             "agent_seq": self.state.last_seq_cached,
             "config_age_seconds": int(age) if age is not None else None,
             "event_time": iso_utc(utcnow()),
+            "features": [f for f in AGENT_FEATURES
+                         if f != "connection-test" or self.settings.connection_test_enabled],
         }
 
     def send_heartbeat(self, api: NexusApi) -> bool:
@@ -707,6 +727,8 @@ class Agent:
         self.mark_api_ok()
         if resp.get("credential_rotation_required"):
             self._rotation_requested.set()
+        if resp.get("connection_tests_pending"):
+            self._tests_wakeup.set()
         return True
 
     def _heartbeat_loop(self) -> None:
@@ -745,12 +767,88 @@ class Agent:
         finally:
             api.close()
 
+    def _tests_budget_wait(self) -> float:
+        """Segundos a esperar antes de tomar otra prueba (tope por minuto), 0 si puede."""
+        now = time.monotonic()
+        self._test_times = [t for t in self._test_times if now - t < 60]
+        if len(self._test_times) < self.settings.connection_test_max_per_minute:
+            return 0.0
+        return max(0.5, 60 - (now - self._test_times[0]))
+
+    def run_one_connection_test(self, api: NexusApi) -> Optional[Dict[str, Any]]:
+        """Toma una prueba pendiente (si hay), la ejecuta y reporta. Devuelve un resumen o None."""
+        if self._tests_budget_wait() > 0:
+            return None  # tope por minuto: ni siquiera se toma (otra instalación puede hacerlo)
+        resp = api.claim_connection_test()
+        self.mark_api_ok()
+        test = resp.get("test")
+        if not test:
+            return None
+        tid = str(test.get("id"))
+        log.info("Prueba de conexión %s (%s): en curso.", tid[:8], test.get("target_kind"))
+        # Separación mínima entre pruebas a la MISMA conexión (evita bloquear la cuenta en la base del
+        # cliente por intentos repetidos); la espera cabe en el plazo del servidor.
+        target = connection_key(test)
+        last = self._test_last_by_target.get(target)
+        spacing = float(self.settings.connection_test_min_spacing_seconds)
+        if last is not None and time.monotonic() - last < spacing:
+            if self.stop_event.wait(spacing - (time.monotonic() - last)):
+                return None
+        self._test_times.append(time.monotonic())
+        self._test_last_by_target[target] = time.monotonic()
+        result = run_connection_test(test, self.settings)
+        try:
+            api.report_connection_test(tid, result)
+        except ApiError as exc:
+            log.warning("Prueba de conexión %s: no se pudo reportar el resultado (%s).", tid[:8], exc.code)
+        log.info("Prueba de conexión %s: %s%s.", tid[:8], result.get("status"),
+                 f" (código {result['error_code']})" if result.get("error_code") else "")
+        self.last_connection_test = {"id": tid, "status": result.get("status"),
+                                     "error_code": result.get("error_code")}
+        return self.last_connection_test
+
+    def _connection_test_loop(self) -> None:
+        api = self.api_factory(self.settings, self.holder)  # sesión HTTP propia
+        failures = 0
+        try:
+            while not self.stop_event.is_set():
+                delay = float(self.settings.connection_test_poll_seconds)
+                try:
+                    # Varias pendientes seguidas se toman sin esperar.
+                    while not self.stop_event.is_set() and self.run_one_connection_test(api):
+                        pass
+                    budget = self._tests_budget_wait()
+                    if budget:
+                        delay = max(delay, budget)
+                    failures = 0
+                except ApiAuthError as exc:
+                    self._handle_auth_error(exc)
+                    failures += 1
+                except ApiError as exc:
+                    failures += 1
+                    if exc.status == 404:
+                        # Nexus anterior sin la ruta: se consulta muy de vez en cuando.
+                        delay = 600.0
+                    log.debug("Prueba de conexión: consulta no disponible (%s).", exc.code)
+                except Exception as exc:  # noqa: BLE001 — el hilo nunca muere
+                    failures += 1
+                    code, msg = sanitize_error(exc)
+                    log.warning("Prueba de conexión: error inesperado [%s] %s", code, msg)
+                if failures:
+                    delay = max(delay, min(300.0, delay * (2 ** min(failures, 5))))
+                self._tests_wakeup.wait(delay)
+                self._tests_wakeup.clear()
+        finally:
+            api.close()
+
     def start_threads(self) -> None:
         self._sender_stop_deadline = float("inf")
         threads = [("heartbeat", self._heartbeat_loop), ("sender", self._sender_loop),
                    ("worker", self._worker_loop)]
         if self.settings.inventory_enabled:
             threads.append(("inventory", self._inventory_loop))
+        if self.settings.connection_test_enabled:
+            threads.append(("connection-tests", self._connection_test_loop))
         for name, target in threads:
             th = threading.Thread(target=target, name=name, daemon=True)
             th.start()
@@ -811,7 +909,7 @@ class Agent:
                         due = self.due_tasks(cfg)
                         if due:
                             self._busy.set()
-                            self._work_q.put((due[0], cfg.get("warehouse") or {}))
+                            self._work_q.put((due[0], task_warehouse(due[0], cfg)))
                     self._periodic_housekeeping()
                 except Exception as exc:  # el scheduler nunca muere por errores transitorios
                     code, msg = sanitize_error(exc)
@@ -830,7 +928,7 @@ class Agent:
         for task in self.due_tasks(cfg):
             if self.stop_event.is_set():
                 break
-            self.execute_task(task, cfg.get("warehouse") or {})
+            self.execute_task(task, task_warehouse(task, cfg))
         self.flush(timeout=60)
         return self.fatal.exit_code if self.fatal else EXIT_OK
 
@@ -839,6 +937,7 @@ class Agent:
 
     def shutdown(self) -> None:
         self.stop_event.set()
+        self._tests_wakeup.set()
         grace = self.settings.shutdown_grace_seconds
         if self._busy.is_set():
             log.warning("Apagando: se espera hasta %ss a que termine la tarea en curso.", grace)

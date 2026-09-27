@@ -703,3 +703,126 @@ def test_sanitize_conserva_codigo_mysql_y_oculta_correos():
     code, msg = sanitize_error(StageError("load", exc))
     assert code == "DWH_CONSTRAINT_VIOLATION" and "juan@x.com" not in msg and "1062" in msg
     assert "4111111111111111" not in redact_text("tarjeta 4111111111111111 en fila")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Destino configurable (sección 22)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_destino_efectivo_esquema_y_tabla():
+    from nexus_agent.destination import effective_load_table, task_warehouse
+
+    assert effective_load_table("Clientes", {"schema": "ventas"}) == "ventas.clientes"
+    assert effective_load_table("dwh.carter", {"schema": "ventas"}) == "dwh.carter"
+    assert effective_load_table("clientes", {"schema": "public"}) == "clientes"
+    assert effective_load_table("clientes", {}) == "clientes"   # Nexus anterior: sin esquema
+    cfg = {"warehouse": {"host": "g"}, "tasks": []}
+    assert task_warehouse({"warehouse": {"host": "propio"}}, cfg) == {"host": "propio"}
+    assert task_warehouse({}, cfg) == {"host": "g"}
+
+
+def test_opciones_ssl_y_certificado(tmp_path):
+    import psycopg2
+
+    from nexus_agent.destination import pg_ssl_kwargs, prune_ca_files
+
+    s = Settings(data_dir=str(tmp_path))
+    assert pg_ssl_kwargs({}, s) == {}                       # compat: comportamiento previo de libpq
+    assert pg_ssl_kwargs({"sslmode": "disable"}, s) == {"sslmode": "disable"}
+    assert pg_ssl_kwargs({"sslmode": "loquesea"}, s) == {"sslmode": "require"}   # nunca se degrada
+    pem = "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----"
+    kw = pg_ssl_kwargs({"sslmode": "verify-full", "sslrootcert": pem}, s)
+    assert kw["sslmode"] == "verify-full" and os.path.isfile(kw["sslrootcert"])
+    assert open(kw["sslrootcert"]).read().startswith("-----BEGIN CERTIFICATE-----")
+    assert oct(os.stat(kw["sslrootcert"]).st_mode)[-3:] == "600"
+    assert pg_ssl_kwargs({"sslmode": "verify-full", "sslrootcert": pem}, s) == kw   # mismo archivo
+    if psycopg2.__libpq_version__ >= 160000:
+        assert pg_ssl_kwargs({"sslmode": "verify-full"}, s)["sslrootcert"] == "system"
+    assert "sslrootcert" not in pg_ssl_kwargs({"sslmode": "verify-ca"}, s)
+    # Limpieza: se conserva el que usa la config vigente.
+    assert prune_ca_files(s, {"warehouse": {"sslrootcert": pem}, "tasks": []}) == 0
+    assert prune_ca_files(s, {"warehouse": {}, "tasks": []}) == 1
+    assert not os.path.exists(kw["sslrootcert"])
+
+
+def test_error_ssl_clasificado():
+    import psycopg2
+
+    exc = psycopg2.OperationalError('connection to server at "10.0.0.5", port 5432 failed: server does not '
+                                    'support SSL, but SSL was required')
+    code, msg = sanitize_error(StageError("load", exc))
+    assert code == "DWH_SSL_ERROR" and "10.0.0.5" not in msg
+    code, _ = sanitize_error(StageError("load", psycopg2.OperationalError("could not connect: timeout expired")))
+    assert code == "DWH_CONNECT_TIMEOUT"
+
+
+def test_inventario_elige_el_dwh_por_identidad():
+    from nexus_agent.inventory import capabilities, dwh_identity_of, target_connection
+
+    g = {"host": "dwh-g", "port": 5432, "database": "a", "username": "u", "password": "p", "sslmode": "disable"}
+    own = {"host": "dwh-p", "port": 6543, "database": "b", "username": "u2", "password": "p2", "sslmode": "require"}
+    cfg = {"warehouse": g, "tasks": [{"task_id": 1, "company_id": 7, "warehouse": own, "source": {}}]}
+    caps = capabilities(cfg)
+    assert sorted(caps["dwh_identities"]) == sorted([dwh_identity_of(g), dwh_identity_of(own)])
+    t = target_connection({"kind": "dwh", "identity_key": dwh_identity_of(own)}, cfg)
+    assert (t["host"], t["port"], t["sslmode"]) == ("dwh-p", 6543, "require")
+    assert target_connection({"kind": "dwh", "identity_key": "f" * 64}, cfg) is None   # nunca otra conexión
+
+
+def test_heartbeat_anuncia_capacidades(tmp_path):
+    s = Settings(data_dir=str(tmp_path), api_url="http://127.0.0.1:1", mode="development",
+                 allow_insecure_http=True)
+    a = Agent(s)
+    assert a.heartbeat_payload()["features"] == ["destination-v2", "connection-test"]
+    s.connection_test_enabled = False
+    assert a.heartbeat_payload()["features"] == ["destination-v2"]
+    assert a.api.session.headers["x-nexus-agent-features"] == "destination-v2,connection-test"
+
+
+def test_pruebas_de_conexion_espaciadas_y_con_tope(tmp_path, monkeypatch):
+    from nexus_agent import agent as am
+
+    s = Settings(data_dir=str(tmp_path), api_url="http://127.0.0.1:1", mode="development",
+                 allow_insecure_http=True, connection_test_min_spacing_seconds=1, connection_test_max_per_minute=3)
+    a = Agent(s)
+    ran = []
+    monkeypatch.setattr(am, "run_connection_test", lambda test, settings: ran.append(time.monotonic()) or
+                        {"status": "ok", "checks": []})
+
+    class FakeApi:
+        def claim_connection_test(self):
+            return {"test": {"id": "t", "target_kind": "group_dwh", "kind": "dwh",
+                             "connection": {"host": "h", "port": 5432, "database": "d", "username": "u"}}}
+
+        def report_connection_test(self, tid, payload):
+            return {}
+
+    api = FakeApi()
+    for _ in range(3):
+        assert a.run_one_connection_test(api)
+    # Misma conexión: separadas al menos 1 s.
+    assert ran[1] - ran[0] >= 0.95 and ran[2] - ran[1] >= 0.95
+    # Tope por minuto alcanzado: no se toma otra.
+    assert a.run_one_connection_test(api) is None and a._tests_budget_wait() > 0
+
+
+def test_ca_escritura_atomica_y_en_uso_no_se_borra(tmp_path):
+    import threading as th
+
+    from nexus_agent import destination as dm
+
+    s = Settings(data_dir=str(tmp_path))
+    pem = "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----"
+    paths = []
+    ts = [th.Thread(target=lambda: paths.append(dm.ca_file(s, pem))) for _ in range(20)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(set(paths)) == 1 and os.path.isfile(paths[0])
+    assert not [f for f in os.listdir(os.path.dirname(paths[0])) if f.endswith(".tmp")]
+    with dm._IN_USE_LOCK:
+        dm._IN_USE[dm._ca_name(pem)] = 1
+    try:
+        assert dm.prune_ca_files(s, {"warehouse": {}, "tasks": []}) == 0 and os.path.isfile(paths[0])
+    finally:
+        with dm._IN_USE_LOCK:
+            dm._IN_USE.pop(dm._ca_name(pem), None)
+    assert dm.prune_ca_files(s, {"warehouse": {}, "tasks": []}) == 1

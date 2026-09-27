@@ -246,6 +246,10 @@ NameStr = Annotated[str, StringConstraints(min_length=1, max_length=128)]
 class LeaseCapabilities(_In):
     dwh: bool = False
     source_company_ids: List[int] = Field(default_factory=list, max_length=500)
+    # Agentes >= 5.3: identidades (sha256) de TODOS los DWH para los que tienen credenciales
+    # (grupo y destinos propios de empresas). None = agente anterior (solo su DWH principal).
+    dwh_identities: Optional[List[Annotated[str, StringConstraints(min_length=64, max_length=64)]]] = \
+        Field(None, max_length=500)
 
 
 class LeaseBody(_In):
@@ -509,18 +513,48 @@ class InventoryEngine:
                                    self.decrypt(group_row.get("warehouse_database") or ""))
 
     def candidates_for(self, cur: Any, ctx: Any) -> List[Dict[str, Any]]:
-        """Bases (DWH del grupo y orígenes HABILITADOS explícitamente) al alcance de la instalación."""
+        """
+        Bases al alcance de la instalación: DWH del grupo (si alguna empresa del alcance lo usa o el
+        alcance es de grupo), destinos PROPIOS de empresas (``warehouse_mode = 'custom'``; misma
+        identidad estable = mismo registro, sin duplicados) y orígenes HABILITADOS explícitamente.
+        Cada candidato DWH lleva ``primary`` = es el destino principal de la instalación (el único
+        que conoce un agente < 5.3).
+        """
         out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        companies = self._company_ids_in_scope(cur, ctx)
         cur.execute("""SELECT id, name, warehouse_host, warehouse_port, warehouse_database
                        FROM client_group WHERE id = %s""", (ctx.group_id,))
         g = cur.fetchone()
-        if g:
+        custom: List[Dict[str, Any]] = []
+        if companies:
+            cur.execute("""SELECT id, name, group_id, warehouse_mode, warehouse_host, warehouse_port,
+                                  warehouse_database
+                           FROM company WHERE id = ANY(%s) ORDER BY id""", (companies,))
+            rows = cur.fetchall()
+            custom = [r for r in rows if r["warehouse_mode"] == "custom"]
+            uses_group = ctx.scope_type == "group" or any(r["warehouse_mode"] != "custom" for r in rows)
+        else:
+            uses_group = ctx.scope_type == "group"
+        primary_company = next((r for r in custom if ctx.company_id and r["id"] == ctx.company_id), None)
+        if g and uses_group:
             key = self.dwh_identity(g)
             if key:
                 dbname = self.decrypt(g.get("warehouse_database") or "")
+                seen.add(key)
                 out.append({"kind": "dwh", "engine": "postgresql", "identity_key": key, "group_id": g["id"],
-                            "company_id": None, "display_name": f"DWH {dbname} · {key[:6]}"[:255]})
-        companies = self._company_ids_in_scope(cur, ctx)
+                            "company_id": None, "display_name": f"DWH {dbname} · {key[:6]}"[:255],
+                            "primary": primary_company is None})
+        for c in custom:
+            key = self.dwh_identity(c)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            dbname = self.decrypt(c.get("warehouse_database") or "")
+            out.append({"kind": "dwh", "engine": "postgresql", "identity_key": key, "group_id": c["group_id"],
+                        "company_id": None, "destination_company_id": c["id"],
+                        "display_name": f"DWH {dbname} · {key[:6]}"[:255],
+                        "primary": primary_company is not None and c["id"] == primary_company["id"]})
         if companies:
             cur.execute(
                 """SELECT c.id, c.name, c.group_id, c.source_type, c.source_host, c.source_port,
@@ -544,8 +578,14 @@ class InventoryEngine:
         cands = self.candidates_for(cur, ctx)
         targets: List[Dict[str, Any]] = []
         kept: List[int] = []
+        known_dwh = set(caps.dwh_identities) if caps.dwh_identities is not None else None
         for c in cands:
-            if c["kind"] == "dwh" and not caps.dwh:
+            if c["kind"] == "dwh" and not caps.dwh and not known_dwh:
+                continue
+            if c["kind"] == "dwh" and known_dwh is not None and c["identity_key"] not in known_dwh:
+                continue
+            if c["kind"] == "dwh" and known_dwh is None and not c.get("primary"):
+                # Agente anterior: solo conoce su DWH principal (cfg["warehouse"]).
                 continue
             if c["kind"] == "source" and c["company_id"] not in set(caps.source_company_ids):
                 continue
@@ -564,8 +604,11 @@ class InventoryEngine:
                 )
                 new = cur.fetchone()
                 if new:
-                    self._mdb_event(cur, new["id"], "created", message="Alta automática del DWH del grupo",
-                                    data={"group_id": c["group_id"]})
+                    own = c.get("destination_company_id")
+                    self._mdb_event(cur, new["id"], "created",
+                                    message=("Alta automática del destino propio de una empresa" if own
+                                             else "Alta automática del DWH del grupo"),
+                                    data={"group_id": c["group_id"], "destination_company_id": own})
                 cur.execute("SELECT * FROM monitored_database WHERE identity_key = %s FOR UPDATE", (c["identity_key"],))
                 m = cur.fetchone()
             cur.execute(
@@ -712,11 +755,15 @@ class InventoryEngine:
         return cur.fetchone() is not None
 
     def identity_is_current(self, cur: Any, mdb: Dict[str, Any]) -> bool:
-        """¿Alguna configuración vigente (grupo / empresa) apunta todavía a esta identidad?"""
+        """¿Alguna configuración vigente (grupo / destino propio de empresa / origen) apunta a esta identidad?"""
         key = (mdb["identity_key"] or "").strip()
         if mdb["kind"] == "dwh":
             cur.execute("SELECT warehouse_host, warehouse_port, warehouse_database FROM client_group")
-            return any(self.dwh_identity(g) == key for g in cur.fetchall())
+            if any(self.dwh_identity(g) == key for g in cur.fetchall()):
+                return True
+            cur.execute("""SELECT warehouse_host, warehouse_port, warehouse_database FROM company
+                           WHERE warehouse_mode = 'custom'""")
+            return any(self.dwh_identity(c) == key for c in cur.fetchall())
         if not mdb.get("company_id"):
             return False
         cur.execute("SELECT * FROM company WHERE id = %s", (mdb["company_id"],))
@@ -1707,7 +1754,13 @@ def create_inventory_admin_router(*, engine: InventoryEngine, auth: Any) -> APIR
                 cur.execute("SELECT warehouse_host, warehouse_port, warehouse_database FROM client_group WHERE id = %s",
                             (raw["group_id"],))
                 g = cur.fetchone()
-                current = bool(g) and engine.dwh_identity(g) == get_mdb_or_404(cur, mdb_id)["identity_key"].strip()
+                key_now = get_mdb_or_404(cur, mdb_id)["identity_key"].strip()
+                current = bool(g) and engine.dwh_identity(g) == key_now
+                if not current:
+                    # Destino propio de alguna empresa del grupo (sección 22).
+                    cur.execute("""SELECT warehouse_host, warehouse_port, warehouse_database FROM company
+                                   WHERE group_id = %s AND warehouse_mode = 'custom'""", (raw["group_id"],))
+                    current = any(engine.dwh_identity(c) == key_now for c in cur.fetchall())
             elif raw["kind"] == "source" and raw["company_id"]:
                 cur.execute("SELECT * FROM company WHERE id = %s", (raw["company_id"],))
                 c = cur.fetchone()
