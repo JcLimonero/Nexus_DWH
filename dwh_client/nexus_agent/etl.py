@@ -285,10 +285,17 @@ def pg_table_exists(cursor: Any, table: str) -> bool:
     return cursor.fetchone() is not None
 
 
+def pg_constraint_signature(cursor: Any, table: str) -> List[Tuple[str, str]]:
+    """Restricciones actuales de la tabla (nombre, definición): para saber si un DDL cambió algo."""
+    cursor.execute("SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+                   "WHERE conrelid = to_regclass(%s) ORDER BY 1", (quote_table(table),))
+    return [(str(r[0]), str(r[1])) for r in cursor.fetchall()]
+
+
 def ensure_columns_exist(
     cursor: Any, table: str,
     columns: Sequence[str], col_types: Dict[str, str],
-) -> None:
+) -> List[str]:
     """
     Verifica que la tabla PostgreSQL tenga todas las columnas necesarias.
     Si faltan, las agrega con ALTER TABLE ADD COLUMN.
@@ -302,6 +309,7 @@ def ensure_columns_exist(
     existing = {row[0] for row in cursor.fetchall()}
     existing_lower = {n.lower() for n in existing}
     added = 0
+    added_names: List[str] = []
     for col in columns:
         if col in existing or col.lower() in existing_lower:
             continue
@@ -311,9 +319,11 @@ def ensure_columns_exist(
             f"ADD COLUMN {quote_ident(col)} {sql_type}"
         )
         added += 1
+        added_names.append(col)
         log.info("  Auto-columna añadida: %s.%s (%s)", table, col, sql_type)
     if added:
         log.info("  %d columna(s) añadida(s) a '%s'.", added, table)
+    return added_names
 
 
 def build_upsert_sql_values_template(
@@ -489,6 +499,8 @@ class TaskResult:
     watermark: Optional[datetime] = None      # naive, dominio del reloj indicado en watermark_kind
     watermark_kind: str = ""
     warnings: List[str] = field(default_factory=list)
+    # DDL aplicado por el agente (sin SQL): evidencia para el inventario estructural.
+    ddl_applied: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class RunContext:
@@ -501,6 +513,8 @@ class RunContext:
         self._lock = threading.Lock()
         self.on_chunk: Optional[Callable[[str, int], None]] = None  # (etapa, filas) para pruebas/progreso
         self.before_commit: Optional[Callable[[], None]] = None     # marca local "committing"
+        # DDL aplicado (evidencia para el inventario); se conserva aunque la ejecución falle después.
+        self.ddl_applied: List[Dict[str, Any]] = []
 
     def check_cancel(self) -> None:
         if self.cancel_event.is_set():
@@ -814,6 +828,7 @@ def run_task(task: Dict[str, Any], warehouse: Dict[str, Any], previous_watermark
     No registra SQL ni datos. Devuelve TaskResult con el watermark a confirmar.
     """
     res = TaskResult()
+    res.ddl_applied = ctx.ddl_applied
     task_id = task["task_id"]
     try:
         ctx.stage = "config"
@@ -894,13 +909,23 @@ def run_task(task: Dict[str, Any], warehouse: Dict[str, Any], previous_watermark
             dconn = connect_dwh(warehouse, settings, ctx)
             try:
                 cur = dconn.cursor()
+                schema_, tbl_ = split_schema_table(load_table)
+                ddl_object = f"{schema_}.{tbl_}".lower()
+                existed_before = pg_table_exists(cur, load_table)
                 if task.get("create_table_sql"):
                     cur.execute(task["create_table_sql"])
                     dconn.commit()
+                    if not existed_before and pg_table_exists(cur, load_table):
+                        res.ddl_applied.append({"object": ddl_object, "action": "create_table", "columns": []})
+                        existed_before = True
                 if task.get("create_constraint_sql"):
                     try:
+                        before = pg_constraint_signature(cur, load_table)
                         cur.execute(task["create_constraint_sql"])
                         dconn.commit()
+                        # Solo es evidencia si el DDL cambió algo (el catálogo lo re-ejecuta en cada corrida).
+                        if pg_constraint_signature(cur, load_table) != before:
+                            res.ddl_applied.append({"object": ddl_object, "action": "constraint_ddl", "columns": []})
                     except psycopg2.Error as exc:
                         dconn.rollback()
                         log.warning("  Tarea %s: el constraint del catálogo no se aplicó (%s).", task_id,
@@ -911,8 +936,12 @@ def run_task(task: Dict[str, Any], warehouse: Dict[str, Any], previous_watermark
                     if not pg_table_exists(cur, load_table):
                         create_table_if_missing(cur, load_table, columns, col_types, upsert_keys)
                         log.info("  Tarea %s: tabla destino creada (no existía; revise el DDL del catálogo).", task_id)
-                    ensure_columns_exist(cur, load_table, columns, col_types)
+                        res.ddl_applied.append({"object": ddl_object, "action": "create_table", "columns": []})
+                    added_cols = ensure_columns_exist(cur, load_table, columns, col_types)
                     dconn.commit()
+                    if added_cols:
+                        res.ddl_applied.append({"object": ddl_object, "action": "add_column",
+                                                "columns": [str(c)[:200] for c in added_cols][:200]})
 
                 # ── Carga: UNA transacción para toda la ejecución ───────────
                 load_sql, mode = build_load_sql(load_table, columns, upsert_keys)

@@ -14,6 +14,7 @@ import {
   MonitorSmartphone,
   Building2,
   Database,
+  GitCompareArrows,
   LayoutDashboard,
   ListChecks,
   LogOut,
@@ -24,6 +25,7 @@ import {
 } from "lucide-react";
 import { cx } from "@/lib/format";
 import { useIncidentBadge } from "@/components/health";
+import { useStructureBadge } from "@/components/structure";
 
 const NAV = [
   { section: "General", items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }] },
@@ -42,6 +44,7 @@ const NAV = [
     items: [
       { href: "/salud", label: "Salud", icon: HeartPulse },
       { href: "/incidencias", label: "Incidencias", icon: Siren },
+      { href: "/estructura", label: "Estructura", icon: GitCompareArrows },
       { href: "/notificaciones", label: "Notificaciones", icon: BellRing },
       { href: "/instalaciones", label: "Instalaciones", icon: MonitorSmartphone },
       { href: "/ejecuciones", label: "Ejecuciones", icon: History },
@@ -54,6 +57,7 @@ const NAV = [
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
   const badge = useIncidentBadge();
+  const structure = useStructureBadge();
   return (
     <nav className="flex-1 space-y-6 overflow-y-auto px-3 py-4">
       {NAV.map((group) => (
@@ -74,6 +78,18 @@ function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
                   >
                     <Icon className={cx("h-4 w-4", active ? "text-brand-600" : "text-slate-400")} />
                     {label}
+                    {href === "/estructura" && structure && structure.pending_changes + structure.unverifiable_databases > 0 && (
+                      <span
+                        className={cx(
+                          "ml-auto inline-flex min-w-[1.25rem] items-center justify-center rounded-full px-1.5 text-[11px] font-semibold",
+                          structure.unverifiable_databases > 0 ? "bg-red-600 text-white" : "bg-amber-100 text-amber-800",
+                        )}
+                        title={`${structure.pending_changes} cambio(s) estructural(es) pendiente(s)${structure.unverifiable_databases ? ` · ${structure.unverifiable_databases} base(s) sin verificar` : ""}`}
+                        aria-label={`${structure.pending_changes} cambios estructurales pendientes`}
+                      >
+                        {structure.pending_changes || "!"}
+                      </span>
+                    )}
                     {href === "/incidencias" && badge && badge.open_unacknowledged > 0 && (
                       <span
                         className={cx(

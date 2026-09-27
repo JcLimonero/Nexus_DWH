@@ -33,11 +33,14 @@ Endpoints administración (requieren header x-admin-token; ver admin_postgres.py
 import argparse
 import configparser
 import hmac
+import json
 import logging
 import os
 import sys
 import time
 import traceback
+import uuid
+import zlib
 from datetime import timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -116,6 +119,12 @@ AGENT_FUTURE_TOLERANCE_HOURS = _ini.getint("agent", "future_tolerance_hours", fa
 MAX_BODY_BYTES = _ini.getint("server", "max_body_bytes", fallback=1_048_576)
 AGENT_MAX_BODY_BYTES = _ini.getint("server", "agent_max_body_bytes", fallback=262_144)
 ENROLL_MAX_BODY_BYTES = _ini.getint("server", "enroll_max_body_bytes", fallback=16_384)
+# Inventario estructural: el snapshot (solo metadatos) puede ser grande.
+INVENTORY_MAX_BODY_BYTES = _ini.getint("server", "inventory_max_body_bytes", fallback=8_388_608)
+# Tamaño máximo DESCOMPRIMIDO de un snapshot enviado con Content-Encoding: gzip (anti zip-bomb).
+INVENTORY_MAX_DECOMPRESSED_BYTES = _ini.getint("server", "inventory_max_decompressed_bytes", fallback=16_777_216)
+# Snapshots procesados a la vez (el resto recibe 429 y el agente reintenta con backoff).
+INVENTORY_MAX_CONCURRENT = max(1, _ini.getint("server", "inventory_max_concurrent", fallback=2))
 # Orígenes permitidos para CORS (separados por coma). Vacío = sin CORS
 # (el panel dwh_front usa un proxy del lado servidor y no lo necesita).
 CORS_ORIGINS = [
@@ -1473,6 +1482,24 @@ app.include_router(
 )
 app.include_router(create_health_router(engine=HEALTH_ENGINE, admin_token=ADMIN_TOKEN))
 
+# Inventario estructural y cambios de estructura (sección 19 de DWH_README.md)
+from inventory_postgres import (  # noqa: E402
+    InventoryEngine, InventorySettings, create_inventory_admin_router,
+)
+
+INVENTORY_ENGINE = InventoryEngine(
+    get_connection=get_connection,
+    settings=InventorySettings.from_ini(_ini),
+    get_secret_cipher=get_secret_cipher,
+    decrypt_config_secret=decrypt_config_secret,
+    future_tolerance_hours=AGENT_FUTURE_TOLERANCE_HOURS,
+)
+# Tope de contenedores JSON ({ y [) de un snapshot antes de parsearlo (anti "JSON bomba").
+INVENTORY_MAX_JSON_CONTAINERS = _ini.getint(
+    "server", "inventory_max_json_containers",
+    fallback=max(10_000, 30 * INVENTORY_ENGINE.s.max_objects_per_snapshot))
+app.include_router(create_inventory_admin_router(engine=INVENTORY_ENGINE, admin_token=ADMIN_TOKEN))
+
 _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers(
     get_connection=get_connection,
     decrypt_config_secret=decrypt_config_secret,
@@ -1484,6 +1511,7 @@ _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers
     download_log_retention_days=AGENT_DOWNLOAD_LOG_RETENTION_DAYS,
     future_tolerance_hours=AGENT_FUTURE_TOLERANCE_HOURS,
     health=HEALTH_ENGINE,
+    inventory=INVENTORY_ENGINE,
 )
 app.include_router(_agent_router)
 app.include_router(_agent_admin_router)
@@ -1524,45 +1552,198 @@ def check_migrations() -> None:
         server_log.error("No se pudo verificar migraciones: %s", type(exc).__name__)
 
 
+def _preauth_installation(headers: Dict[bytes, bytes]) -> Optional[str]:
+    """
+    Verificación LIGERA de la credencial de instalación ANTES de leer el cuerpo
+    (el dependency de FastAPI corre después de parsear el JSON). Devuelve None si es
+    válida o un código de error. La autenticación completa se repite en el endpoint.
+    """
+    from agent_postgres import hash_secret, utcnow
+
+    inst_id = headers.get(b"x-installation-id", b"").decode("latin-1").strip()
+    secret = headers.get(b"x-installation-secret", b"").decode("latin-1").strip()
+    auth = headers.get(b"authorization", b"").decode("latin-1")
+    if (not inst_id or not secret) and auth.lower().startswith("bearer ") and "." in auth[7:]:
+        inst_id, secret = auth[7:].strip().split(".", 1)
+    if not inst_id or not secret:
+        return "missing_credentials"
+    try:
+        iid = str(uuid.UUID(inst_id))
+    except ValueError:
+        return "invalid_credentials"
+    try:
+        conn = get_connection()
+    except psycopg2.OperationalError:
+        return "config_db_unavailable"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT status, credential_hash, previous_credential_hash, previous_valid_until
+                           FROM installation WHERE id = %s""", (iid,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    provided = hash_secret(secret)
+    current = (row[1] if row else None) or "0" * 64
+    ok = hmac.compare_digest(provided, current)
+    if row and not ok and row[2] and row[3] and row[3] > utcnow():
+        ok = hmac.compare_digest(provided, row[2])
+    if not row or not ok:
+        return "invalid_credentials"
+    if row[0] != "active":
+        return "installation_revoked"
+    return None
+
+
+def _prepare_snapshot_body(data: bytes, gzipped: bool) -> Tuple[Optional[bytes], int, str]:
+    """(cuerpo, status, código). Descompresión acotada y tope de contenedores JSON (en el threadpool)."""
+    raw = data
+    if gzipped:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            raw = d.decompress(data, INVENTORY_MAX_DECOMPRESSED_BYTES + 1)
+        except zlib.error:
+            return None, 400, "invalid_gzip"
+        if len(raw) > INVENTORY_MAX_DECOMPRESSED_BYTES or d.unconsumed_tail:
+            return None, 413, "body_too_large"
+        if d.unused_data or not d.eof:
+            # Miembros gzip concatenados o flujo truncado: no se aceptan.
+            return None, 400, "invalid_gzip"
+    # Tope de estructura ANTES de json.loads: un JSON "bomba" ({} repetidos) dentro del
+    # límite de bytes podría ocupar cientos de MB al parsearse.
+    if raw.count(b"{") + raw.count(b"[") > INVENTORY_MAX_JSON_CONTAINERS:
+        return None, 413, "too_many_json_containers"
+    return raw, 200, ""
+
+
 class BodySizeLimitMiddleware:
     """
     Límite de tamaño del cuerpo (ASGI puro, externo al resto): 413 si el
     Content-Length lo supera o si el cuerpo recibido en streaming lo supera.
     /agent/enroll (sin autenticar) tiene el límite más bajo.
+
+    /agent/inventory/snapshots (cuerpo grande, opcionalmente gzip): se autentica la
+    instalación ANTES de leer el cuerpo, se limita la concurrencia (429), se descomprime
+    con límite en el threadpool (no en el event loop) y se acota el número de
+    contenedores JSON antes de parsear. En el resto de /agent/* (salvo enroll), un
+    cuerpo de más de 16 KB (o chunked) también exige credencial válida antes de leerse.
     """
+
+    PREAUTH_THRESHOLD = 16_384
 
     def __init__(self, app: Any) -> None:
         self.app = app
+        self._inventory_inflight = 0
 
     @staticmethod
     def _limit(path: str) -> int:
         if path == "/agent/enroll":
             return ENROLL_MAX_BODY_BYTES
+        if path == "/agent/inventory/snapshots":
+            return INVENTORY_MAX_BODY_BYTES
         if path.startswith("/agent/"):
             return AGENT_MAX_BODY_BYTES
         return MAX_BODY_BYTES
 
     @staticmethod
-    async def _reject(send: Any) -> None:
-        body = b'{"detail":{"code":"body_too_large","message":"Cuerpo de la peticion demasiado grande."}}'
-        await send({"type": "http.response.start", "status": 413,
+    async def _error(send: Any, status: int, code: str, message: str) -> None:
+        body = json.dumps({"detail": {"code": code, "message": message}}).encode()
+        await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
         await send({"type": "http.response.body", "body": body})
+
+    async def _reject(self, send: Any) -> None:
+        await self._error(send, 413, "body_too_large", "Cuerpo de la peticion demasiado grande.")
+
+    async def _preauth(self, scope: Any, send: Any) -> bool:
+        headers = {k: v for k, v in scope.get("headers") or []}
+        err = await run_in_threadpool(_preauth_installation, headers)
+        if err is None:
+            return True
+        if err == "config_db_unavailable":
+            await self._error(send, 503, err, "BD de configuración no disponible.")
+        elif err == "installation_revoked":
+            await self._error(send, 401, err, "La instalación fue revocada. Debe re-enrolarse.")
+        else:
+            await self._error(send, 401, err, "Credenciales de instalación no válidas.")
+        return False
+
+    async def _inventory(self, scope: Any, receive: Any, send: Any, limit: int, encoding: bytes) -> None:
+        if not await self._preauth(scope, send):
+            return
+        if self._inventory_inflight >= INVENTORY_MAX_CONCURRENT:
+            await self._error(send, 429, "inventory_busy", "Nexus está procesando otros inventarios; reintente.")
+            return
+        self._inventory_inflight += 1
+        try:
+            chunks, total = [], 0
+            while True:
+                msg = await receive()
+                if msg.get("type") != "http.request":
+                    return
+                data = msg.get("body", b"")
+                total += len(data)
+                if total > limit:
+                    await self._reject(send)
+                    return
+                chunks.append(data)
+                if not msg.get("more_body"):
+                    break
+            raw, status, code = await run_in_threadpool(_prepare_snapshot_body, b"".join(chunks),
+                                                        encoding == b"gzip")
+            del chunks
+            if raw is None:
+                await self._error(send, status, code, "Cuerpo del inventario no aceptado.")
+                return
+            headers = [(k, v) for k, v in scope.get("headers") or []
+                       if k not in (b"content-encoding", b"content-length", b"transfer-encoding")]
+            headers.append((b"content-length", str(len(raw)).encode()))
+            sent = {"done": False}
+
+            async def new_receive() -> Any:
+                if not sent["done"]:
+                    sent["done"] = True
+                    return {"type": "http.request", "body": raw, "more_body": False}
+                return await receive()
+
+            await self.app(dict(scope, headers=headers), new_receive, send)
+        finally:
+            self._inventory_inflight -= 1
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        limit = self._limit(scope.get("path", ""))
+        path = scope.get("path", "")
+        limit = self._limit(path)
+        clen: Optional[int] = None
+        encoding = b""
+        chunked = False
         for k, v in scope.get("headers") or []:
             if k == b"content-length":
                 try:
-                    if int(v) > limit:
-                        await self._reject(send)
-                        return
+                    clen = int(v)
                 except ValueError:
                     await self._reject(send)
                     return
+                if clen > limit:
+                    await self._reject(send)
+                    return
+            elif k == b"content-encoding":
+                encoding = v.strip().lower()
+            elif k == b"transfer-encoding" and b"chunked" in v.lower():
+                chunked = True
+        if encoding and encoding != b"identity":
+            if path != "/agent/inventory/snapshots" or encoding != b"gzip":
+                await self._error(send, 415, "unsupported_encoding", "Content-Encoding no admitido.")
+                return
+        if path == "/agent/inventory/snapshots" and scope.get("method") == "POST":
+            await self._inventory(scope, receive, send, limit, encoding)
+            return
+        if path.startswith("/agent/") and path != "/agent/enroll" \
+                and scope.get("method") in ("POST", "PUT", "PATCH") \
+                and (chunked or (clen or 0) > self.PREAUTH_THRESHOLD):
+            if not await self._preauth(scope, send):
+                return
         state = {"received": 0, "exceeded": False, "started": False}
 
         async def limited_receive() -> Any:

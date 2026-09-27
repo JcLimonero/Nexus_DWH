@@ -4,7 +4,7 @@ import Link from "next/link";
 import { AlertTriangle, ArrowRight, Building2, CheckCircle2, ListChecks, RefreshCw, Store, Users, XCircle } from "lucide-react";
 import { useApi } from "@/lib/api";
 import { fmtDate, fmtDateTz, fmtNumber, cx, tzLabel } from "@/lib/format";
-import type { ClientEvent, HealthSummary, Incident, MonitorClient, Stats } from "@/lib/types";
+import type { ClientEvent, HealthSummary, Incident, InventorySummary, MonitorClient, Stats } from "@/lib/types";
 import { CATEGORY_LABEL, CONNECTIVITY, IncidentStatusBadges, SEVERITY, SeverityBadge, TASK_STATE, useAutoRefresh } from "@/components/health";
 import { Badge, Button, Card, PageHeader } from "@/components/ui/primitives";
 import { DataState, ErrorState, LoadingState } from "@/components/ui/states";
@@ -58,7 +58,9 @@ export default function DashboardPage() {
   const errors = useApi<{ items: ClientEvent[] }>("monitor/events?event_type=error&only_unacknowledged=true&limit=8");
   const health = useApi<HealthSummary>("admin/health/summary");
   const topIncidents = useApi<{ items: Incident[] }>("admin/incidents?view=open&limit=6");
+  const inventory = useApi<InventorySummary>("admin/inventory/summary");
   useAutoRefresh(health.reload);
+  useAutoRefresh(inventory.reload);
   useAutoRefresh(topIncidents.reload);
 
   const reloadAll = () => {
@@ -67,6 +69,7 @@ export default function DashboardPage() {
     void errors.reload();
     void health.reload();
     void topIncidents.reload();
+    void inventory.reload();
   };
   const h = health.data;
   const s = stats.data;
@@ -105,7 +108,7 @@ export default function DashboardPage() {
       )}
 
       {/* ── Salud (instalaciones, tareas, incidencias) ───────────────── */}
-      <div className="mb-6 grid gap-4 lg:grid-cols-3">
+      <div className="mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Card className="p-4">
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900">Instalaciones</h2>
@@ -177,6 +180,30 @@ export default function DashboardPage() {
             </>
           ) : (
             <p className="text-xs text-slate-400">{health.error ?? "Cargando…"}</p>
+          )}
+        </Card>
+        <Card className="p-4">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-900">Cambios estructurales</h2>
+            <Link href="/estructura" className="text-xs font-medium text-brand-600 hover:text-brand-700">
+              Estructura
+            </Link>
+          </div>
+          {inventory.data ? (
+            <>
+              <p className={cx("text-2xl font-semibold", inventory.data.pending_changes ? "text-amber-600" : "text-emerald-600")}>
+                {fmtNumber(inventory.data.pending_changes)}
+              </p>
+              <p className="text-xs text-slate-500">pendientes de dar por entendidos</p>
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                {inventory.data.unverifiable > 0 && <Badge tone="red">No se pudo verificar: {inventory.data.unverifiable}</Badge>}
+                {inventory.data.awaiting_baseline > 0 && <Badge tone="amber">Línea base por aprobar: {inventory.data.awaiting_baseline}</Badge>}
+                <Badge tone="slate">Bases monitoreadas: {inventory.data.databases}</Badge>
+              </div>
+              <p className="mt-2 text-[11px] text-slate-500">Independiente de las incidencias de carga.</p>
+            </>
+          ) : (
+            <p className="text-xs text-slate-400">{inventory.error ?? "Cargando…"}</p>
           )}
         </Card>
       </div>

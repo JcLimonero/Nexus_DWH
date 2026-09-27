@@ -190,6 +190,7 @@ Los **clientes ETL** reciben el valor **ya descifrado** por HTTPS. La seguridad 
 - `admin_postgres.py` — API de administración `/admin/*` (CRUD de la configuración; la monta `main_postgres.py`).
 - `agent_postgres.py` — API del agente por instalación `/agent/*`, `/admin/installations|executions|sync-state|legacy-clients` y `/monitor/installations` (sección 17).
 - `health_postgres.py` — salud, incidencias y notificaciones: evaluador periódico, ganchos de incidencias del API del agente, `/admin/health/*`, `/admin/incidents*`, `/admin/notification-*` (sección 18).
+- `inventory_postgres.py` — inventario estructural y cambios de estructura: `/agent/inventory/*`, `/admin/monitored-databases*`, `/admin/structural-changes*`, `/admin/inventory/summary` (sección 19).
 - `redact.py` — saneamiento de textos del backend (errores, detalle de eventos, logs).
 - `schema_postgres.sql` — esquema **base idempotente** de la BD de configuración PostgreSQL.
 - `migrate.py` + `migrations/NNN_*.sql` — migraciones ordenadas (sección 17.8).
@@ -263,6 +264,7 @@ Clientes ETL:
 Agente v5 (solo PostgreSQL; detalle en la sección 17):
 
 - `POST /agent/enroll`, `GET /agent/tasks`, `POST /agent/executions`, `PUT /agent/executions/{id}`, `POST /agent/heartbeat`, `POST /agent/events`, `POST /agent/credentials/rotate`, `GET /agent/whoami`.
+- Inventario estructural (sección 19): `POST /agent/inventory/lease`, `POST /agent/inventory/snapshots`.
 
 Monitor (todos requieren header `x-monitor-token`):
 
@@ -591,7 +593,8 @@ Panel de administración en **Next.js 14 (App Router) + TypeScript + Tailwind**,
 ### 16.1. Qué permite
 
 - **Dashboard**: conteos (grupos, empresas, agencias, tareas), **resumen de salud** (instalaciones por conectividad, tareas por estado, incidencias abiertas por severidad) y las incidencias abiertas más relevantes; estado por cliente ETL (`/monitor/clients`) y últimos errores sin reconocer (eventos legados).
-- **Salud**, **Incidencias** y **Notificaciones**: ver sección 18. El menú muestra un contador de incidencias abiertas **sin reconocer** (rojo si hay críticas/errores; se consulta cada 30 s).
+- **Salud**, **Incidencias** y **Notificaciones**: ver sección 18.
+- **Estructura**: inventario estructural, línea base, cambios pendientes y "Dar por entendido" (sección 19). El menú muestra su propio contador (cambios pendientes; rojo si hay bases que no se pudieron verificar), separado del de incidencias. El menú muestra un contador de incidencias abiertas **sin reconocer** (rojo si hay críticas/errores; se consulta cada 30 s).
 - **Grupos / Empresas / Agencias**: alta, edición, baja, habilitar/deshabilitar; tokens con mostrar/copiar/regenerar (y revocar en grupo/agencia); contraseñas de **solo escritura**.
 - **Catálogo de objetos**: tabla destino, `create_table_sql`, `upsert_keys`, constraint y `static_columns` (editores monoespaciados).
 - **Tareas**: por agencia, `extract_sql`, `schedule_seconds` (con atajos), activa, modo empresa (`run_on_company_token`), duración esperada y tolerancia de retraso (opcionales, sección 18), última ejecución y reinicio de `last_run_at`; filtros por grupo/empresa/agencia.
@@ -764,6 +767,8 @@ Hilo independiente con su propia sesión HTTP: cada `heartbeat_seconds` (defecto
   - `004_rotacion_y_limites`: `installation.pending_secret_enc` (re-entrega idempotente de la rotación).
   - `005_salud_incidencias`: `agency_task.expected_duration_seconds`/`delay_tolerance_seconds`, `task_health_state`, `incident` (+ índice único parcial: una abierta por clave), `incident_event`, `notification_channel`, `notification_outbox` (sección 18). Solo crea tablas/columnas nuevas: rápida y compatible con BD existentes.
   - `006_indices_salud`: índices de expresión/parciales de `task_execution` para el modelo de salud y la retención (sección 18.3.1).
+  - `007_inventario_estructural`: `monitored_database` (+ `_link`, `_event`), `inventory_snapshot`, `inventory_object_state`, `inventory_baseline` (+ `_version`), `structural_change` (+ `_event`) y `task_execution.ddl_applied` (sección 19). Solo crea tablas/columnas nuevas.
+  - `008_inventario_ajustes`: identidad débil del servidor (`engine_identity_weak`), `allow_engine_duplicate`, estado `out_of_scope` de las alertas y limpieza de `monitored_database_link` al borrar grupo (FK) o empresa (trigger).
 - **Ojo con `001` en BD grandes**: hace `UPDATE` masivos sobre `activity_log` y `client_events` (relleno de ids y recorte de tokens) en una sola transacción: puede tardar y generar mucho WAL/bloqueos si `activity_log` es grande. Recomendado: purgar/archivar `activity_log` antiguo antes, ejecutarla en ventana de mantenimiento y con respaldo.
 - Compatibles con BD existentes (probado sobre una copia de la BD de desarrollo y sobre una BD "legada" creada en las pruebas).
 
@@ -957,3 +962,144 @@ cd dwh_client && .venv/bin/python -m pytest tests -q          # incluye tests/te
 
 - `dwh_back/tests/test_health.py` (BD propia, evaluador manual, receptor webhook **local**): agrupación de recurrencias con una sola notificación y firma HMAC verificada; recuperación solo de su tarea; éxito con 0 filas; eventos fuera de orden (no reabren ni resuelven); desconexión detectada por Nexus y latido que no cierra errores de tareas; reconocer ≠ resolver (409 al cerrar a mano); retraso por periodicidad, tarea deshabilitada sin alerta y cierre `task_disabled`, gracia al rehabilitar; ejecución en curso y prolongada; `checkpoint_kind_mismatch` (resuelta por checkpoint y por reinicio del watermark); dead-letter con cierre manual con motivo; revocación; advisory lock; reintentos con backoff (500, 500, 200) y fallo definitivo; secretos de canal cifrados y de solo escritura; relleno de fallas previas a la migración; modelo de salud sin SQL; evaluador que aísla fallos por instalación y por fase (fallas inyectadas con triggers); latido viejo de una instalación muerta que no deja la tarea "en curso"; falla abierta en otra instalación que mantiene la tarea con error y sin doble alerta de retraso; anti-SSRF (IPs privadas/metadatos al guardar y al enviar); canal borrado a mitad del envío; retención del outbox desde el notificador y del historial de ejecuciones/eventos sin borrar lo protegido.
 - `dwh_client/tests/test_health_integration.py` (backend + origen + DWH reales, evaluador cada 1 s, desconexión a 10 s): DMS caído → incidencia `SOURCE_*` y recuperación que la resuelve (con notificaciones de apertura y resolución); DWH caído/recuperado; **Nexus caído** más que el umbral con la cola guardando falla + éxito → al volver se aplican en orden (abre y resuelve) y **no** se marca desconectado a un agente vivo; **agente muerto** (`SIGKILL`) → Nexus abre `disconnected`, reconocerla no la resuelve, al volver el agente se resuelve la desconexión pero la falla de la tarea sigue abierta; tarea larga (~15 s, > umbral) con latidos → en curso confirmada por latido, sin desconexión.
+
+---
+
+## 19. Inventario estructural y cambios de estructura (PostgreSQL)
+
+Módulos `dwh_back/inventory_postgres.py` (motor + API) y `dwh_client/nexus_agent/inventory.py` (inventario en el agente); página **Estructura** del panel. Requiere la migración `007_inventario_estructural` y agentes **v5.1.0+** (los v5.0 simplemente no inventarían).
+
+Alcance: comparación **estructural** (tablas, vistas, vistas materializadas, tablas foráneas; columnas, tipos, nulabilidad, valores por defecto, llaves, restricciones, índices, definición de vistas, particionamiento). **No** es auditoría de filas ni detecta quién cargó datos.
+
+### 19.1. Quién inventaría y con qué permisos
+
+- El inventario lo hace el **agente local** y lo reporta a Nexus: **sin conexiones entrantes** y Nexus nunca se conecta a la base. Usa las credenciales que el agente ya tiene en memoria (`GET /agent/tasks`); no se entregan credenciales nuevas.
+- Sesión de **solo lectura**: `default_transaction_read_only=on` + transacción `READ ONLY` `REPEATABLE READ`, `statement_timeout` (`[agent] inventory_statement_timeout_seconds`, 60 s) y `lock_timeout` de 5 s; solo consultas a `pg_catalog` (nunca DDL/DML, nunca filas). Hilo propio (`[agent] inventory_enabled`, `inventory_tick_seconds`), independiente del ETL y del latido.
+- **Privilegios mínimos recomendados** (rol dedicado, p. ej. `nexus_inventario`): `CONNECT` sobre la base y `USAGE` sobre cada esquema a vigilar. No necesita `SELECT` sobre las tablas (los catálogos de PostgreSQL son legibles), ni `pg_read_all_data`, ni superusuario. Para una identidad "fuerte" del servidor lee `pg_control_system()` (permitido a `PUBLIC` en PostgreSQL 16); si no puede, usa dirección+puerto del servidor (identidad "débil").
+- Hoy el DWH de cada grupo usa las credenciales del grupo (las mismas del ETL); si se desea separar, configure el DWH con un usuario de solo lectura para un grupo que solo inventaría, o espere a la fase de empaquetado para credenciales por propósito.
+- **No** se habilita auditoría del motor, triggers ni event triggers en la base del cliente.
+
+### 19.2. Identidad estable y responsable único
+
+- `monitored_database.identity_key = sha256(tipo | motor | host:puerto/base)` normalizados (host en minúsculas, puerto por defecto del motor; DSN para orígenes ODBC). El backend la calcula de la configuración y el agente la recalcula con la conexión que usó: si no coinciden → **409 `identity_mismatch`**.
+- Un DWH compartido por varias agencias (o por varios grupos con la misma dirección) es **una sola** base monitoreada; `monitored_database_link` registra qué grupos/empresas la referencian.
+- Identidad del **servidor** que reporta el agente, con dos componentes: **fuerte** = `sha256(system_identifier | oid | nombre de la base)` (si el rol puede leer `pg_control_system()`) y **débil** = `sha256(dirección:puerto del servidor | oid | nombre)` (siempre). Solo se compara un componente **comparable** (fuerte con fuerte; si alguno no tiene fuerte, débil con débil) y se completan los que falten: pasar de débil a fuerte (o perder el permiso y volver a débil) o que cambie la IP interna con el mismo clúster **no** es un cambio de servidor.
+- Misma base física con **otra configuración** (otro nombre de host, otro grupo). **Solo cuenta la identidad FUERTE**: la débil colisiona trivialmente entre clientes distintos (p. ej. `127.0.0.1:5432`, oid 16384, base `dwh`), así que una coincidencia solo débil **nunca** marca duplicado ni fusiona; solo deja un aviso no bloqueante `possible_duplicate` en el historial de la base.
+  - si la identidad fuerte coincide y la configuración original **sigue vigente**, o pertenece a **otro grupo** (u otra empresa, en orígenes) → la nueva queda **`duplicate_of_id`**: se inventaría y alerta una sola vez. **Nunca se mueven línea base ni alertas entre grupos**;
+  - si la identidad fuerte coincide, la original **ya no está vigente** y es del **mismo grupo** (p. ej. se cambió el `warehouse_host` del grupo a un alias de la misma base) → el registro original **adopta la nueva identidad** y conserva su línea base, alertas e historial (evento `identity_rebound`); el registro nuevo se fusiona y desaparece. El monitoreo nunca queda apagado.
+  - Acción de administrador **Resolver duplicado** (`POST /admin/monitored-databases/{id}/resolve-duplicate {action: merge|undo, reason}`): *fusionar* solo si ambas son del mismo grupo/empresa (si no, 409 `cross_group_merge`), con identidad fuerte coincidente (si no, 409 `weak_identity`) y la original ya no vigente (si no, 409 `original_still_current`); o *deshacer* una detección errónea (no se vuelve a marcar sola; evento `duplicate_undone`). Así, un DWH compartido por grupos distintos queda como duplicado; para inventariarlo por separado use *deshacer*.
+- Si un componente comparable **difiere** para una base ya monitoreada (otro servidor en la misma dirección) → el snapshot se trata como **no confiable** (`ENGINE_IDENTITY_CHANGED`) hasta que un administrador **reinicie la línea base**.
+- **Lease**: `POST /agent/inventory/lease` asigna cada base a **una** instalación (`lease_ttl_seconds`, defecto 900 s, renovable en cada ciclo). Si el responsable deja de renovar (agente caído), otra instalación con alcance la toma. Un snapshot de una instalación sin lease → **409 `lease_not_held`**; de otra fuera de alcance → **403**. "Liberar responsable" en el panel lo reasigna.
+
+### 19.3. Alcance, exclusiones y origen opcional
+
+- Se inventarían **todos los esquemas de usuario autorizados** (no solo los objetos del catálogo Nexus), para detectar tablas/vistas extra. Siempre se excluyen `pg_catalog`, `information_schema`, `pg_toast*`, `pg_temp_*`. Por base: patrones de inclusión/exclusión (`fnmatch`, p. ej. `ventas_*`) y `[inventory] default_schema_exclude` global. El backend vuelve a aplicar el filtro.
+- **DWH**: se registra solo cuando un agente lo alcanza (`dwh_auto_monitor`).
+- **Origen (DMS)**: **opcional y explícito**: se registra por empresa en el panel (`POST /admin/monitored-databases {"kind":"source","company_id":…}`) y queda **deshabilitado** salvo que se habilite. Hoy el agente inventaría orígenes PostgreSQL; otros motores se registran pero reportan "No se pudo verificar la estructura" (`ENGINE_UNSUPPORTED`).
+- Frecuencia configurable por base (`scan_interval_seconds`, defecto `default_interval_seconds` = 3600), independiente del ETL; "Inventariar ahora" pide uno inmediato.
+
+### 19.4. Normalización y huellas
+
+- Por objeto (**base, esquema, nombre, tipo**) una estructura normalizada: columnas **por nombre** (`format_type`, `NOT NULL`, `DEFAULT` con `pg_get_expr`, identidad, generada, collation no por defecto), restricciones por nombre (`pg_get_constraintdef`), índices que no respaldan restricciones (`USING …` de `pg_get_indexdef`), clave/límites de partición, `unlogged`, y para vistas/vistas materializadas **solo la huella** (`sha256`) de `pg_get_viewdef`.
+- El orden físico de columnas/restricciones no importa y se colapsan espacios fuera de literales: recrear una vista con otro formato, recrear un índice igual, borrar y volver a agregar una columna igual o refrescar una vista materializada **no** generan alertas.
+- Huella del objeto = `sha256` del JSON canónico (claves ordenadas); huella del snapshot = de todas las huellas.
+
+### 19.5. Estados de fiabilidad ("No se pudo verificar la estructura")
+
+| Snapshot | Cuándo | Efecto |
+|---|---|---|
+| `complete` | todos los esquemas del alcance verificados | se compara |
+| `partial` | hay esquemas **sin USAGE** (`schemas_unverifiable`) | se compara, pero **nunca** se infiere eliminación en esos esquemas |
+| `unreliable` | conexión/autenticación/consulta fallida (`DWH_CONNECTION_FAILED`…), servidor distinto, motor no soportado, demasiados objetos | **no** se compara; se conserva la línea base; el panel muestra **"No se pudo verificar la estructura"** con la última verificación exitosa |
+
+También se muestra "No se pudo verificar" si no hay intento en `intervalo × stale_factor + lease_ttl` (agente caído).
+
+Reglas conservadoras de eliminación:
+
+- Una **eliminación** solo se registra para esquemas que **este** snapshot listó en `schemas_verified` (y que siguen en el alcance). Un esquema omitido, no verificable o fuera de alcance nunca produce eliminaciones.
+- Para que el borrado de un esquema completo sí se detecte, el lease envía `expected_schemas` (esquemas que ya tenían objetos): si alguno ya no existe en `pg_namespace` (visible para cualquier rol), el agente lo reporta como verificado y vacío.
+- Un snapshot **sin objetos** cuando antes había objetos en el alcance se trata como **no confiable** (`EMPTY_SNAPSHOT_SUSPICIOUS`): no se borra toda la referencia por un inventario vacío. Si de verdad se eliminó todo, reinicie la línea base.
+- Un snapshot con `captured_at` **anterior** al último aceptado de esa base se ignora (`status: ignored`, `stale_snapshot`): datos viejos nunca revierten alertas. Cuenta como intento (`last_attempt_at`), así que la base no queda "vencida" en cada ciclo. `captured_at` más adelantado que `[agent] future_tolerance_hours` → **422** `invalid_time` (un reloj adelantado no congela el monitoreo). El reenvío del mismo `snapshot_id` responde `duplicate`; ese `snapshot_id` usado para otra base → **409** `snapshot_id_conflict`.
+- Un DWH que de verdad quedó **vacío** seguirá como `EMPTY_SNAPSHOT_SUSPICIOUS` ("No se pudo verificar") hasta que se **reinicie la línea base**.
+- Snapshot de una base inexistente o fuera del alcance de la instalación: **404** en ambos casos (no se revela su existencia).
+
+### 19.6. Línea base
+
+- El primer inventario queda como **propuesta** (`baseline_pending`); **nunca se aprueba sola** ni genera alertas. No se asume que los objetos los creó Nexus: la coincidencia con tablas destino del catálogo se muestra solo como evidencia ("Catálogo Nexus").
+- Aprobar (`POST …/baseline/approve {expected_snapshot_id, object_keys?}`) exige que la propuesta revisada siga siendo la última (si llegó otra → 409 `snapshot_changed`). Se puede aprobar un subconjunto: lo no aprobado queda como cambios pendientes ("objeto nuevo").
+- En monitoreo no se puede re-aprobar en bloque. **Reiniciar línea base** (motivo obligatorio) cierra las pendientes como reemplazadas (quedan en el historial), borra la referencia (queda en `inventory_baseline_version`, acción `reset`) y pide un inventario nuevo que vuelve a fijar la identidad del servidor.
+- Historial de cada cambio de la referencia: `inventory_baseline_version` (versión global, acción `approved|acknowledged|removed|reset`, huella, estructura, actor, fecha).
+
+### 19.7. Cambios estructurales
+
+Una alerta **por objeto** (`object_added`, `object_removed`, `object_modified`) con detalle granular (`column_added/removed/type_changed/nullability_changed/default_changed/attr_changed`, `constraint_added/removed/changed`, `index_added/removed/changed`, `view_definition_changed`, `object_attr_changed`), grupo y base afectados (empresa en orígenes), esquema, objeto y tipo, **primera detección** y **última observación** (+ contador), anterior vs. actual (estructura de la línea base y observada), estado y responsable.
+
+- Una sola **pendiente** por objeto (índice único parcial). Si el mismo estado se observa de nuevo solo se actualiza la última observación. Si el objeto **vuelve a cambiar** mientras está pendiente, la alerta vista **no se modifica en silencio**: pasa a `superseded` y se crea otra (enlazadas). Si vuelve por sí solo a la línea base → `reverted`.
+- Estados: `pending`, `acknowledged`, `superseded`, `reverted`, `out_of_scope` (el esquema se excluyó del alcance: la pendiente se cierra al guardar la configuración o en el siguiente inventario; el historial queda). Las alertas estructurales son **independientes** de las incidencias de carga: dar por entendido **no** resuelve incidencias.
+
+### 19.8. "Dar por entendido"
+
+`POST /admin/structural-changes/{id}/acknowledge {attribution: "client"|"nexus", comment?, ticket_ref?, expected_version, expected_observed_fingerprint}`
+
+- Responsable **obligatorio**: "Modificó cliente" o "Modificó equipo Nexus"; comentario y ticket opcionales; usuario (`admin` hasta la fase de RBAC) y fecha automáticos.
+- Efectos: sale de pendientes; se conserva el historial y el detalle; se incorpora a la línea base **solo esa diferencia** (alta/actualización/baja de ese objeto); **no** acepta otras pendientes; si el objeto cambia después se genera una alerta nueva.
+- **Concurrencia optimista**: se bloquea la base y la alerta (mismo orden que la recepción de snapshots) y se verifica `row_version`, la huella mostrada y el último estado observado. Si el objeto cambió otra vez → **409** (`not_pending` con `superseded_by_id`, `stale_version` u `object_changed_again`) y la versión nueva queda pendiente.
+- **Reclasificar** (`POST …/reclassify {attribution, reason (obligatorio), ticket_ref?, expected_version}`): solo alertas entendidas; conserva en el historial los valores anteriores, el actor y la fecha; no pisa el reconocimiento original.
+- La atribución es **manual** y se guarda separada de la **evidencia técnica** (`evidence`): ejecuciones del agente Nexus que aplicaron DDL sobre el objeto (`task_execution.ddl_applied`: `create_table`, `add_column` con columnas, `constraint_ddl`; sin SQL) y coincidencias con el catálogo. La evidencia se adjunta aunque el reporte de la ejecución llegue después de la detección, pero **nunca** asigna autoría. La autoría real y la hora exacta requieren auditoría del motor, que no se habilita.
+
+### 19.9. Definiciones de vistas (sensibles)
+
+- Por defecto solo viaja y se guarda la **huella**. Con "Guardar SQL de vistas" en la base (`view_definitions_enabled`) el agente envía el texto por TLS y el backend lo guarda **cifrado** (`ENC:` Fernet con `config_secret_key`; sin clave no se guarda). Nunca se registra en logs ni aparece en el detalle general.
+- Al **deshabilitar** "Guardar SQL de vistas" se borra el SQL cifrado ya guardado de esa base (estado observado, línea base y alertas; evento `view_definitions_purged`); quedan las huellas.
+- Verlo: `GET /admin/structural-changes/{id}/definitions`, que requiere el permiso reservado `inventory.view_definitions` (hoy: `[inventory] expose_view_definitions = true`); cada consulta queda en el historial del cambio.
+
+### 19.10. API
+
+| Método y ruta | Uso |
+|---|---|
+| `POST /agent/inventory/lease` | `{capabilities: {dwh, source_company_ids}, release_ids?}` → objetivos asignados (`granted`, `due`, alcance, frecuencia) |
+| `POST /agent/inventory/snapshots` | Resultado del inventario (idempotente por `snapshot_id`). Protecciones en la capa ASGI, **antes** de leer el cuerpo: se verifica la credencial de la instalación (401 sin leerlo ni descomprimirlo), a lo sumo `[server] inventory_max_concurrent` (2) a la vez (429 al resto; el agente reintenta con backoff). Después: límite comprimido `inventory_max_body_bytes` (8 MB), **descomprimido** `inventory_max_decompressed_bytes` (16 MB) en el threadpool (413), un solo miembro gzip completo (concatenados/truncados → 400) y tope de contenedores JSON `inventory_max_json_containers` (defecto 30 × `max_objects_per_snapshot`) **antes** de parsear (413 `too_many_json_containers`). Solo este endpoint acepta gzip (otros → 415). En el resto de `/agent/*` (salvo `enroll`), un cuerpo > 16 KB o chunked también exige credencial válida antes de leerse |
+| `GET /admin/inventory/summary`, `GET /admin/structural-changes/badge` | Conteos (panel/dashboard) |
+| `GET/POST /admin/monitored-databases`, `GET/PUT /admin/monitored-databases/{id}` | Bases monitoreadas y su configuración (cambios auditados en `monitored_database_event`) |
+| `POST /admin/monitored-databases/{id}/scan` · `/release-lease` | Inventario inmediato · liberar responsable |
+| `POST /admin/monitored-databases/{id}/resolve-duplicate` | `{action: merge|undo, reason}` (sección 19.2) |
+| `GET /admin/monitored-databases/{id}/baseline?view=auto|approved|proposal` · `/baseline/history` | Línea base / propuesta · historial |
+| `POST /admin/monitored-databases/{id}/baseline/approve` · `/baseline/reset` | Aprobar · reiniciar (motivo) |
+| `GET /admin/structural-changes` | Filtros `view=pending|history`, `status`, `group_id`, `company_id`, `agency_id`, `monitored_database_id`, `schema`, `object`, `change_type`, `attribution` (`client|nexus|none`), `since`, `until`, `limit` |
+| `GET /admin/structural-changes/{id}` · `/definitions` | Detalle (anterior vs actual, evidencia, historial, otras alertas del objeto) · SQL (permiso) |
+| `POST /admin/structural-changes/{id}/acknowledge` · `/reclassify` | Dar por entendido · reclasificar |
+
+Permisos reservados para la fase de RBAC: `inventory.configure`, `inventory.approve_baseline`, `inventory.view_definitions`, `structure.acknowledge`, `structure.reclassify` (hoy todos equivalen al token de administrador, salvo `inventory.view_definitions`).
+
+### 19.11. Panel
+
+**Estructura** con pestañas *Cambios pendientes*, *Historial* (entendidos con responsable, reemplazados, revertidos, reclasificaciones) y *Bases monitoreadas* (estado de verificación, línea base, última verificación, responsable del inventario, configuración, propuesta con aprobación total o parcial, reinicio, inventarios y eventos). El detalle muestra anterior vs. actual, la evidencia en un recuadro "Evidencia técnica (no prueba autoría)" y el formulario "Dar por entendido" con responsable obligatorio. Horas en `NEXT_PUBLIC_DWH_TIMEZONE` con zona explícita. El Dashboard tiene la tarjeta *Cambios estructurales*.
+
+### 19.12. Variables nuevas
+
+Backend `[inventory]`: `enabled`, `dwh_auto_monitor`, `default_interval_seconds`, `lease_ttl_seconds`, `stale_factor`, `snapshot_retention_days`, `max_objects_per_snapshot`, `default_schema_exclude`, `expose_view_definitions`, `evidence_window_days`, `collapse_partitions`; `[server] inventory_max_body_bytes`, `inventory_max_decompressed_bytes`, `inventory_max_concurrent`, `inventory_max_json_containers`. `captured_at` usa `[agent] future_tolerance_hours`. Agente `[agent]`: `inventory_enabled`, `inventory_tick_seconds`, `inventory_statement_timeout_seconds`. Ver `dwh_back/config_postgres.ini.example` y `dwh_client/config_postgres.ini.example`.
+
+### 19.13. Limitaciones conocidas
+
+- **Muestreo periódico**: un objeto creado y eliminado entre dos inventarios (o un cambio revertido entre dos) **no se detecta**. La granularidad es la frecuencia de la base.
+- No se sabe **quién** ni **cuándo exactamente** se hizo un cambio: solo "entre el inventario anterior y este". La atribución es manual; la evidencia Nexus es indicio, no prueba.
+- Solo PostgreSQL (DWH y orígenes PostgreSQL). SQL Server/MySQL/Firebird: registrables pero "No se pudo verificar" (`ENGINE_UNSUPPORTED`).
+- No se comparan privilegios (GRANT), dueños, triggers, funciones, secuencias ni comentarios.
+- Las columnas se comparan por nombre: renombrar una columna aparece como eliminada + agregada.
+- **Particiones** (`[inventory] collapse_partitions = true`, defecto): se agrupan bajo su tabla raíz (`partitions`: nombre → límites). Una partición nueva o un índice creado en la raíz (que PostgreSQL propaga a cada partición) generan **una** alerta en la raíz, no una por partición. Contrapartida: cambios hechos solo en una partición (un índice o restricción local) no se detectan. Las **sub-particiones** se aplanan bajo la raíz. **Adjuntar** (`ATTACH PARTITION`) una tabla que antes era independiente aparece como `object_removed` de esa tabla + raíz modificada (y `DETACH` como objeto nuevo). Con `false` cada partición es un objeto propio.
+- **DWH compartido por varios grupos con distinto host**: se inventaría una sola vez (duplicado); los vínculos muestran todos los grupos. Si un grupo cambia de host a otra base, el registro original queda con la otra configuración vigente o se fusiona según 19.2.
+- **Tamaño**: ~0,4 KB por objeto con pocas columnas (≈100 bytes por columna) sin comprimir; gzip lo reduce ~6×. Con los límites por defecto (8 MB comprimido / **16 MB descomprimido** / `max_objects_per_snapshot` 20000) caben del orden de 8000 tablas de ~20 columnas (suba `inventory_max_decompressed_bytes` si hace falta, considerando memoria × `inventory_max_concurrent`); si se supera, el agente reporta `PAYLOAD_TOO_LARGE` o `TOO_MANY_OBJECTS` ("No se pudo verificar"). Si falla el envío, el agente espera con backoff exponencial por base (tope 1 h) en lugar de re-inventariar cada ciclo.
+- El **responsable** del inventario aparece como "vencido" si su agente no está corriendo (no renovó el lease); otra instalación con alcance lo toma en su siguiente ciclo.
+- Evidencia técnica: `add_column` solo se asocia a alertas con esas columnas agregadas, `create_table` solo a objetos nuevos y `constraint_ddl` solo a restricciones agregadas/modificadas; el agente marca `constraint_ddl` únicamente si el DDL del catálogo cambió las restricciones (re-ejecutarlo sin cambios no es evidencia). La marca no dice **cuál** restricción cambió: se asocia a cualquier restricción agregada/modificada de esa tabla.
+- La estructura recibida se filtra con lista blanca de claves (columnas, restricciones, índices, huella de definición, partición); lo desconocido se descarta.
+- `ack_by`/`reclassified_by` = `admin` hasta la fase de usuarios (RBAC).
+
+### 19.14. Pruebas
+
+```
+cd dwh_back   && .venv/bin/python -m pytest tests/test_inventory.py -q               # lógica (inventarios construidos)
+cd dwh_client && .venv/bin/python -m pytest tests/test_inventory_integration.py -q   # PostgreSQL real + agente
+```
+
+- `test_inventory.py`: propuesta sin alertas y aprobación (409 con snapshot viejo, aprobación parcial); alta/modificación/eliminación de tablas y vistas con detalle granular y filtros; "Dar por entendido" con ambas opciones, historial, incorporación de solo esa diferencia, otra pendiente intacta y alerta nueva al volver a cambiar; cambio concurrente (409 y la versión nueva sigue pendiente) y carrera real ack/snapshot con invariantes; pérdida de permisos, conexión o servidor sin eliminaciones falsas y reversión; reclasificación con motivo; lease único, relevo y 403/409; misma base física con otro host sin duplicados; el ack no resuelve incidencias de carga; SQL de vistas cifrado y protegido; origen opcional y motor no soportado; evidencia sin atribución (antes y después de la detección); reinicio de línea base. Regresiones: cambio de host a la misma base (conserva línea base/historial), fusionar/deshacer duplicado, eliminaciones solo en esquemas verificados y snapshot vacío sospechoso, snapshot viejo ignorado, gzip con límite anti zip-bomb (413/400/415), identidad débil→fuerte compatible, colisión de identidad débil entre clientes sin duplicar ni fusionar (y nunca fusión entre grupos), bomba JSON/gzip sin credencial (401 sin leer el cuerpo, RSS < 150 MB, 429 por concurrencia, tope de contenedores), `captured_at` futuro → 422, `snapshot_id` ajeno → 409, lista blanca de estructura y evidencia específica, `out_of_scope`, borrado del SQL de vistas, contador = resumen, limpieza de vínculos.
+- `test_inventory_integration.py` (base `nexus_inv_it` y rol de solo lectura en el contenedor DWH): dos agentes del mismo DWH → un solo inventario; crear/modificar/eliminar tablas, vistas y vista materializada reales; normalización sin falsos positivos; `REVOKE USAGE` → parcial sin eliminaciones; `NOLOGIN` → no verificable; sesión de solo lectura (incluso como superusuario); relevo del lease; `ensure_columns_exist` del ETL → evidencia con `execution_id` y sin atribución; sin SQL de vistas ni secretos en logs/BD. Además: particiones agrupadas (una alerta en la raíz), DDL de restricción sin cambios no es evidencia, backoff del runner y `PAYLOAD_TOO_LARGE` ante 413.

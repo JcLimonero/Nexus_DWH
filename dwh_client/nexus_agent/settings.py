@@ -72,6 +72,10 @@ class Settings:
     dwh_lock_timeout_seconds: int = 300
     fetch_chunk_rows: int = 20000
 
+    inventory_enabled: bool = True            # inventario estructural (sección 19)
+    inventory_tick_seconds: int = 60
+    inventory_statement_timeout_seconds: int = 60
+
     watermark_clock: str = "source"           # source | agent_local | agent_utc
     watermark_overlap_seconds: int = 120
     legacy_watermark_overlap_seconds: int = 3600
@@ -185,6 +189,10 @@ def load_settings(config_path: Optional[str] = None, data_dir: Optional[str] = N
     s.dwh_statement_timeout_seconds = _int(ini, "agent", "dwh_statement_timeout_seconds", 3600, 0)
     s.dwh_lock_timeout_seconds = _int(ini, "agent", "dwh_lock_timeout_seconds", 300, 0)
     s.fetch_chunk_rows = _int(ini, "agent", "fetch_chunk_rows", 20000, 100)
+
+    s.inventory_enabled = _bool(ini, "agent", "inventory_enabled", True)
+    s.inventory_tick_seconds = _int(ini, "agent", "inventory_tick_seconds", 60, 5)
+    s.inventory_statement_timeout_seconds = _int(ini, "agent", "inventory_statement_timeout_seconds", 60, 1)
 
     s.watermark_clock = (_get(ini, "agent", "watermark_clock", "source") or "source").lower()
     if s.watermark_clock not in ("source", "agent_local", "agent_utc"):

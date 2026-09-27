@@ -11,7 +11,8 @@ contiene los módulos testeables:
   localstate  SQLite local: cola de reportes, agent_seq, checkpoints, agenda
   api         cliente HTTP de /agent/* (TLS verificado, reintentos)
   etl         extracción / transformación / carga (una transacción por tarea)
-  agent       orquestación: scheduler, worker, heartbeat, envío de la cola
+  agent       orquestación: scheduler, worker, heartbeat, envío de la cola, inventario
+  inventory   inventario estructural de solo lectura (sección 19)
 """
 
-AGENT_VERSION = "5.0.0"
+AGENT_VERSION = "5.1.0"

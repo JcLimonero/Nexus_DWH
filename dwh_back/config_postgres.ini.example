@@ -51,6 +51,14 @@ password = TU_PASSWORD_AQUI
 ; max_body_bytes = 1048576
 ; agent_max_body_bytes = 262144
 ; enroll_max_body_bytes = 16384
+; Inventario estructural: tamaño máximo del snapshot (solo metadatos) de POST /agent/inventory/snapshots.
+; inventory_max_body_bytes = 8388608
+; El agente envía el snapshot con gzip: tamaño máximo DESCOMPRIMIDO (anti zip-bomb).
+; inventory_max_decompressed_bytes = 16777216
+; Snapshots procesados a la vez (el resto recibe 429 y el agente reintenta).
+; inventory_max_concurrent = 2
+; Tope de contenedores JSON ({ y [) antes de parsear (defecto 30 × max_objects_per_snapshot).
+; inventory_max_json_containers = 600000
 
 [health]
 ; Salud e incidencias (sección 18 de DWH_README.md). Todo se calcula con la
@@ -97,3 +105,29 @@ password = TU_PASSWORD_AQUI
 ; sending_stale_seconds = 300
 ; Días que se conserva el registro de entregas terminadas (el historial de incidencias no se purga).
 ; retention_days = 30
+
+[inventory]
+; Inventario estructural y "Dar por entendido" (sección 19 de DWH_README.md).
+; El agente local inventaría en SOLO LECTURA y lo reporta; Nexus nunca se conecta a la base.
+; enabled = true
+; Registrar automáticamente el DWH de cada grupo cuando un agente lo alcanza (el origen/DMS
+; NUNCA se registra solo: se habilita explícitamente en el panel, por empresa).
+; dwh_auto_monitor = true
+; Frecuencia por defecto de cada base nueva (s, mín. 60); se cambia por base en el panel.
+; default_interval_seconds = 3600
+; Una sola instalación inventaría cada base (lease); si deja de renovarlo en este tiempo, otra lo toma.
+; lease_ttl_seconds = 900
+; "No se pudo verificar la estructura" también si no hay intento en intervalo × stale_factor + lease_ttl.
+; stale_factor = 3
+; Retención de snapshots (días; 0 = sin purga). Nunca se borra el último ni el último verificado.
+; snapshot_retention_days = 90
+; max_objects_per_snapshot = 20000
+; Esquemas excluidos en TODAS las bases (además de los del sistema), separados por coma.
+; default_schema_exclude =
+; Stand-in del permiso inventory.view_definitions hasta la fase de RBAC: permite ver el SQL
+; (cifrado) de vistas de las bases que tengan "Guardar SQL de vistas" habilitado.
+; expose_view_definitions = false
+; Ventana (días) para buscar ejecuciones Nexus con DDL como evidencia técnica.
+; evidence_window_days = 7
+; Agrupar las particiones bajo su tabla raíz (una alerta en la raíz, no una por partición).
+; collapse_partitions = true
