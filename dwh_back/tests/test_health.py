@@ -300,7 +300,7 @@ def test_reconocer_no_resuelve_ni_convierte_en_exito(henv, db):
     assert inc["acknowledged"] is False
     assert inc["id"] in [i["id"] for i in incidents(b, view="active")]
     r = b.admin("PUT", f"/admin/incidents/{inc['id']}/ack", {"comment": "Revisando con la sede"}, expect=200)
-    assert r["acknowledged"] is True and r["status"] == "open" and r["acknowledged_by"] == "admin"
+    assert r["acknowledged"] is True and r["status"] == "open" and r["acknowledged_by"] == "token-admin"
     assert inc["id"] in [i["id"] for i in incidents(b, view="acknowledged")]
     assert inc["id"] not in [i["id"] for i in incidents(b, view="active")]
     # No se puede cerrar a mano una falla de tarea
@@ -427,7 +427,7 @@ def test_dead_letter_se_cierra_solo_manualmente_con_motivo(henv, db):
                      headers={"x-admin-token": b.admin_token})
     assert r.status_code == 422
     r = b.admin("PUT", f"/admin/incidents/{inc[0]['id']}/resolve", {"reason": "Revisado el log local"}, expect=200)
-    assert r["status"] == "resolved" and r["resolution_reason"] == "manual" and r["resolved_by"] == "admin"
+    assert r["status"] == "resolved" and r["resolution_reason"] == "manual" and r["resolved_by"] == "token-admin"
     assert r["resolution_comment"] == "Revisado el log local"
 
 

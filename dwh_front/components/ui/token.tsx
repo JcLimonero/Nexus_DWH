@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Copy, Eye, EyeOff, KeyRound, RefreshCw, Ban } from "lucide-react";
+import { Copy, Eye, EyeOff, KeyRound, Lock, RefreshCw, Ban } from "lucide-react";
 import { IconButton } from "./primitives";
 import { useToast } from "./feedback";
 
@@ -20,14 +20,26 @@ export function TokenField({
   onRegenerate,
   onRevoke,
   emptyLabel = "Sin token",
+  hidden,
 }: {
   token: string | null;
   onRegenerate?: () => void;
   onRevoke?: () => void;
   emptyLabel?: string;
+  /** El backend no lo devolvió (falta credentials.manage sobre el grupo). */
+  hidden?: boolean;
 }) {
   const [visible, setVisible] = useState(false);
   const toast = useToast();
+
+  if (hidden) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs italic text-slate-400" title="Requiere el permiso «Administrar credenciales» sobre el grupo">
+        <Lock className="h-3.5 w-3.5" />
+        Oculto (credenciales)
+      </span>
+    );
+  }
 
   if (!token) {
     return (

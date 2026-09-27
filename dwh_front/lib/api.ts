@@ -1,13 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { CSRF_HEADER, CSRF_VALUE } from "@/lib/session";
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code?: string;
+  permission?: string;
+  constructor(status: number, message: string, code?: string, permission?: string) {
     super(message);
     this.status = status;
+    this.code = code;
+    this.permission = permission;
   }
+}
+
+function detailField(data: unknown, key: "code" | "permission"): string | undefined {
+  if (data && typeof data === "object" && "detail" in data) {
+    const d = (data as { detail: unknown }).detail;
+    if (d && typeof d === "object" && !Array.isArray(d)) {
+      const v = (d as Record<string, unknown>)[key];
+      return typeof v === "string" ? v : undefined;
+    }
+  }
+  return undefined;
 }
 
 function extractDetail(data: unknown, fallback: string): string {
@@ -37,7 +53,7 @@ async function handleUnauthorized() {
   if (redirecting || typeof window === "undefined") return;
   redirecting = true;
   try {
-    await fetch("/api/auth/logout", { method: "POST" });
+    await fetch("/api/auth/logout", { method: "POST", headers: { [CSRF_HEADER]: CSRF_VALUE } });
   } finally {
     window.location.href = "/login";
   }
@@ -48,9 +64,11 @@ export async function api<T = unknown>(
   path: string,
   options: { method?: string; body?: unknown } = {},
 ): Promise<T> {
+  const headers: Record<string, string> = { [CSRF_HEADER]: CSRF_VALUE };
+  if (options.body !== undefined) headers["content-type"] = "application/json";
   const res = await fetch(`/api/dwh/${path.replace(/^\/+/, "")}`, {
     method: options.method || "GET",
-    headers: options.body !== undefined ? { "content-type": "application/json" } : undefined,
+    headers,
     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
     cache: "no-store",
   });
@@ -67,8 +85,15 @@ export async function api<T = unknown>(
     void handleUnauthorized();
     throw new ApiError(401, extractDetail(data, "Sesión expirada."));
   }
+  const code = detailField(data, "code");
+  if (res.status === 403 && code === "password_change_required" && typeof window !== "undefined") {
+    window.location.href = "/cambiar-contrasena";
+  }
+  if (res.status === 403 && code === "permission_required") {
+    throw new ApiError(403, "Sin permiso para esta acción. " + extractDetail(data, ""), code, detailField(data, "permission"));
+  }
   if (!res.ok) {
-    throw new ApiError(res.status, extractDetail(data, `Error ${res.status}`));
+    throw new ApiError(res.status, extractDetail(data, `Error ${res.status}`), code, detailField(data, "permission"));
   }
   return data as T;
 }

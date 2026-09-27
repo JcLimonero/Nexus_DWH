@@ -5,19 +5,37 @@ import { CheckCheck, RefreshCw } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
 import type { ClientEvent } from "@/lib/types";
 import { fmtDate, fmtNumber } from "@/lib/format";
-import { Badge, Button, Card, PageHeader, Select, Switch } from "@/components/ui/primitives";
+import { Badge, Button, Card, PageHeader, Select } from "@/components/ui/primitives";
+import { FilterBar, dateRange, useUrlFilters } from "@/components/scope-filters";
+import { useSession } from "@/components/session";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ExpandableText } from "@/components/expandable";
 import { useActions } from "@/components/use-actions";
 
+const FILTER_KEYS = ["group_id", "company_id", "agency_id", "task_id", "status", "since", "until"] as const;
+const STATUS_OPTIONS = [
+  { value: "error", label: "Errores" },
+  { value: "pending", label: "Errores sin reconocer" },
+  { value: "ok", label: "OK" },
+];
+
 export default function EventosPage() {
-  const [eventType, setEventType] = useState("");
-  const [onlyPending, setOnlyPending] = useState(false);
+  const { can, canAny } = useSession();
+  const [f, setF, clearF] = useUrlFilters(FILTER_KEYS);
   const [limit, setLimit] = useState("200");
   const [search, setSearch] = useState("");
   const { data, loading, error, reload } = useApi<{ total: number; items: ClientEvent[] }>(
-    `monitor/events${qs({ event_type: eventType, only_unacknowledged: onlyPending || undefined, limit })}`,
+    `admin/events${qs({
+      group_id: f.group_id,
+      company_id: f.company_id,
+      agency_id: f.agency_id,
+      task_id: f.task_id,
+      event_type: f.status === "pending" ? "error" : f.status,
+      only_unacknowledged: f.status === "pending" || undefined,
+      ...dateRange(f.since, f.until),
+      limit,
+    })}`,
   );
   const { run, busy } = useActions(reload);
   const term = search.trim().toLowerCase();
@@ -36,28 +54,44 @@ export default function EventosPage() {
             <Button variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={reload} loading={loading && Boolean(data)}>
               Actualizar
             </Button>
-            <Button
-              icon={<CheckCheck className="h-4 w-4" />}
-              loading={busy === "ackall"}
-              onClick={() =>
-                run<{ acknowledged: number }>("ackall", "monitor/events/ack-all", {
-                  method: "PUT",
-                  success: "Errores reconocidos.",
-                  confirm: { title: "Reconocer todos", message: "Se marcarán como reconocidos todos los errores pendientes.", confirmLabel: "Reconocer todos" },
-                })
-              }
-            >
-              Reconocer todos
-            </Button>
+            {canAny("incident.acknowledge") && (
+              <Button
+                icon={<CheckCheck className="h-4 w-4" />}
+                loading={busy === "ackall"}
+                onClick={() =>
+                  run<{ acknowledged: number }>(
+                    "ackall",
+                    `admin/events/ack-all${qs({ group_id: f.group_id, company_id: f.company_id, agency_id: f.agency_id })}`,
+                    {
+                      method: "PUT",
+                      success: "Errores reconocidos.",
+                      confirm: {
+                        title: "Reconocer todos",
+                        message:
+                          "Se marcarán como reconocidos los errores pendientes de los grupos donde usted puede reconocer (y del grupo/empresa/agencia filtrados).",
+                        confirmLabel: "Reconocer todos",
+                      },
+                    },
+                  )
+                }
+              >
+                Reconocer todos
+              </Button>
+            )}
           </>
         }
       />
+      <div className="mb-3">
+        <FilterBar
+          values={f}
+          onChange={setF}
+          onClear={clearF}
+          fields={[...FILTER_KEYS]}
+          statusOptions={STATUS_OPTIONS}
+          statusLabel="Tipo"
+        />
+      </div>
       <div className="mb-4 flex flex-wrap items-center gap-3">
-        <Select aria-label="Tipo de evento" className="w-full sm:w-40" value={eventType} onChange={(e) => setEventType(e.target.value)}>
-          <option value="">Todos</option>
-          <option value="error">Errores</option>
-          <option value="ok">OK</option>
-        </Select>
         <Select aria-label="Límite" className="w-full sm:w-36" value={limit} onChange={(e) => setLimit(e.target.value)}>
           {["50", "200", "500", "1000", "2000"].map((l) => (
             <option key={l} value={l}>
@@ -72,7 +106,6 @@ export default function EventosPage() {
           placeholder="Buscar grupo, empresa, tarea, detalle…"
           className="h-9 w-full rounded-md border border-slate-300 px-3 text-sm shadow-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20 sm:w-72"
         />
-        <Switch checked={onlyPending} onChange={setOnlyPending} label="Solo sin reconocer" />
         {data && (
           <span className="text-xs text-slate-500 sm:ml-auto">
             {fmtNumber(items.length)} de {fmtNumber(data.total)} · {pending} errores pendientes en la vista
@@ -109,17 +142,23 @@ export default function EventosPage() {
                     <ExpandableText text={e.detail} />
                   </Td>
                   <Td className="text-right">
-                    {e.event_type === "error" && !e.acknowledged ? (
+                    {e.event_type === "error" && !e.acknowledged && can("incident.acknowledge", e.group_id) ? (
                       <Button
                         size="sm"
                         variant="secondary"
                         loading={busy === `ack-${e.id}`}
-                        onClick={() => run(`ack-${e.id}`, `monitor/events/${e.id}/ack`, { method: "PUT", success: "Evento reconocido." })}
+                        onClick={() => run(`ack-${e.id}`, `admin/events/${e.id}/ack`, { method: "PUT", success: "Evento reconocido." })}
                       >
                         Reconocer
                       </Button>
                     ) : (
-                      <span className="text-xs text-slate-400">{e.event_type === "error" ? "Reconocido" : "—"}</span>
+                      <span className="text-xs text-slate-400" title={e.acknowledged_at ? fmtDate(e.acknowledged_at) : undefined}>
+                        {e.event_type !== "error"
+                          ? "—"
+                          : e.acknowledged
+                            ? `Reconocido${e.acknowledged_by ? ` por ${e.acknowledged_by}` : ""}`
+                            : "Pendiente"}
+                      </span>
                     )}
                   </Td>
                 </Tr>

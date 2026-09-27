@@ -21,9 +21,21 @@ import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { Modal } from "@/components/ui/modal";
 import { useConfirm, useToast } from "@/components/ui/feedback";
-import { CompanyOptions, HierarchyFilters, type FilterValue } from "@/components/filters";
-import { useRefData } from "@/components/ref-data";
+import { CompanyOptions } from "@/components/filters";
 import { useAutoRefresh } from "@/components/health";
+import { FilterBar, dateRange, useUrlFilters } from "@/components/scope-filters";
+import { useSession } from "@/components/session";
+
+const CHANGE_FILTERS = ["group_id", "company_id", "agency_id", "database_id", "since", "until"] as const;
+const DB_FILTERS = ["group_id", "company_id", "agency_id"] as const;
+
+/** Quita un parámetro de la URL conservando los filtros. */
+function withoutParam(params: URLSearchParams, key: string): string {
+  const next = new URLSearchParams(params.toString());
+  next.delete(key);
+  const q = next.toString();
+  return q ? `/estructura?${q}` : "/estructura";
+}
 import {
   ATTRIBUTION,
   CHANGE_EVENT_LABEL,
@@ -70,11 +82,11 @@ function EstructuraInner() {
 
   const closeChange = () => {
     setOpenChange(null);
-    if (params.get("change")) router.replace("/estructura");
+    if (params.get("change")) router.replace(withoutParam(params, "change"));
   };
   const closeDb = () => {
     setOpenDb(null);
-    if (params.get("db")) router.replace("/estructura");
+    if (params.get("db")) router.replace(withoutParam(params, "db"));
   };
 
   const TABS: { key: Tab; label: string; count?: number }[] = [
@@ -142,31 +154,25 @@ function EstructuraInner() {
 // Cambios (pendientes / historial)
 // ─────────────────────────────────────────────────────────────────────────────
 function ChangesTab({ view, onOpen }: { view: "pending" | "history"; onOpen: (id: number) => void }) {
-  const { groups, companies, agencies } = useRefData({ agencies: true });
-  const dbs = useApi<{ items: MonitoredDatabase[] }>("admin/monitored-databases");
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "", agency_id: "" });
-  const [dbId, setDbId] = useState("");
+  const [filter, setFilter, clearFilter] = useUrlFilters(CHANGE_FILTERS);
   const [changeType, setChangeType] = useState("");
   const [attribution, setAttribution] = useState("");
   const [status, setStatus] = useState("");
   const [schema, setSchema] = useState("");
   const [object, setObject] = useState("");
-  const [since, setSince] = useState("");
-  const [until, setUntil] = useState("");
 
   const path = `admin/structural-changes${qs({
     view,
     group_id: filter.group_id,
     company_id: filter.company_id,
     agency_id: filter.agency_id,
-    monitored_database_id: dbId,
+    monitored_database_id: filter.database_id,
     change_type: changeType,
     attribution: view === "history" ? attribution : "",
     status: view === "history" ? status : "",
     schema: schema.trim(),
     object: object.trim(),
-    since: since ? new Date(`${since}T00:00:00`).toISOString() : "",
-    until: until ? new Date(`${until}T23:59:59`).toISOString() : "",
+    ...dateRange(filter.since, filter.until),
     limit: 500,
   })}`;
   const { data, loading, error, reload } = useApi<{ items: StructuralChange[] }>(path);
@@ -176,15 +182,7 @@ function ChangesTab({ view, onOpen }: { view: "pending" | "history"; onOpen: (id
   return (
     <>
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} agencies={agencies} />
-        <Select aria-label="Base monitoreada" className="w-full sm:w-56" value={dbId} onChange={(e) => setDbId(e.target.value)}>
-          <option value="">Todas las bases</option>
-          {(dbs.data?.items ?? []).map((d) => (
-            <option key={d.id} value={d.id}>
-              {d.display_name}
-            </option>
-          ))}
-        </Select>
+        <FilterBar values={filter} onChange={setFilter} onClear={clearFilter} fields={[...CHANGE_FILTERS]} />
         <Select aria-label="Tipo de cambio" className="w-full sm:w-52" value={changeType} onChange={(e) => setChangeType(e.target.value)}>
           <option value="">Todo tipo de cambio</option>
           {Object.entries(CHANGE_TYPE_LABEL).map(([k, v]) => (
@@ -212,14 +210,6 @@ function ChangesTab({ view, onOpen }: { view: "pending" | "history"; onOpen: (id
         )}
         <Input aria-label="Esquema" placeholder="Esquema" className="w-full sm:w-32" value={schema} onChange={(e) => setSchema(e.target.value)} />
         <Input aria-label="Objeto" placeholder="Objeto (contiene)" className="w-full sm:w-44" value={object} onChange={(e) => setObject(e.target.value)} />
-        <label className="flex items-center gap-1 text-xs text-slate-500">
-          Desde
-          <Input type="date" aria-label="Detectado desde" className="w-36" value={since} onChange={(e) => setSince(e.target.value)} />
-        </label>
-        <label className="flex items-center gap-1 text-xs text-slate-500">
-          Hasta
-          <Input type="date" aria-label="Detectado hasta" className="w-36" value={until} onChange={(e) => setUntil(e.target.value)} />
-        </label>
         <Button variant="secondary" size="sm" icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => void reload()} loading={loading && Boolean(data)}>
           Actualizar
         </Button>
@@ -551,7 +541,15 @@ function ChangeDrawer({
             </p>
           )}
 
-          {c.status === "pending" && (
+          {(c.status === "pending" || c.status === "acknowledged") &&
+            !(c.status === "pending" ? c.allowed_actions?.acknowledge : c.allowed_actions?.reclassify) && (
+              <p className="flex items-center gap-2 border-t border-slate-200 pt-4 text-xs text-slate-500">
+                <Lock className="h-3.5 w-3.5" />
+                Sin permiso para {c.status === "pending" ? "dar por entendido" : "reclasificar"} cambios de esta base (se requiere en todos sus grupos).
+              </p>
+            )}
+
+          {c.status === "pending" && c.allowed_actions?.acknowledge && (
             <div className="space-y-3 border-t border-slate-200 pt-4">
               <p className="text-sm font-semibold text-slate-900">Dar por entendido</p>
               <AttributionPicker value={attribution} onChange={setAttribution} name="ack-attr" />
@@ -573,7 +571,7 @@ function ChangeDrawer({
             </div>
           )}
 
-          {c.status === "acknowledged" && (
+          {c.status === "acknowledged" && c.allowed_actions?.reclassify && (
             <div className="space-y-3 border-t border-slate-200 pt-4">
               <p className="text-sm font-semibold text-slate-900">Reclasificar responsable</p>
               <AttributionPicker value={attribution} onChange={setAttribution} name="rec-attr" />
@@ -763,10 +761,10 @@ function Item({ label, value, mono }: { label: string; value: string; mono?: boo
 // Bases monitoreadas
 // ─────────────────────────────────────────────────────────────────────────────
 function DatabasesTab({ onOpen }: { onOpen: (id: number) => void }) {
-  const { groups, companies } = useRefData();
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "" });
+  const [filter, setFilter, clearFilter] = useUrlFilters(DB_FILTERS);
+  const { canAny } = useSession();
   const { data, loading, error, reload } = useApi<{ items: MonitoredDatabase[] }>(
-    `admin/monitored-databases${qs({ group_id: filter.group_id, company_id: filter.company_id })}`,
+    `admin/monitored-databases${qs({ group_id: filter.group_id, company_id: filter.company_id, agency_id: filter.agency_id })}`,
   );
   useAutoRefresh(reload);
   const [creating, setCreating] = useState(false);
@@ -775,13 +773,15 @@ function DatabasesTab({ onOpen }: { onOpen: (id: number) => void }) {
   return (
     <>
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} />
+        <FilterBar values={filter} onChange={setFilter} onClear={clearFilter} fields={[...DB_FILTERS]} />
         <Button variant="secondary" size="sm" icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => void reload()} loading={loading && Boolean(data)}>
           Actualizar
         </Button>
-        <Button size="sm" icon={<Plus className="h-3.5 w-3.5" />} className="sm:ml-auto" onClick={() => setCreating(true)}>
-          Monitorear origen (opcional)
-        </Button>
+        {canAny("inventory.configure") && (
+          <Button size="sm" icon={<Plus className="h-3.5 w-3.5" />} className="sm:ml-auto" onClick={() => setCreating(true)}>
+            Monitorear origen (opcional)
+          </Button>
+        )}
       </div>
       <p className="mb-3 text-xs text-slate-500">
         El DWH de cada grupo se registra solo cuando un agente lo alcanza (una sola base aunque la compartan varias agencias; la inventaría una
@@ -884,6 +884,7 @@ function splitPatterns(v: string): string[] {
 
 function CreateSourceModal({ onClose, onCreated }: { onClose: () => void; onCreated: (id: number) => void }) {
   const companies = useApi<ListResponse<Company>>("admin/companies");
+  const { can } = useSession();
   const toast = useToast();
   const [companyId, setCompanyId] = useState("");
   const [enabled, setEnabled] = useState(false);
@@ -937,7 +938,7 @@ function CreateSourceModal({ onClose, onCreated }: { onClose: () => void; onCrea
         <Field label="Empresa (origen)" htmlFor="src-company" required>
           <Select id="src-company" value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
             <option value="">Seleccione…</option>
-            <CompanyOptions companies={companies.data?.items ?? []} />
+            <CompanyOptions companies={(companies.data?.items ?? []).filter((c) => can("inventory.configure", c.group_id))} />
           </Select>
         </Field>
         <Switch checked={enabled} onChange={setEnabled} label="Habilitar ahora" description="Si queda deshabilitado, ningún agente inventaría el origen." />
@@ -961,6 +962,9 @@ function DatabaseDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
   const baseline = useApi<BaselineResponse>(`admin/monitored-databases/${id}/baseline?limit=5000`);
   const toast = useToast();
   const confirm = useConfirm();
+  // Permisos calculados por el backend sobre TODOS los grupos de la base (DWH compartido).
+  const canConfigure = Boolean(data?.allowed_actions?.configure);
+  const canApprove = Boolean(data?.allowed_actions?.approve_baseline);
   const [busy, setBusy] = useState<string | null>(null);
   const [form, setForm] = useState<{ enabled: boolean; interval: string; include: string; exclude: string; viewDefs: boolean } | null>(null);
   const [selected, setSelected] = useState<Set<string> | null>(null);
@@ -1107,7 +1111,7 @@ function DatabaseDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
                 bases distintas, <b>deshaga</b> la detección.
               </p>
               <Textarea aria-label="Motivo" rows={2} maxLength={500} value={dupReason} onChange={(e) => setDupReason(e.target.value)} placeholder="Motivo (obligatorio)" />
-              <div className="flex flex-wrap gap-2">
+              <div className={cx("flex flex-wrap gap-2", !canConfigure && "hidden")}>
                 <Button size="sm" disabled={dupReason.trim().length < 5} loading={busy === "merge"} onClick={() => void resolveDup("merge")}>
                   Fusionar con la #{d.duplicate_of_id}
                 </Button>
@@ -1127,7 +1131,14 @@ function DatabaseDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
             <Item label="Línea base" value={`v${d.baseline_version}${d.baseline_approved_at ? ` · aprobada ${fmtDateTz(d.baseline_approved_at)} por ${d.baseline_approved_by}` : ""}`} />
           </dl>
 
-          <div className="flex flex-wrap gap-2">
+          {!canConfigure && (
+            <p className="flex items-center gap-2 text-xs text-slate-500">
+              <Lock className="h-3.5 w-3.5" />
+              Solo consulta: configurar esta base requiere «Configurar inventario» en todos sus grupos
+              {canApprove ? "" : "; aprobar la línea base requiere «Aprobar línea base»"}.
+            </p>
+          )}
+          <div className={cx("flex flex-wrap gap-2", !canConfigure && "hidden")}>
             <Button size="sm" variant="secondary" icon={<Play className="h-3.5 w-3.5" />} loading={busy === "scan"} onClick={() => void act("scan", `admin/monitored-databases/${id}/scan`, undefined, "Inventario solicitado: el agente responsable lo hará en su próximo ciclo.")}>
               Inventariar ahora
             </Button>
@@ -1137,7 +1148,7 @@ function DatabaseDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
           </div>
 
           {/* Configuración */}
-          <div className="rounded-md border border-slate-200 p-4">
+          <fieldset disabled={!canConfigure} className="rounded-md border border-slate-200 p-4">
             <p className="mb-3 text-sm font-semibold text-slate-900">Configuración</p>
             <div className="grid gap-4 sm:grid-cols-2">
               <Switch checked={form.enabled} onChange={(v) => setForm({ ...form, enabled: v })} label="Monitoreo habilitado" description={d.kind === "source" ? "Origen: opcional y explícito." : undefined} />
@@ -1162,10 +1173,12 @@ function DatabaseDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
                 <Input id="db-exclude" value={form.exclude} onChange={(e) => setForm({ ...form, exclude: e.target.value })} />
               </Field>
             </div>
-            <Button className="mt-3" size="sm" loading={busy === "save"} onClick={() => void save()}>
-              Guardar configuración
-            </Button>
-          </div>
+            {canConfigure && (
+              <Button className="mt-3" size="sm" loading={busy === "save"} onClick={() => void save()}>
+                Guardar configuración
+              </Button>
+            )}
+          </fieldset>
 
           {/* Línea base */}
           <div className="rounded-md border border-slate-200 p-4">
@@ -1244,12 +1257,12 @@ function DatabaseDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
                 </table>
               </div>
             )}
-            {baseline.data?.view === "proposal" && d.state === "baseline_pending" && (
+            {baseline.data?.view === "proposal" && d.state === "baseline_pending" && canApprove && (
               <Button className="mt-3" size="sm" icon={<CheckCheck className="h-3.5 w-3.5" />} loading={busy === "approve"} disabled={!selected || selected.size === 0} onClick={() => void approve()}>
                 Aprobar línea base ({selected?.size ?? 0})
               </Button>
             )}
-            {d.state === "monitoring" && (
+            {d.state === "monitoring" && canApprove && (
               <div className="mt-4 border-t border-slate-100 pt-3">
                 <Field label="Reiniciar línea base" htmlFor="reset-reason" hint="Cierra las alertas pendientes (quedan en el historial) y pide un inventario nuevo para aprobarlo. Úselo si cambió el servidor.">
                   <Textarea id="reset-reason" rows={2} maxLength={500} value={resetReason} onChange={(e) => setResetReason(e.target.value)} placeholder="Motivo (obligatorio)" />

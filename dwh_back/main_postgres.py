@@ -45,6 +45,7 @@ from datetime import timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
+import psycopg2.errors
 import psycopg2.extras
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -125,6 +126,10 @@ INVENTORY_MAX_BODY_BYTES = _ini.getint("server", "inventory_max_body_bytes", fal
 INVENTORY_MAX_DECOMPRESSED_BYTES = _ini.getint("server", "inventory_max_decompressed_bytes", fallback=16_777_216)
 # Snapshots procesados a la vez (el resto recibe 429 y el agente reintenta con backoff).
 INVENTORY_MAX_CONCURRENT = max(1, _ini.getint("server", "inventory_max_concurrent", fallback=2))
+# Límites de tasa del API del agente (enroll y credenciales inválidas): ver agent_postgres.AgentRateLimits.
+from agent_postgres import AgentRateLimits  # noqa: E402
+
+AGENT_LIMITS = AgentRateLimits.from_ini(_ini)
 # Orígenes permitidos para CORS (separados por coma). Vacío = sin CORS
 # (el panel dwh_front usa un proxy del lado servidor y no lo necesita).
 CORS_ORIGINS = [
@@ -215,11 +220,21 @@ class GroupConfigsResponse(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 # Conexión BD
 # ─────────────────────────────────────────────────────────────────────────────
+# Pool acotado (db_pool.py): conn.close() devuelve la conexión al pool (ROLLBACK + DISCARD ALL).
+from db_pool import BoundedPool  # noqa: E402
+
+DB_POOL = BoundedPool(
+    dict(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, dbname=DB_NAME,
+         connect_timeout=_ini.getint("database", "connect_timeout_seconds", fallback=5),
+         application_name=_ini.get("database", "application_name", fallback="nexus_dwh_back")[:60]),
+    minconn=_ini.getint("database", "pool_min", fallback=5),
+    maxconn=_ini.getint("database", "pool_max", fallback=20),
+    timeout=_ini.getfloat("database", "pool_timeout_seconds", fallback=10.0),
+)
+
+
 def get_connection():
-    return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, user=DB_USER,
-        password=DB_PASS, dbname=DB_NAME,
-    )
+    return DB_POOL.getconn()
 
 
 _secret_cipher: Optional["Fernet"] = None
@@ -431,12 +446,22 @@ async def activity_logging_middleware(request: Request, call_next):
 
     finally:
         elapsed_ms = int((time.time() - start) * 1000)
-        # Las validaciones de sesión del panel (/admin/whoami OK) no se registran.
-        if not (endpoint == "/admin/whoami" and status_code < 400):
+        # Las validaciones de sesión del panel (/admin/whoami, /admin/auth/me OK) no se registran.
+        if not (endpoint in ("/admin/whoami", "/admin/auth/me") and status_code < 400):
             audit = getattr(request.state, "audit", None) or {}
             await run_in_threadpool(
                 _record_activity, audit, company_token, group_token, agency_token,
                 method, endpoint, status_code, elapsed_ms, error_detail, client_ip,
+            )
+        # Auditoría del panel: toda mutación /admin/* de un usuario y TODO uso del token estático.
+        ctx = getattr(request.state, "auth", None)
+        if ctx is not None and endpoint.startswith("/admin/") and getattr(ctx, "audit_target", None) != "__done__" \
+                and (method not in ("GET", "HEAD", "OPTIONS") or ctx.auth_kind == "static_token"):
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", endpoint)
+            await run_in_threadpool(
+                AUTH.record_request, ctx, method, route_path, dict(request.scope.get("path_params") or {}),
+                status_code, AUTH.client_ip(request),
             )
 
 
@@ -1200,34 +1225,16 @@ def report_client_event(
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoints — monitor
 # ─────────────────────────────────────────────────────────────────────────────
-@app.get("/monitor/events")
-def get_events(
-    x_monitor_token: str = Header(...),
-    event_type: Optional[str] = Query(None, description="'ok' | 'error' | None = todos"),
-    only_unacknowledged: bool = Query(False),
-    limit: int = Query(200, ge=1, le=2000),
-) -> dict:
-    """Historial de eventos con grupo + razón social en cada registro."""
-    _require_monitor_token(x_monitor_token)
-
-    conditions: List[str] = []
-    params: list = []
-
-    if event_type in ("ok", "error"):
-        conditions.append("event_type = %s")
-        params.append(event_type)
-    if only_unacknowledged:
-        conditions.append("is_acknowledged = 0")
-
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
+def _q_events(conds: List[str], params: list, limit: int) -> List[Dict[str, Any]]:
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             f"""
             SELECT id, created_at, group_name AS grupo, company_name AS razon_social, config_id,
-                   task_name, event_type, detail, rows_loaded, is_acknowledged AS acknowledged
+                   task_name, event_type, detail, rows_loaded, is_acknowledged AS acknowledged,
+                   group_id, company_id, agency_id, acknowledged_by, acknowledged_at
             FROM client_events
             {where}
             ORDER BY created_at DESC
@@ -1238,8 +1245,7 @@ def get_events(
         rows = cur.fetchall()
     finally:
         conn.close()
-
-    items = [
+    return [
         {
             "id":           r[0],
             "timestamp":    r[1].isoformat() if r[1] else "",
@@ -1251,27 +1257,45 @@ def get_events(
             "detail":       r[7],
             "rows_loaded":  r[8],
             "acknowledged": bool(r[9]),
+            "group_id":     r[10],
+            "company_id":   r[11],
+            "agency_id":    r[12],
+            "acknowledged_by": r[13],
+            "acknowledged_at": r[14].astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if r[14] else None,
         }
         for r in rows
     ]
+
+
+@app.get("/monitor/events")
+def get_events(
+    x_monitor_token: str = Header(...),
+    event_type: Optional[str] = Query(None, description="'ok' | 'error' | None = todos"),
+    only_unacknowledged: bool = Query(False),
+    limit: int = Query(200, ge=1, le=2000),
+) -> dict:
+    """Historial de eventos con grupo + razón social en cada registro."""
+    _require_monitor_token(x_monitor_token)
+    conditions: List[str] = []
+    params: list = []
+    if event_type in ("ok", "error"):
+        conditions.append("event_type = %s")
+        params.append(event_type)
+    if only_unacknowledged:
+        conditions.append("is_acknowledged = 0")
+    items = _q_events(conditions, params, limit)
+    for it in items:  # contrato legado del monitor (sin columnas nuevas)
+        for k in ("group_id", "company_id", "agency_id", "acknowledged_by", "acknowledged_at"):
+            it.pop(k, None)
     return {"total": len(items), "items": items}
 
 
-@app.get("/monitor/clients")
-def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
-    """
-    Resumen por empresa: grupo, RS, última conexión, ejecuciones totales,
-    errores pendientes y errores en la última hora. Agrupa por ids resueltos
-    (company_id), así cuenta también lo reportado con token de grupo/agencia o
-    por instalaciones. Las instalaciones se ven en /monitor/installations.
-    """
-    _require_monitor_token(x_monitor_token)
-
+def _q_clients(scope_sql: str = "TRUE", scope_params: Optional[list] = None) -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            """
+            f"""
             SELECT
                 g.name                                                  AS grupo,
                 c.name                                                  AS razon_social,
@@ -1285,7 +1309,8 @@ def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
                 ce.last_execution,
                 -- Mismas horas como timestamptz (UTC): las columnas legadas son TIMESTAMP
                 -- sin zona en la zona de la sesión de la BD.
-                al.last_seen::timestamptz, ce.last_execution::timestamptz
+                al.last_seen::timestamptz, ce.last_execution::timestamptz,
+                g.id, c.id
             FROM company c
             JOIN client_group g ON g.id = c.group_id
             LEFT JOIN (
@@ -1296,7 +1321,7 @@ def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
                        SUM(CASE WHEN created_at >= NOW() - INTERVAL '1 hour' AND status_code >= 400
                                 THEN 1 ELSE 0 END) AS http_errors_1h
                 FROM activity_log
-                WHERE company_id IS NOT NULL AND auth_kind NOT IN ('admin', 'monitor')
+                WHERE company_id IS NOT NULL AND auth_kind NOT IN ('admin', 'monitor', 'panel')
                 GROUP BY company_id
             ) al ON al.company_id = c.id
             LEFT JOIN (
@@ -1311,14 +1336,15 @@ def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
                 WHERE company_id IS NOT NULL
                 GROUP BY company_id
             ) ce ON ce.company_id = c.id
+            WHERE {scope_sql}
             ORDER BY g.name, c.name
-            """
+            """,
+            scope_params or [],
         )
         rows = cur.fetchall()
     finally:
         conn.close()
-
-    items = [
+    return [
         {
             "grupo":               r[0],
             "razon_social":        r[1],
@@ -1337,22 +1363,31 @@ def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
             # Aditivos (compatibles): ISO UTC con zona, para mostrar la hora con zona explícita.
             "last_seen_utc":      r[14].astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if r[14] else None,
             "last_execution_utc": r[15].astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if r[15] else None,
+            "group_id":           r[16],
+            "company_id":         r[17],
         }
         for r in rows
     ]
+
+
+@app.get("/monitor/clients")
+def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
+    """
+    Resumen por empresa: grupo, RS, última conexión, ejecuciones totales,
+    errores pendientes y errores en la última hora. Agrupa por ids resueltos
+    (company_id), así cuenta también lo reportado con token de grupo/agencia o
+    por instalaciones. Las instalaciones se ven en /monitor/installations.
+    """
+    _require_monitor_token(x_monitor_token)
+    items = _q_clients()
+    for it in items:
+        it.pop("group_id", None)
+        it.pop("company_id", None)
     return {"clients": items}
 
 
-@app.get("/monitor/activity")
-def get_activity_log(
-    x_monitor_token: str = Header(...),
-    only_errors: bool = Query(True),
-    limit: int = Query(200, ge=1, le=2000),
-) -> dict:
-    """Log de actividad HTTP del backend con grupo + RS."""
-    _require_monitor_token(x_monitor_token)
-
-    where = "WHERE status_code >= 400" if only_errors else ""
+def _q_activity(conds: List[str], params: list, limit: int) -> List[Dict[str, Any]]:
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1360,19 +1395,18 @@ def get_activity_log(
             f"""
             SELECT id, created_at, group_name AS grupo, company_name AS razon_social, token,
                    method, endpoint, status_code, response_ms,
-                   error_detail, client_ip, auth_kind, installation_id
+                   error_detail, client_ip, auth_kind, installation_id, group_id, company_id, agency_id
             FROM activity_log
             {where}
             ORDER BY created_at DESC
             LIMIT %s
             """,
-            (limit,),
+            params + [limit],
         )
         rows = cur.fetchall()
     finally:
         conn.close()
-
-    items = [
+    return [
         {
             "id":           r[0],
             "timestamp":    r[1].isoformat() if r[1] else "",
@@ -1387,9 +1421,26 @@ def get_activity_log(
             "client_ip":    r[10],
             "auth_kind":    r[11],
             "installation_id": str(r[12]) if r[12] else None,
+            "group_id":     r[13],
+            "company_id":   r[14],
+            "agency_id":    r[15],
         }
         for r in rows
     ]
+
+
+@app.get("/monitor/activity")
+def get_activity_log(
+    x_monitor_token: str = Header(...),
+    only_errors: bool = Query(True),
+    limit: int = Query(200, ge=1, le=2000),
+) -> dict:
+    """Log de actividad HTTP del backend con grupo + RS."""
+    _require_monitor_token(x_monitor_token)
+    items = _q_activity(["status_code >= 400"] if only_errors else [], [], limit)
+    for it in items:
+        for k in ("group_id", "company_id", "agency_id"):
+            it.pop(k, None)
     return {"total": len(items), "items": items}
 
 
@@ -1400,7 +1451,8 @@ def acknowledge_event(event_id: int, x_monitor_token: str = Header(...)) -> dict
     try:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE client_events SET is_acknowledged = 1 WHERE id = %s",
+            "UPDATE client_events SET is_acknowledged = 1, acknowledged_by = 'monitor', acknowledged_at = NOW() "
+            "WHERE id = %s",
             (event_id,),
         )
         conn.commit()
@@ -1418,7 +1470,7 @@ def acknowledge_all_events(x_monitor_token: str = Header(...)) -> dict:
     try:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE client_events SET is_acknowledged = 1 "
+            "UPDATE client_events SET is_acknowledged = 1, acknowledged_by = 'monitor', acknowledged_at = NOW() "
             "WHERE is_acknowledged = 0 AND event_type = 'error'"
         )
         conn.commit()
@@ -1469,18 +1521,28 @@ def _on_watermark_reset(cur: Any, task_id: int) -> None:
     HEALTH_ENGINE.on_watermark_reset(cur, task_id)
 
 
+# Usuarios del panel, sesiones y permisos por grupo (sección 20 de DWH_README.md)
+from panel_auth import AuthContext, AuthService, AuthSettings, group_of  # noqa: E402
+from users_postgres import create_users_router  # noqa: E402
+
+AUTH = AuthService(get_connection=get_connection, settings=AuthSettings.from_ini(_ini, ADMIN_TOKEN))
+if AUTH.s.allow_static_token and AUTH.s.static_token:
+    server_log.warning("[admin] allow_static_token = true: el token estático x-admin-token está ACTIVO "
+                       "(superadministrador; cada uso queda en panel_audit_log). Solo para emergencias/pruebas.")
+app.include_router(create_users_router(auth=AUTH))
+
 app.include_router(
     create_admin_router(
         get_connection=get_connection,
         get_secret_cipher=get_secret_cipher,
         decrypt_config_secret=decrypt_config_secret,
-        admin_token=ADMIN_TOKEN,
+        auth=AUTH,
         group_token_column_exists=group_token_column_exists,
         agency_token_column_exists=agency_token_column_exists,
         on_watermark_reset=_on_watermark_reset,
     )
 )
-app.include_router(create_health_router(engine=HEALTH_ENGINE, admin_token=ADMIN_TOKEN))
+app.include_router(create_health_router(engine=HEALTH_ENGINE, auth=AUTH))
 
 # Inventario estructural y cambios de estructura (sección 19 de DWH_README.md)
 from inventory_postgres import (  # noqa: E402
@@ -1498,13 +1560,14 @@ INVENTORY_ENGINE = InventoryEngine(
 INVENTORY_MAX_JSON_CONTAINERS = _ini.getint(
     "server", "inventory_max_json_containers",
     fallback=max(10_000, 30 * INVENTORY_ENGINE.s.max_objects_per_snapshot))
-app.include_router(create_inventory_admin_router(engine=INVENTORY_ENGINE, admin_token=ADMIN_TOKEN))
+app.include_router(create_inventory_admin_router(engine=INVENTORY_ENGINE, auth=AUTH))
 
 _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers(
     get_connection=get_connection,
     decrypt_config_secret=decrypt_config_secret,
-    admin_token=ADMIN_TOKEN,
+    auth=AUTH,
     monitor_token=MONITOR_TOKEN,
+    limits=AGENT_LIMITS,
     config_max_age_seconds=AGENT_CONFIG_MAX_AGE,
     rotation_grace_seconds=AGENT_ROTATION_GRACE,
     heartbeat_retention_days=AGENT_HEARTBEAT_RETENTION_DAYS,
@@ -1516,6 +1579,142 @@ _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers
 app.include_router(_agent_router)
 app.include_router(_agent_admin_router)
 app.include_router(_agent_monitor_router)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Equivalentes /admin de /monitor/* para el panel (sesión + permisos + alcance).
+# /monitor/* sigue igual para el monitor legado (dwh_api) con su token.
+# ─────────────────────────────────────────────────────────────────────────────
+from fastapi import APIRouter, Depends  # noqa: E402
+
+_panel_legacy = APIRouter(prefix="/admin", tags=["admin"])
+
+
+def _scope_filters(ctx: AuthContext, col_prefix: str, group_id: Optional[int], company_id: Optional[int],
+                   agency_id: Optional[int], perm: str = "view") -> Tuple[List[str], list]:
+    sc, params = ctx.scope_sql(f"{col_prefix}group_id", perm)
+    conds = [sc]
+    for col, val in (("group_id", group_id), ("company_id", company_id), ("agency_id", agency_id)):
+        if val is not None:
+            conds.append(f"{col_prefix}{col} = %s")
+            params.append(val)
+    return conds, params
+
+
+@_panel_legacy.get("/events")
+def admin_events(
+    event_type: Optional[str] = Query(None), only_unacknowledged: bool = Query(False),
+    group_id: Optional[int] = Query(None), company_id: Optional[int] = Query(None),
+    agency_id: Optional[int] = Query(None), task_id: Optional[int] = Query(None),
+    since: Optional[str] = Query(None, max_length=40), until: Optional[str] = Query(None, max_length=40),
+    limit: int = Query(200, ge=1, le=2000), ctx: AuthContext = Depends(AUTH.perm("view")),
+) -> dict:
+    """Eventos legados (client_events) limitados a los grupos del usuario."""
+    conds, params = _scope_filters(ctx, "", group_id, company_id, agency_id)
+    if event_type in ("ok", "error"):
+        conds.append("event_type = %s")
+        params.append(event_type)
+    if only_unacknowledged:
+        conds.append("is_acknowledged = 0")
+    if task_id is not None:
+        conds.append("config_id = %s")
+        params.append(str(task_id))
+    if since:
+        conds.append("created_at::timestamptz >= %s::timestamptz")
+        params.append(since)
+    if until:
+        conds.append("created_at::timestamptz <= %s::timestamptz")
+        params.append(until)
+    try:
+        items = _q_events(conds, params, limit)
+    except psycopg2.errors.InvalidDatetimeFormat:
+        raise HTTPException(status_code=422, detail="Fecha no válida.")
+    return {"total": len(items), "items": items}
+
+
+@_panel_legacy.put("/events/{event_id}/ack")
+def admin_ack_event(event_id: int, ctx: AuthContext = Depends(AUTH.perm("incident.acknowledge"))) -> dict:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        gid = group_of(cur, "event", event_id, "Evento")
+        ctx.check("incident.acknowledge", gid, "Evento")
+        cur.execute("""UPDATE client_events SET is_acknowledged = 1, acknowledged_by = %s,
+                              acknowledged_by_user_id = %s, acknowledged_at = NOW() WHERE id = %s""",
+                    (ctx.actor, ctx.user_id, event_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok", "event_id": event_id}
+
+
+@_panel_legacy.put("/events/ack-all")
+def admin_ack_all_events(group_id: Optional[int] = Query(None), company_id: Optional[int] = Query(None),
+                         agency_id: Optional[int] = Query(None),
+                         ctx: AuthContext = Depends(AUTH.perm("incident.acknowledge"))) -> dict:
+    """Reconoce los errores pendientes SOLO de los grupos donde el usuario puede reconocer."""
+    conds, params = _scope_filters(ctx, "", group_id, company_id, agency_id, "incident.acknowledge")
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""UPDATE client_events SET is_acknowledged = 1, acknowledged_by = %s, acknowledged_by_user_id = %s,
+                       acknowledged_at = NOW()
+                WHERE is_acknowledged = 0 AND event_type = 'error' AND {' AND '.join(conds)}""",
+            [ctx.actor, ctx.user_id, *params])
+        affected = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok", "acknowledged": affected}
+
+
+@_panel_legacy.get("/clients")
+def admin_clients(group_id: Optional[int] = Query(None), company_id: Optional[int] = Query(None),
+                  ctx: AuthContext = Depends(AUTH.perm("view"))) -> dict:
+    conds, params = _scope_filters(ctx, "c.", group_id, None, None)
+    if company_id is not None:
+        conds.append("c.id = %s")
+        params.append(company_id)
+    items = _q_clients(" AND ".join(conds), params)
+    for it in items:  # prefijo del token de empresa: solo con credentials.manage
+        if not ctx.can("credentials.manage", it.get("group_id")):
+            it["token_preview"] = None
+    return {"clients": items}
+
+
+@_panel_legacy.get("/activity")
+def admin_activity(
+    only_errors: bool = Query(True), group_id: Optional[int] = Query(None),
+    company_id: Optional[int] = Query(None), agency_id: Optional[int] = Query(None),
+    auth_kind: Optional[str] = Query(None, max_length=20),
+    since: Optional[str] = Query(None, max_length=40), until: Optional[str] = Query(None, max_length=40),
+    limit: int = Query(200, ge=1, le=2000), ctx: AuthContext = Depends(AUTH.perm("view")),
+) -> dict:
+    """Log HTTP; las filas sin grupo resuelto (p. ej. intentos anónimos) solo con alcance global."""
+    conds, params = _scope_filters(ctx, "", group_id, company_id, agency_id)
+    if only_errors:
+        conds.append("status_code >= 400")
+    if auth_kind:
+        conds.append("auth_kind = %s")
+        params.append(auth_kind)
+    if since:
+        conds.append("created_at::timestamptz >= %s::timestamptz")
+        params.append(since)
+    if until:
+        conds.append("created_at::timestamptz <= %s::timestamptz")
+        params.append(until)
+    try:
+        items = _q_activity(conds, params, limit)
+    except psycopg2.errors.InvalidDatetimeFormat:
+        raise HTTPException(status_code=422, detail="Fecha no válida.")
+    for it in items:  # prefijo del token legado: solo con credentials.manage
+        if not ctx.can("credentials.manage", it.get("group_id")):
+            it["token"] = None
+    return {"total": len(items), "items": items}
+
+
+app.include_router(_panel_legacy)
 
 
 @app.on_event("startup")
@@ -1656,9 +1855,17 @@ class BodySizeLimitMiddleware:
 
     async def _preauth(self, scope: Any, send: Any) -> bool:
         headers = {k: v for k, v in scope.get("headers") or []}
+        ip = (scope.get("client") or ("", 0))[0] or ""
+        wait = AGENT_LIMITS.auth_fail_ip.blocked(ip)
+        if wait:
+            await self._error(send, 429, "rate_limited",
+                              "Demasiadas credenciales de instalación inválidas desde esta dirección.")
+            return False
         err = await run_in_threadpool(_preauth_installation, headers)
         if err is None:
             return True
+        if err in ("invalid_credentials", "missing_credentials"):
+            AGENT_LIMITS.auth_fail_ip.hit(ip)
         if err == "config_db_unavailable":
             await self._error(send, 503, err, "BD de configuración no disponible.")
         elif err == "installation_revoked":
@@ -1779,7 +1986,7 @@ if CORS_ORIGINS:
         allow_origins=CORS_ORIGINS,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["content-type", "x-admin-token", "x-monitor-token"],
+        allow_headers=["content-type", "authorization", "x-admin-token", "x-monitor-token"],
         # /agent/* no se expone a navegadores (sin CORS para x-installation-*).
     )
 
@@ -1795,4 +2002,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(f"Nexus Server (PostgreSQL) iniciando en {args.host}:{args.port} ...")
     check_migrations()
-    uvicorn.run(app, host=args.host, port=args.port, h11_max_incomplete_event_size=65_536)
+    # X-Forwarded-For solo se acepta si se configura explícitamente (proxy inverso delante del
+    # backend); por defecto uvicorn lo confiaría desde 127.0.0.1 y cualquier proceso local (o el
+    # panel reenviando cabeceras del navegador) podría falsear la IP de los límites de tasa.
+    uvicorn.run(app, host=args.host, port=args.port, h11_max_incomplete_event_size=65_536,
+                proxy_headers=_ini.getboolean("server", "proxy_headers", fallback=False),
+                forwarded_allow_ips=_ini.get("server", "forwarded_allow_ips", fallback="127.0.0.1"))

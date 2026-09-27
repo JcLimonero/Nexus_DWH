@@ -5,7 +5,8 @@ import { RefreshCw } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
 import type { ActivityItem } from "@/lib/types";
 import { fmtDate, fmtNumber } from "@/lib/format";
-import { Badge, Button, Card, PageHeader, Select, Switch } from "@/components/ui/primitives";
+import { Badge, Button, Card, PageHeader, Select } from "@/components/ui/primitives";
+import { FilterBar, dateRange, useUrlFilters } from "@/components/scope-filters";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ExpandableText } from "@/components/expandable";
@@ -16,11 +17,33 @@ function statusTone(code: number) {
   return "green" as const;
 }
 
+const FILTER_KEYS = ["group_id", "company_id", "agency_id", "status", "since", "until"] as const;
+const AUTH_KINDS = [
+  { value: "installation", label: "Agente (instalación)" },
+  { value: "enroll", label: "Enrolamiento" },
+  { value: "company", label: "Token de empresa (legado)" },
+  { value: "agency", label: "Token de agencia (legado)" },
+  { value: "group", label: "Token de grupo (legado)" },
+  { value: "panel", label: "Panel (usuario)" },
+  { value: "admin", label: "Token estático" },
+];
+
 export default function ActividadPage() {
-  const [onlyErrors, setOnlyErrors] = useState(true);
+  const [f, setF, clearF] = useUrlFilters(FILTER_KEYS, { status: "errors" });
+  const [authKind, setAuthKind] = useState("");
   const [limit, setLimit] = useState("200");
   const [search, setSearch] = useState("");
-  const { data, loading, error, reload } = useApi<{ total: number; items: ActivityItem[] }>(`monitor/activity${qs({ only_errors: onlyErrors, limit })}`);
+  const { data, loading, error, reload } = useApi<{ total: number; items: ActivityItem[] }>(
+    `admin/activity${qs({
+      only_errors: f.status !== "all",
+      group_id: f.group_id,
+      company_id: f.company_id,
+      agency_id: f.agency_id,
+      auth_kind: authKind,
+      ...dateRange(f.since, f.until),
+      limit,
+    })}`,
+  );
   const term = search.trim().toLowerCase();
   const items = (data?.items ?? []).filter(
     (a) => !term || [a.endpoint, a.grupo, a.razon_social, a.client_ip, String(a.status_code)].some((v) => (v || "").toLowerCase().includes(term)),
@@ -30,13 +53,35 @@ export default function ActividadPage() {
     <>
       <PageHeader
         title="Actividad"
-        description="Log HTTP del backend (activity_log): peticiones de clientes ETL, monitor y panel."
+        description="Log HTTP del backend (activity_log) de los grupos de su alcance. Las filas sin grupo (p. ej. intentos anónimos) solo las ve un usuario con alcance global."
         actions={
           <Button variant="secondary" icon={<RefreshCw className="h-4 w-4" />} onClick={reload} loading={loading && Boolean(data)}>
             Actualizar
           </Button>
         }
       />
+      <div className="mb-3">
+        <FilterBar
+          values={f}
+          onChange={setF}
+          onClear={clearF}
+          fields={[...FILTER_KEYS]}
+          statusLabel="Estado HTTP"
+          statusOptions={[
+            { value: "errors", label: "Solo errores (≥ 400)" },
+            { value: "all", label: "Todas" },
+          ]}
+        >
+          <Select aria-label="Tipo de cliente" className="w-full sm:w-48" value={authKind} onChange={(e) => setAuthKind(e.target.value)}>
+            <option value="">Todos los clientes</option>
+            {AUTH_KINDS.map((k) => (
+              <option key={k.value} value={k.value}>
+                {k.label}
+              </option>
+            ))}
+          </Select>
+        </FilterBar>
+      </div>
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <Select aria-label="Límite" className="w-full sm:w-36" value={limit} onChange={(e) => setLimit(e.target.value)}>
           {["50", "200", "500", "1000", "2000"].map((l) => (
@@ -52,7 +97,6 @@ export default function ActividadPage() {
           placeholder="Buscar endpoint, empresa, IP, código…"
           className="h-9 w-full rounded-md border border-slate-300 px-3 text-sm shadow-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20 sm:w-72"
         />
-        <Switch checked={onlyErrors} onChange={setOnlyErrors} label="Solo errores (≥ 400)" />
         {data && <span className="text-xs text-slate-500 sm:ml-auto">{fmtNumber(items.length)} registros</span>}
       </div>
       <Card>

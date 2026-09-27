@@ -1,14 +1,16 @@
 /**
  * Proxy servidor → backend DWH.
  *
- * - Solo permite rutas /admin/* y /monitor/*.
- * - Agrega x-admin-token desde la cookie httpOnly de sesión.
- * - Para /monitor/* valida primero la sesión admin y agrega x-monitor-token
- *   desde la variable de servidor DWH_MONITOR_TOKEN (nunca llega al navegador).
+ * - Solo rutas /admin/* (el panel ya no usa /monitor/* ni el token de monitor:
+ *   usa los equivalentes /admin/events|clients|activity con permisos y alcance).
+ * - Agrega `Authorization: Bearer <sesión>` desde la cookie httpOnly.
+ * - login/logout NO pasan por aquí (route handlers propios que manejan la cookie).
+ * - CSRF: toda petición que modifica exige la cabecera x-nexus-csrf y mismo Origin
+ *   (además de la cookie SameSite=Strict).
  */
 import { NextRequest, NextResponse } from "next/server";
-import { checkAdminToken } from "@/lib/server/auth";
-import { SESSION_COOKIE, apiBaseUrl, monitorToken } from "@/lib/server/config";
+import { backendFetch, csrfProblem, forwardHeaders } from "@/lib/server/auth";
+import { SESSION_COOKIE } from "@/lib/server/config";
 
 export const dynamic = "force-dynamic";
 
@@ -18,58 +20,40 @@ function json(detail: string, status: number) {
   return NextResponse.json({ detail }, { status });
 }
 
+const BLOCKED = new Set(["admin/auth/login", "admin/auth/logout"]);
+
 async function proxy(req: NextRequest, { params }: Ctx) {
   const token = req.cookies.get(SESSION_COOKIE)?.value || "";
   if (!token) return json("Sesión no iniciada.", 401);
 
   const segments = params.path || [];
   if (
-    segments.length === 0 ||
-    !["admin", "monitor"].includes(segments[0]) ||
-    segments.some((s) => !s || s === "." || s === ".." || s.includes("/") || s.includes("\\"))
+    segments.length < 2 ||
+    segments[0] !== "admin" ||
+    segments.some((s) => !s || s === "." || s === ".." || s.includes("/") || s.includes("\\")) ||
+    BLOCKED.has(segments.join("/"))
   ) {
     return json("Ruta no permitida.", 404);
   }
+  const bad = csrfProblem(req);
+  if (bad) return json(bad, 403);
 
-  const headers: Record<string, string> = { "x-admin-token": token, accept: "application/json" };
-
-  if (segments[0] === "monitor") {
-    // El token de monitor lo pone el servidor: exigir sesión admin válida.
-    const check = await checkAdminToken(token);
-    if (check === "invalid") return json("Sesión expirada o token no válido.", 401);
-    if (check !== "ok") return json("No se pudo validar la sesión con el backend.", 502);
-    const mt = monitorToken();
-    if (!mt) return json("Falta DWH_MONITOR_TOKEN en la configuración del panel.", 503);
-    headers["x-monitor-token"] = mt;
-  }
-
+  const headers = forwardHeaders(req, token);
   let body: string | undefined;
   if (req.method !== "GET" && req.method !== "HEAD") {
     body = await req.text();
     if (body) headers["content-type"] = "application/json";
   }
-
-  let base: string;
+  const path = `/${segments.map(encodeURIComponent).join("/")}${req.nextUrl.search}`;
   try {
-    base = apiBaseUrl();
-  } catch (e) {
-    return json((e as Error).message, 500);
-  }
-  const url = `${base}/${segments.map(encodeURIComponent).join("/")}${req.nextUrl.search}`;
-
-  try {
-    const res = await fetch(url, {
-      method: req.method,
-      headers,
-      body,
-      cache: "no-store",
-      redirect: "manual",
-      signal: AbortSignal.timeout(30_000),
-    });
+    const res = await backendFetch(path, { method: req.method, headers, body, timeoutMs: 30_000 });
     const text = await res.text();
     return new NextResponse(text, {
       status: res.status,
-      headers: { "content-type": res.headers.get("content-type") || "application/json" },
+      headers: {
+        "content-type": res.headers.get("content-type") || "application/json",
+        "cache-control": "no-store",
+      },
     });
   } catch {
     return json("No se pudo contactar al backend DWH.", 502);

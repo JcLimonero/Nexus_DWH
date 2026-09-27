@@ -83,9 +83,10 @@ export function fmtSecs(total: number | null | undefined): string {
 }
 
 /** Contador de incidencias abiertas sin reconocer (sondeo cada 30 s). */
-export function useIncidentBadge(intervalMs = 30_000) {
+export function useIncidentBadge(enabled = true, intervalMs = 30_000) {
   const [badge, setBadge] = useState<IncidentBadge | null>(null);
   useEffect(() => {
+    if (!enabled) return;
     let alive = true;
     const load = async () => {
       try {
@@ -106,7 +107,7 @@ export function useIncidentBadge(intervalMs = 30_000) {
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("dwh:incidents-changed", onFocus);
     };
-  }, [intervalMs]);
+  }, [enabled, intervalMs]);
   return badge;
 }
 

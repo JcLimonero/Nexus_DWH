@@ -8,8 +8,11 @@ import { fmtAgo, fmtDateTz, fmtNumber, secondsSince, tzLabel } from "@/lib/forma
 import { Badge, Button, Card, IconButton, PageHeader, Select } from "@/components/ui/primitives";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
-import { useRefData } from "@/components/ref-data";
 import { useActions } from "@/components/use-actions";
+import { useSession } from "@/components/session";
+import { FilterBar, useUrlFilters } from "@/components/scope-filters";
+
+const FILTER_KEYS = ["group_id", "company_id", "agency_id", "status"] as const;
 
 const SCOPE_LABEL: Record<string, string> = { group: "Grupo", company: "Empresa", agency: "Agencia" };
 
@@ -30,18 +33,23 @@ function LastSeen({ value }: { value: string | null }) {
 }
 
 export default function InstalacionesPage() {
-  const [groupId, setGroupId] = useState("");
-  const [status, setStatus] = useState("");
+  const [f, setF, clearF] = useUrlFilters(FILTER_KEYS);
+  const groupId = f.group_id;
+  const { can } = useSession();
   const { data, loading, error, reload } = useApi<ListResponse<Installation>>(
-    `admin/installations${qs({ group_id: groupId, status })}`,
+    `admin/installations${qs({ group_id: groupId, company_id: f.company_id, agency_id: f.agency_id, status: f.status })}`,
   );
   const legacy = useApi<ListResponse<LegacyClient>>("admin/legacy-clients");
-  const { groups } = useRefData();
   const { run, busy } = useActions(() => {
     void reload();
   });
   const items = data?.items ?? [];
-  const legacyItems = (legacy.data?.items ?? []).filter((l) => !groupId || String(l.group_id) === groupId);
+  const legacyItems = (legacy.data?.items ?? []).filter(
+    (l) =>
+      (!groupId || String(l.group_id) === groupId) &&
+      (!f.company_id || String(l.company_id) === f.company_id) &&
+      (!f.agency_id || String(l.agency_id) === f.agency_id),
+  );
 
   return (
     <>
@@ -64,19 +72,16 @@ export default function InstalacionesPage() {
       />
 
       <div className="mb-4 flex flex-wrap items-center gap-3">
-        <Select aria-label="Filtrar por grupo" className="w-full sm:w-52" value={groupId} onChange={(e) => setGroupId(e.target.value)}>
-          <option value="">Todos los grupos</option>
-          {groups.map((g) => (
-            <option key={g.id} value={g.id}>
-              {g.name}
-            </option>
-          ))}
-        </Select>
-        <Select aria-label="Estado" className="w-full sm:w-40" value={status} onChange={(e) => setStatus(e.target.value)}>
-          <option value="">Todos los estados</option>
-          <option value="active">Activas</option>
-          <option value="revoked">Revocadas</option>
-        </Select>
+        <FilterBar
+          values={f}
+          onChange={setF}
+          onClear={clearF}
+          fields={[...FILTER_KEYS]}
+          statusOptions={[
+            { value: "active", label: "Activas" },
+            { value: "revoked", label: "Revocadas" },
+          ]}
+        />
         {data && <span className="text-xs text-slate-500 sm:ml-auto">{fmtNumber(items.length)} instalación(es)</span>}
       </div>
 
@@ -148,7 +153,10 @@ export default function InstalacionesPage() {
                       {i.failures_24h ? <Badge tone="red">{i.failures_24h}</Badge> : <span className="text-slate-400">0</span>}
                     </Td>
                     <Td className="text-right">
-                      {i.status === "active" && (
+                      {i.status === "active" && !can("credentials.manage", i.group_id) && (
+                        <span className="text-xs text-slate-400">Solo lectura</span>
+                      )}
+                      {i.status === "active" && can("credentials.manage", i.group_id) && (
                         <div className="flex justify-end gap-0.5">
                           <IconButton
                             label="Rotar credencial"

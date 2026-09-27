@@ -8,9 +8,12 @@ Se monta desde main_postgres.py con:
 
     app.include_router(create_admin_router(...))
 
-Autenticación: header ``x-admin-token`` comparado (tiempo constante) contra
-``[admin] token`` de config.ini o la variable ``NEXUS_ADMIN_TOKEN``.
-Si no hay token configurado, todos los endpoints /admin/* responden 503.
+Autenticación y permisos: panel_auth.AuthService (sesión de usuario del panel o,
+solo si [admin] allow_static_token = true, el token estático x-admin-token).
+Cada ruta declara su permiso (view, config.manage, credentials.manage) y el
+aislamiento por grupo: fuera del alcance → 404; sin el permiso de la acción → 403.
+Los datos de conexión (host/base/usuario) y los tokens de enrolamiento solo se
+devuelven con credentials.manage sobre el grupo.
 
 Reglas de seguridad:
   * Campos sensibles (source_host/database/username/password/dsn y
@@ -22,7 +25,6 @@ Reglas de seguridad:
   * Solo SQL parametrizado; los nombres de columnas salen de listas blancas.
 """
 
-import hmac
 import re
 import secrets
 from contextlib import contextmanager
@@ -31,8 +33,10 @@ from typing import Annotated, Any, Callable, Dict, Iterator, List, Literal, Opti
 import psycopg2
 import psycopg2.errors
 import psycopg2.extras
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+from panel_auth import AuthContext, AuthService, err, group_of
 
 SOURCE_TYPES = ("sqlserver", "mysql", "postgresql", "pervasive", "firebird")
 SourceType = Literal["sqlserver", "mysql", "postgresql", "pervasive", "firebird"]
@@ -226,6 +230,8 @@ class TaskUpdate(_Base):
 TASK_NULLABLE_FIELDS = ("expected_duration_seconds", "delay_tolerance_seconds")
 
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Router
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,27 +240,19 @@ def create_admin_router(
     get_connection: Callable[[], Any],
     get_secret_cipher: Callable[[], Any],
     decrypt_config_secret: Callable[[Optional[str]], str],
-    admin_token: str,
+    auth: AuthService,
     group_token_column_exists: Callable[[], bool],
     agency_token_column_exists: Callable[[], bool],
     on_watermark_reset: Optional[Callable[[Any, int], None]] = None,
 ) -> APIRouter:
     """Construye el router /admin usando los helpers de main_postgres."""
 
-    configured_token = (admin_token or "").strip()
+    # ── Permisos (sección 20 de DWH_README.md) ─────────────────────────────
+    VIEW = auth.perm("view")
+    CONFIG = auth.perm("config.manage")
+    CREDS = auth.perm("credentials.manage")
 
-    # ── Auth ────────────────────────────────────────────────────────────────
-    def require_admin(x_admin_token: Optional[str] = Header(None, alias="x-admin-token")) -> None:
-        if not configured_token:
-            raise HTTPException(
-                status_code=503,
-                detail="Admin no configurado: agrega [admin] token=... en config.ini o NEXUS_ADMIN_TOKEN.",
-            )
-        provided = (x_admin_token or "").encode("utf-8")
-        if not provided or not hmac.compare_digest(provided, configured_token.encode("utf-8")):
-            raise HTTPException(status_code=401, detail="Token de administrador no válido.")
-
-    router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+    router = APIRouter(prefix="/admin", tags=["admin"])
 
     # ── BD ──────────────────────────────────────────────────────────────────
     @contextmanager
@@ -306,11 +304,6 @@ def create_admin_router(
             row = cur.fetchone()
             return dict(row) if row else None
 
-    def exists(cur: Any, table: str, row_id: int) -> bool:
-        # `table` siempre viene de literales internos, nunca del usuario.
-        cur.execute(f"SELECT 1 FROM {table} WHERE id = %s", (row_id,))
-        return cur.fetchone() is not None
-
     def count(cur: Any, sql: str, params: Tuple) -> int:
         cur.execute(sql, params)
         row = cur.fetchone()
@@ -318,6 +311,11 @@ def create_admin_router(
 
     def new_token() -> str:
         return secrets.token_urlsafe(32)
+
+    def require_global(ctx: AuthContext, perm: str) -> None:
+        if not ctx.has_global(perm):
+            raise err(403, "global_scope_required",
+                      "Esta acción requiere el permiso con alcance sobre TODOS los grupos.", permission=perm)
 
     # ── Cifrado ─────────────────────────────────────────────────────────────
     def encrypt_value(value: Optional[str], field: str) -> str:
@@ -339,8 +337,13 @@ def create_admin_router(
             return value
         return "ENC:" + cipher.encrypt(value.encode("utf-8")).decode("utf-8")
 
-    def reveal(row: Dict[str, Any], fields: Tuple[str, ...], password_field: str) -> Dict[str, Any]:
-        """Descifra campos sensibles no-password y oculta la contraseña."""
+    def reveal(row: Dict[str, Any], fields: Tuple[str, ...], password_field: str,
+               allowed: bool) -> Dict[str, Any]:
+        """
+        Descifra campos sensibles no-password y oculta la contraseña. Sin
+        credentials.manage sobre el grupo los datos de conexión NO se devuelven
+        (null + secrets_hidden) y los tokens de enrolamiento tampoco.
+        """
         encrypted: List[str] = []
         errors: List[str] = []
         for f in fields:
@@ -351,6 +354,9 @@ def create_admin_router(
                 row["has_password"] = bool(raw)
                 row.pop(f, None)
                 continue
+            if not allowed:
+                row[f] = None
+                continue
             try:
                 row[f] = decrypt_config_secret(raw or "")
             except Exception:
@@ -358,6 +364,16 @@ def create_admin_router(
                 errors.append(f)
         row["encrypted_fields"] = encrypted
         row["decrypt_errors"] = errors
+        row["secrets_hidden"] = not allowed
+        return row
+
+    def hide_token(row: Dict[str, Any], column: str, allowed: bool) -> Dict[str, Any]:
+        row["has_token"] = bool(row.get(column))
+        if not allowed:
+            row[column] = None
+            row["token_hidden"] = True
+        else:
+            row["token_hidden"] = False
         return row
 
     # ── Update genérico ─────────────────────────────────────────────────────
@@ -371,12 +387,19 @@ def create_admin_router(
     def not_found(what: str) -> HTTPException:
         return HTTPException(status_code=404, detail=f"{what} no encontrado.")
 
+    def check(cur: Any, ctx: AuthContext, perm: str, kind: str, row_id: Any, what: str) -> Optional[int]:
+        """Resuelve el grupo del recurso (404 si no existe o está fuera del alcance) y exige `perm`."""
+        gid = group_of(cur, kind, row_id, what)
+        ctx.check(perm, gid, what)
+        return gid
+
     # ── Info ────────────────────────────────────────────────────────────────
     @router.get("/whoami")
-    def whoami() -> dict:
+    def whoami(ctx: AuthContext = Depends(auth.authenticated())) -> dict:
         return {
             "status": "ok",
-            "role": "admin",
+            "role": "superadmin" if ctx.is_superadmin else "user",
+            "username": ctx.username,
             "encryption_enabled": get_secret_cipher() is not None,
             "group_token_supported": group_token_column_exists(),
             "agency_token_supported": agency_token_column_exists(),
@@ -384,27 +407,33 @@ def create_admin_router(
         }
 
     @router.get("/stats")
-    def stats() -> dict:
+    def stats(ctx: AuthContext = Depends(VIEW)) -> dict:
+        scope, params = ctx.scope_sql("g.id")
         row = fetch_one(
-            """
+            f"""
+            WITH gs AS (SELECT g.id, g.is_enabled FROM client_group g WHERE {scope}),
+                 cs AS (SELECT c.id, c.is_enabled FROM company c WHERE c.group_id IN (SELECT id FROM gs)),
+                 ags AS (SELECT a.id, a.is_enabled FROM agency a WHERE a.company_id IN (SELECT id FROM cs))
             SELECT
-              (SELECT COUNT(*) FROM client_group)                       AS groups,
-              (SELECT COUNT(*) FROM client_group WHERE is_enabled)      AS groups_enabled,
-              (SELECT COUNT(*) FROM company)                            AS companies,
-              (SELECT COUNT(*) FROM company WHERE is_enabled)           AS companies_enabled,
-              (SELECT COUNT(*) FROM agency)                             AS agencies,
-              (SELECT COUNT(*) FROM agency WHERE is_enabled)            AS agencies_enabled,
-              (SELECT COUNT(*) FROM object_catalog)                     AS objects,
-              (SELECT COUNT(*) FROM agency_task)                        AS tasks,
-              (SELECT COUNT(*) FROM agency_task WHERE is_active)        AS tasks_active,
-              (SELECT COUNT(*) FROM client_events
-                 WHERE event_type = 'error' AND is_acknowledged = 0)    AS pending_errors,
-              (SELECT COUNT(*) FROM client_events
-                 WHERE created_at >= NOW() - INTERVAL '24 hours')       AS events_24h,
-              (SELECT COUNT(*) FROM client_events
-                 WHERE event_type = 'error'
-                   AND created_at >= NOW() - INTERVAL '24 hours')       AS errors_24h
-            """
+              (SELECT COUNT(*) FROM gs)                                 AS groups,
+              (SELECT COUNT(*) FROM gs WHERE is_enabled)                AS groups_enabled,
+              (SELECT COUNT(*) FROM cs)                                 AS companies,
+              (SELECT COUNT(*) FROM cs WHERE is_enabled)                AS companies_enabled,
+              (SELECT COUNT(*) FROM ags)                                AS agencies,
+              (SELECT COUNT(*) FROM ags WHERE is_enabled)               AS agencies_enabled,
+              (SELECT COUNT(*) FROM object_catalog o WHERE o.company_id IN (SELECT id FROM cs)) AS objects,
+              (SELECT COUNT(*) FROM agency_task t WHERE t.agency_id IN (SELECT id FROM ags))    AS tasks,
+              (SELECT COUNT(*) FROM agency_task t WHERE t.agency_id IN (SELECT id FROM ags)
+                  AND t.is_active)                                      AS tasks_active,
+              (SELECT COUNT(*) FROM client_events e WHERE e.group_id IN (SELECT id FROM gs)
+                 AND e.event_type = 'error' AND e.is_acknowledged = 0)  AS pending_errors,
+              (SELECT COUNT(*) FROM client_events e WHERE e.group_id IN (SELECT id FROM gs)
+                 AND e.created_at >= NOW() - INTERVAL '24 hours')       AS events_24h,
+              (SELECT COUNT(*) FROM client_events e WHERE e.group_id IN (SELECT id FROM gs)
+                 AND e.event_type = 'error'
+                 AND e.created_at >= NOW() - INTERVAL '24 hours')       AS errors_24h
+            """,
+            tuple(params),
         )
         return {k: int(v or 0) for k, v in (row or {}).items()}
 
@@ -422,26 +451,34 @@ def create_admin_router(
             FROM client_group g
         """
 
-    def group_out(row: Dict[str, Any]) -> Dict[str, Any]:
-        return reveal(row, GROUP_SECRET_FIELDS, "warehouse_password")
+    def group_out(row: Dict[str, Any], ctx: AuthContext) -> Dict[str, Any]:
+        allowed = ctx.can("credentials.manage", row["id"])
+        hide_token(row, "group_token", allowed)
+        return reveal(row, GROUP_SECRET_FIELDS, "warehouse_password", allowed)
 
-    def get_group_or_404(group_id: int) -> Dict[str, Any]:
+    def get_group_or_404(group_id: int, ctx: AuthContext) -> Dict[str, Any]:
         row = fetch_one(group_select() + " WHERE g.id = %s", (group_id,))
         if not row:
             raise not_found("Grupo")
-        return group_out(row)
+        ctx.check("view", row["id"], "Grupo")
+        return group_out(row, ctx)
 
     @router.get("/groups")
-    def list_groups() -> dict:
-        rows = fetch_all(group_select() + " ORDER BY g.name")
-        return {"items": [group_out(r) for r in rows]}
+    def list_groups(ctx: AuthContext = Depends(VIEW)) -> dict:
+        scope, params = ctx.scope_sql("g.id")
+        rows = fetch_all(group_select() + f" WHERE {scope} ORDER BY g.name", tuple(params))
+        return {"items": [group_out(r, ctx) for r in rows]}
 
     @router.get("/groups/{group_id}")
-    def get_group(group_id: int) -> dict:
-        return get_group_or_404(group_id)
+    def get_group(group_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
+        return get_group_or_404(group_id, ctx)
 
     @router.post("/groups", status_code=201)
-    def create_group(body: GroupCreate) -> dict:
+    def create_group(body: GroupCreate, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        # Un grupo nuevo no está en el alcance de nadie con alcance por grupo: solo global.
+        require_global(ctx, "config.manage")
+        if any(getattr(body, f) for f in GROUP_SECRET_FIELDS):
+            require_global(ctx, "credentials.manage")
         values: Dict[str, Any] = {
             "name": body.name,
             "warehouse_host": encrypt_value(body.warehouse_host, "warehouse_host"),
@@ -458,13 +495,15 @@ def create_admin_router(
         with tx() as cur:
             cur.execute(f"INSERT INTO client_group ({cols}) VALUES ({ph}) RETURNING id", tuple(values.values()))
             new_id = cur.fetchone()["id"]
-        return get_group_or_404(new_id)
+        ctx.audit_group = new_id
+        return get_group_or_404(new_id, ctx)
 
     @router.put("/groups/{group_id}")
-    def update_group(group_id: int, body: GroupUpdate) -> dict:
+    def update_group(group_id: int, body: GroupUpdate, ctx: AuthContext = Depends(VIEW)) -> dict:
         data = body.model_dump(exclude_unset=True)
         clear_pw = data.pop("clear_password", False)
         values: Dict[str, Any] = {}
+        touches_secrets = clear_pw
         for k, v in data.items():
             if v is None:
                 continue
@@ -472,23 +511,28 @@ def create_admin_router(
                 if v == "":
                     continue
                 values[k] = encrypt_value(v, k)
-            elif k in GROUP_SECRET_FIELDS:
-                values[k] = encrypt_value(v, k)
+                touches_secrets = True
+            elif k in GROUP_SECRET_FIELDS or k == "warehouse_port":
+                values[k] = encrypt_value(v, k) if k in GROUP_SECRET_FIELDS else v
+                touches_secrets = True
             else:
                 values[k] = v
         if clear_pw and "warehouse_password" not in values:
             values["warehouse_password"] = ""
         with tx() as cur:
-            if not exists(cur, "client_group", group_id):
-                raise not_found("Grupo")
+            check(cur, ctx, "view", "group", group_id, "Grupo")
+            if any(k not in GROUP_SECRET_FIELDS and k != "warehouse_port" for k in values):
+                ctx.check("config.manage", group_id, "Grupo")
+            if touches_secrets:
+                ctx.check("credentials.manage", group_id, "Grupo")
             apply_update(cur, "client_group", group_id, values)
-        return get_group_or_404(group_id)
+        return get_group_or_404(group_id, ctx)
 
     @router.delete("/groups/{group_id}")
-    def delete_group(group_id: int) -> dict:
+    def delete_group(group_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
         with tx() as cur:
-            if not exists(cur, "client_group", group_id):
-                raise not_found("Grupo")
+            check(cur, ctx, "view", "group", group_id, "Grupo")
+            require_global(ctx, "config.manage")
             n = count(cur, "SELECT COUNT(*) AS n FROM company WHERE group_id = %s", (group_id,))
             if n:
                 raise HTTPException(
@@ -499,24 +543,28 @@ def create_admin_router(
         return {"status": "ok", "deleted": group_id}
 
     @router.post("/groups/{group_id}/enable")
-    def enable_group(group_id: int) -> dict:
-        return _set_flag("client_group", group_id, "is_enabled", True, "Grupo", get_group_or_404)
+    def enable_group(group_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "group", "client_group", group_id, "is_enabled", True, "Grupo",
+                         get_group_or_404)
 
     @router.post("/groups/{group_id}/disable")
-    def disable_group(group_id: int) -> dict:
-        return _set_flag("client_group", group_id, "is_enabled", False, "Grupo", get_group_or_404)
+    def disable_group(group_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "group", "client_group", group_id, "is_enabled", False, "Grupo",
+                         get_group_or_404)
 
     @router.post("/groups/{group_id}/regenerate-token")
-    def regenerate_group_token(group_id: int) -> dict:
+    def regenerate_group_token(group_id: int, ctx: AuthContext = Depends(CREDS)) -> dict:
         if not group_token_column_exists():
             raise HTTPException(status_code=503, detail="La BD no tiene la columna client_group.group_token.")
-        return _set_token("client_group", "group_token", group_id, new_token(), "Grupo", get_group_or_404)
+        return _set_flag(ctx, "credentials.manage", "group", "client_group", group_id, "group_token", new_token(),
+                         "Grupo", get_group_or_404)
 
     @router.delete("/groups/{group_id}/token")
-    def revoke_group_token(group_id: int) -> dict:
+    def revoke_group_token(group_id: int, ctx: AuthContext = Depends(CREDS)) -> dict:
         if not group_token_column_exists():
             raise HTTPException(status_code=503, detail="La BD no tiene la columna client_group.group_token.")
-        return _set_token("client_group", "group_token", group_id, None, "Grupo", get_group_or_404)
+        return _set_flag(ctx, "credentials.manage", "group", "client_group", group_id, "group_token", None,
+                         "Grupo", get_group_or_404)
 
     # ════════════════════════════════════════════════════════════════════════
     # EMPRESAS (company)
@@ -533,30 +581,37 @@ def create_admin_router(
         FROM company c
         JOIN client_group g ON g.id = c.group_id
     """
+    # Campos de conexión al origen (credentials.manage); el resto es configuración.
+    COMPANY_CRED_FIELDS = set(COMPANY_SECRET_FIELDS) | {"source_port", "source_type"}
 
-    def company_out(row: Dict[str, Any]) -> Dict[str, Any]:
-        return reveal(row, COMPANY_SECRET_FIELDS, "source_password")
+    def company_out(row: Dict[str, Any], ctx: AuthContext) -> Dict[str, Any]:
+        allowed = ctx.can("credentials.manage", row["group_id"])
+        hide_token(row, "company_token", allowed)
+        return reveal(row, COMPANY_SECRET_FIELDS, "source_password", allowed)
 
-    def get_company_or_404(company_id: int) -> Dict[str, Any]:
+    def get_company_or_404(company_id: int, ctx: AuthContext) -> Dict[str, Any]:
         row = fetch_one(COMPANY_SELECT + " WHERE c.id = %s", (company_id,))
         if not row:
             raise not_found("Empresa")
-        return company_out(row)
+        ctx.check("view", row["group_id"], "Empresa")
+        return company_out(row, ctx)
 
     @router.get("/companies")
-    def list_companies(group_id: Optional[int] = Query(None)) -> dict:
+    def list_companies(group_id: Optional[int] = Query(None), ctx: AuthContext = Depends(VIEW)) -> dict:
+        scope, params = ctx.scope_sql("c.group_id")
+        conds = [scope]
         if group_id is not None:
-            rows = fetch_all(COMPANY_SELECT + " WHERE c.group_id = %s ORDER BY g.name, c.name", (group_id,))
-        else:
-            rows = fetch_all(COMPANY_SELECT + " ORDER BY g.name, c.name")
-        return {"items": [company_out(r) for r in rows]}
+            conds.append("c.group_id = %s")
+            params.append(group_id)
+        rows = fetch_all(COMPANY_SELECT + f" WHERE {' AND '.join(conds)} ORDER BY g.name, c.name", tuple(params))
+        return {"items": [company_out(r, ctx) for r in rows]}
 
     @router.get("/companies/{company_id}")
-    def get_company(company_id: int) -> dict:
-        return get_company_or_404(company_id)
+    def get_company(company_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
+        return get_company_or_404(company_id, ctx)
 
     @router.post("/companies", status_code=201)
-    def create_company(body: CompanyCreate) -> dict:
+    def create_company(body: CompanyCreate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         values: Dict[str, Any] = {
             "group_id": body.group_id,
             "name": body.name,
@@ -572,14 +627,18 @@ def create_admin_router(
         cols = ", ".join(values)
         ph = ", ".join(["%s"] * len(values))
         with tx() as cur:
-            if not exists(cur, "client_group", body.group_id):
+            cur.execute("SELECT 1 FROM client_group WHERE id = %s", (body.group_id,))
+            if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Grupo no encontrado.")
+            ctx.check("config.manage", body.group_id, "Grupo")
+            if any(getattr(body, f) for f in COMPANY_SECRET_FIELDS):
+                ctx.check("credentials.manage", body.group_id, "Grupo")
             cur.execute(f"INSERT INTO company ({cols}) VALUES ({ph}) RETURNING id", tuple(values.values()))
             new_id = cur.fetchone()["id"]
-        return get_company_or_404(new_id)
+        return get_company_or_404(new_id, ctx)
 
     @router.put("/companies/{company_id}")
-    def update_company(company_id: int, body: CompanyUpdate) -> dict:
+    def update_company(company_id: int, body: CompanyUpdate, ctx: AuthContext = Depends(VIEW)) -> dict:
         data = body.model_dump(exclude_unset=True)
         clear_pw = data.pop("clear_password", False)
         values: Dict[str, Any] = {}
@@ -597,18 +656,25 @@ def create_admin_router(
         if clear_pw and "source_password" not in values:
             values["source_password"] = ""
         with tx() as cur:
-            if not exists(cur, "company", company_id):
-                raise not_found("Empresa")
-            if "group_id" in values and not exists(cur, "client_group", values["group_id"]):
-                raise HTTPException(status_code=404, detail="Grupo no encontrado.")
+            gid = check(cur, ctx, "view", "company", company_id, "Empresa")
+            if any(k not in COMPANY_CRED_FIELDS for k in values):
+                ctx.check("config.manage", gid, "Empresa")
+            if any(k in COMPANY_CRED_FIELDS for k in values):
+                ctx.check("credentials.manage", gid, "Empresa")
+            if "group_id" in values and values["group_id"] != gid:
+                # Mover de grupo: configuración (y credenciales) en AMBOS grupos.
+                cur.execute("SELECT 1 FROM client_group WHERE id = %s", (values["group_id"],))
+                if not cur.fetchone():
+                    raise HTTPException(status_code=404, detail="Grupo no encontrado.")
+                ctx.check("config.manage", values["group_id"], "Grupo")
+                ctx.check("credentials.manage", [gid, values["group_id"]], "Grupo")
             apply_update(cur, "company", company_id, values)
-        return get_company_or_404(company_id)
+        return get_company_or_404(company_id, ctx)
 
     @router.delete("/companies/{company_id}")
-    def delete_company(company_id: int) -> dict:
+    def delete_company(company_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
         with tx() as cur:
-            if not exists(cur, "company", company_id):
-                raise not_found("Empresa")
+            check(cur, ctx, "config.manage", "company", company_id, "Empresa")
             n_ag = count(cur, "SELECT COUNT(*) AS n FROM agency WHERE company_id = %s", (company_id,))
             n_obj = count(cur, "SELECT COUNT(*) AS n FROM object_catalog WHERE company_id = %s", (company_id,))
             if n_ag or n_obj:
@@ -623,16 +689,19 @@ def create_admin_router(
         return {"status": "ok", "deleted": company_id}
 
     @router.post("/companies/{company_id}/enable")
-    def enable_company(company_id: int) -> dict:
-        return _set_flag("company", company_id, "is_enabled", True, "Empresa", get_company_or_404)
+    def enable_company(company_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "company", "company", company_id, "is_enabled", True, "Empresa",
+                         get_company_or_404)
 
     @router.post("/companies/{company_id}/disable")
-    def disable_company(company_id: int) -> dict:
-        return _set_flag("company", company_id, "is_enabled", False, "Empresa", get_company_or_404)
+    def disable_company(company_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "company", "company", company_id, "is_enabled", False, "Empresa",
+                         get_company_or_404)
 
     @router.post("/companies/{company_id}/regenerate-token")
-    def regenerate_company_token(company_id: int) -> dict:
-        return _set_token("company", "company_token", company_id, new_token(), "Empresa", get_company_or_404)
+    def regenerate_company_token(company_id: int, ctx: AuthContext = Depends(CREDS)) -> dict:
+        return _set_flag(ctx, "credentials.manage", "company", "company", company_id, "company_token", new_token(),
+                         "Empresa", get_company_or_404)
 
     # ════════════════════════════════════════════════════════════════════════
     # AGENCIAS
@@ -650,35 +719,40 @@ def create_admin_router(
             JOIN client_group g ON g.id = c.group_id
         """
 
-    def get_agency_or_404(agency_id: int) -> Dict[str, Any]:
+    def agency_out(row: Dict[str, Any], ctx: AuthContext) -> Dict[str, Any]:
+        return hide_token(row, "agency_token", ctx.can("credentials.manage", row["group_id"]))
+
+    def get_agency_or_404(agency_id: int, ctx: AuthContext) -> Dict[str, Any]:
         row = fetch_one(agency_select() + " WHERE a.id = %s", (agency_id,))
         if not row:
             raise not_found("Agencia")
-        return row
+        ctx.check("view", row["group_id"], "Agencia")
+        return agency_out(row, ctx)
 
     @router.get("/agencies")
     def list_agencies(
         company_id: Optional[int] = Query(None),
         group_id: Optional[int] = Query(None),
+        ctx: AuthContext = Depends(VIEW),
     ) -> dict:
-        conds: List[str] = []
-        params: List[Any] = []
+        scope, params = ctx.scope_sql("c.group_id")
+        conds: List[str] = [scope]
         if company_id is not None:
             conds.append("a.company_id = %s")
             params.append(company_id)
         if group_id is not None:
             conds.append("c.group_id = %s")
             params.append(group_id)
-        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        where = " WHERE " + " AND ".join(conds)
         rows = fetch_all(agency_select() + where + " ORDER BY g.name, c.name, a.name", tuple(params))
-        return {"items": rows}
+        return {"items": [agency_out(r, ctx) for r in rows]}
 
     @router.get("/agencies/{agency_id}")
-    def get_agency(agency_id: int) -> dict:
-        return get_agency_or_404(agency_id)
+    def get_agency(agency_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
+        return get_agency_or_404(agency_id, ctx)
 
     @router.post("/agencies", status_code=201)
-    def create_agency(body: AgencyCreate) -> dict:
+    def create_agency(body: AgencyCreate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         values: Dict[str, Any] = {
             "company_id": body.company_id,
             "name": body.name,
@@ -689,23 +763,20 @@ def create_admin_router(
         cols = ", ".join(values)
         ph = ", ".join(["%s"] * len(values))
         with tx() as cur:
-            if not exists(cur, "company", body.company_id):
-                raise HTTPException(status_code=404, detail="Empresa no encontrada.")
+            check(cur, ctx, "config.manage", "company", body.company_id, "Empresa")
             cur.execute(f"INSERT INTO agency ({cols}) VALUES ({ph}) RETURNING id", tuple(values.values()))
             new_id = cur.fetchone()["id"]
-        return get_agency_or_404(new_id)
+        return get_agency_or_404(new_id, ctx)
 
     @router.put("/agencies/{agency_id}")
-    def update_agency(agency_id: int, body: AgencyUpdate) -> dict:
+    def update_agency(agency_id: int, body: AgencyUpdate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         values = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
         with tx() as cur:
+            check(cur, ctx, "config.manage", "agency", agency_id, "Agencia")
             cur.execute("SELECT company_id FROM agency WHERE id = %s", (agency_id,))
             current = cur.fetchone()
-            if not current:
-                raise not_found("Agencia")
             if "company_id" in values and values["company_id"] != current["company_id"]:
-                if not exists(cur, "company", values["company_id"]):
-                    raise HTTPException(status_code=404, detail="Empresa no encontrada.")
+                check(cur, ctx, "config.manage", "company", values["company_id"], "Empresa")
                 n = count(cur, "SELECT COUNT(*) AS n FROM agency_task WHERE agency_id = %s", (agency_id,))
                 if n:
                     raise HTTPException(
@@ -713,13 +784,12 @@ def create_admin_router(
                         detail=f"No se puede cambiar de empresa: la agencia tiene {n} tarea(s) ligadas al catálogo de su empresa actual.",
                     )
             apply_update(cur, "agency", agency_id, values)
-        return get_agency_or_404(agency_id)
+        return get_agency_or_404(agency_id, ctx)
 
     @router.delete("/agencies/{agency_id}")
-    def delete_agency(agency_id: int) -> dict:
+    def delete_agency(agency_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
         with tx() as cur:
-            if not exists(cur, "agency", agency_id):
-                raise not_found("Agencia")
+            check(cur, ctx, "config.manage", "agency", agency_id, "Agencia")
             n = count(cur, "SELECT COUNT(*) AS n FROM agency_task WHERE agency_id = %s", (agency_id,))
             if n:
                 raise HTTPException(
@@ -730,24 +800,28 @@ def create_admin_router(
         return {"status": "ok", "deleted": agency_id}
 
     @router.post("/agencies/{agency_id}/enable")
-    def enable_agency(agency_id: int) -> dict:
-        return _set_flag("agency", agency_id, "is_enabled", True, "Agencia", get_agency_or_404)
+    def enable_agency(agency_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "agency", "agency", agency_id, "is_enabled", True, "Agencia",
+                         get_agency_or_404)
 
     @router.post("/agencies/{agency_id}/disable")
-    def disable_agency(agency_id: int) -> dict:
-        return _set_flag("agency", agency_id, "is_enabled", False, "Agencia", get_agency_or_404)
+    def disable_agency(agency_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "agency", "agency", agency_id, "is_enabled", False, "Agencia",
+                         get_agency_or_404)
 
     @router.post("/agencies/{agency_id}/regenerate-token")
-    def regenerate_agency_token(agency_id: int) -> dict:
+    def regenerate_agency_token(agency_id: int, ctx: AuthContext = Depends(CREDS)) -> dict:
         if not agency_token_column_exists():
             raise HTTPException(status_code=503, detail="La BD no tiene la columna agency.agency_token.")
-        return _set_token("agency", "agency_token", agency_id, new_token(), "Agencia", get_agency_or_404)
+        return _set_flag(ctx, "credentials.manage", "agency", "agency", agency_id, "agency_token", new_token(),
+                         "Agencia", get_agency_or_404)
 
     @router.delete("/agencies/{agency_id}/token")
-    def revoke_agency_token(agency_id: int) -> dict:
+    def revoke_agency_token(agency_id: int, ctx: AuthContext = Depends(CREDS)) -> dict:
         if not agency_token_column_exists():
             raise HTTPException(status_code=503, detail="La BD no tiene la columna agency.agency_token.")
-        return _set_token("agency", "agency_token", agency_id, None, "Agencia", get_agency_or_404)
+        return _set_flag(ctx, "credentials.manage", "agency", "agency", agency_id, "agency_token", None,
+                         "Agencia", get_agency_or_404)
 
     # ════════════════════════════════════════════════════════════════════════
     # CATÁLOGO DE OBJETOS
@@ -764,47 +838,48 @@ def create_admin_router(
         JOIN client_group g ON g.id = c.group_id
     """
 
-    def get_object_or_404(object_id: int) -> Dict[str, Any]:
+    def get_object_or_404(object_id: int, ctx: AuthContext) -> Dict[str, Any]:
         row = fetch_one(OBJECT_SELECT + " WHERE o.id = %s", (object_id,))
         if not row:
             raise not_found("Objeto")
+        ctx.check("view", row["group_id"], "Objeto")
         return row
 
     @router.get("/objects")
     def list_objects(
         company_id: Optional[int] = Query(None),
         group_id: Optional[int] = Query(None),
+        ctx: AuthContext = Depends(VIEW),
     ) -> dict:
-        conds: List[str] = []
-        params: List[Any] = []
+        scope, params = ctx.scope_sql("c.group_id")
+        conds: List[str] = [scope]
         if company_id is not None:
             conds.append("o.company_id = %s")
             params.append(company_id)
         if group_id is not None:
             conds.append("c.group_id = %s")
             params.append(group_id)
-        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        where = " WHERE " + " AND ".join(conds)
         rows = fetch_all(OBJECT_SELECT + where + " ORDER BY g.name, c.name, o.name", tuple(params))
         return {"items": rows}
 
     @router.get("/objects/{object_id}")
-    def get_object(object_id: int) -> dict:
-        return get_object_or_404(object_id)
+    def get_object(object_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
+        return get_object_or_404(object_id, ctx)
 
     @router.post("/objects", status_code=201)
-    def create_object(body: ObjectCreate) -> dict:
+    def create_object(body: ObjectCreate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         values = body.model_dump()
         cols = ", ".join(values)
         ph = ", ".join(["%s"] * len(values))
         with tx() as cur:
-            if not exists(cur, "company", body.company_id):
-                raise HTTPException(status_code=404, detail="Empresa no encontrada.")
+            check(cur, ctx, "config.manage", "company", body.company_id, "Empresa")
             cur.execute(f"INSERT INTO object_catalog ({cols}) VALUES ({ph}) RETURNING id", tuple(values.values()))
             new_id = cur.fetchone()["id"]
-        return get_object_or_404(new_id)
+        return get_object_or_404(new_id, ctx)
 
     @router.put("/objects/{object_id}")
-    def update_object(object_id: int, body: ObjectUpdate) -> dict:
+    def update_object(object_id: int, body: ObjectUpdate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         nullable = {"description", "create_table_sql", "upsert_keys", "constraint_name",
                     "create_constraint_sql", "static_columns"}
         values = {
@@ -812,13 +887,11 @@ def create_admin_router(
             if v is not None or k in nullable
         }
         with tx() as cur:
+            check(cur, ctx, "config.manage", "object", object_id, "Objeto")
             cur.execute("SELECT company_id FROM object_catalog WHERE id = %s", (object_id,))
             current = cur.fetchone()
-            if not current:
-                raise not_found("Objeto")
             if "company_id" in values and values["company_id"] != current["company_id"]:
-                if not exists(cur, "company", values["company_id"]):
-                    raise HTTPException(status_code=404, detail="Empresa no encontrada.")
+                check(cur, ctx, "config.manage", "company", values["company_id"], "Empresa")
                 n = count(cur, "SELECT COUNT(*) AS n FROM agency_task WHERE object_catalog_id = %s", (object_id,))
                 if n:
                     raise HTTPException(
@@ -826,13 +899,12 @@ def create_admin_router(
                         detail=f"No se puede cambiar de empresa: el objeto tiene {n} tarea(s).",
                     )
             apply_update(cur, "object_catalog", object_id, values)
-        return get_object_or_404(object_id)
+        return get_object_or_404(object_id, ctx)
 
     @router.delete("/objects/{object_id}")
-    def delete_object(object_id: int) -> dict:
+    def delete_object(object_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
         with tx() as cur:
-            if not exists(cur, "object_catalog", object_id):
-                raise not_found("Objeto")
+            check(cur, ctx, "config.manage", "object", object_id, "Objeto")
             n = count(cur, "SELECT COUNT(*) AS n FROM agency_task WHERE object_catalog_id = %s", (object_id,))
             if n:
                 raise HTTPException(
@@ -843,12 +915,14 @@ def create_admin_router(
         return {"status": "ok", "deleted": object_id}
 
     @router.post("/objects/{object_id}/enable")
-    def enable_object(object_id: int) -> dict:
-        return _set_flag("object_catalog", object_id, "is_enabled", True, "Objeto", get_object_or_404)
+    def enable_object(object_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "object", "object_catalog", object_id, "is_enabled", True, "Objeto",
+                         get_object_or_404)
 
     @router.post("/objects/{object_id}/disable")
-    def disable_object(object_id: int) -> dict:
-        return _set_flag("object_catalog", object_id, "is_enabled", False, "Objeto", get_object_or_404)
+    def disable_object(object_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "object", "object_catalog", object_id, "is_enabled", False, "Objeto",
+                         get_object_or_404)
 
     # ════════════════════════════════════════════════════════════════════════
     # TAREAS (agency_task)
@@ -870,21 +944,20 @@ def create_admin_router(
         JOIN client_group g ON g.id = c.group_id
     """
 
-    def get_task_or_404(task_id: int) -> Dict[str, Any]:
+    def get_task_or_404(task_id: int, ctx: AuthContext) -> Dict[str, Any]:
         row = fetch_one(TASK_SELECT + " WHERE t.id = %s", (task_id,))
         if not row:
             raise not_found("Tarea")
+        ctx.check("view", row["group_id"], "Tarea")
         return row
 
-    def check_task_refs(cur: Any, agency_id: int, object_id: int) -> None:
+    def check_task_refs(cur: Any, ctx: AuthContext, agency_id: int, object_id: int) -> None:
+        check(cur, ctx, "config.manage", "agency", agency_id, "Agencia")
+        check(cur, ctx, "config.manage", "object", object_id, "Objeto")
         cur.execute("SELECT company_id FROM agency WHERE id = %s", (agency_id,))
         ag = cur.fetchone()
-        if not ag:
-            raise HTTPException(status_code=404, detail="Agencia no encontrada.")
         cur.execute("SELECT company_id FROM object_catalog WHERE id = %s", (object_id,))
         ob = cur.fetchone()
-        if not ob:
-            raise HTTPException(status_code=404, detail="Objeto no encontrado.")
         if ag["company_id"] != ob["company_id"]:
             raise HTTPException(
                 status_code=422,
@@ -897,69 +970,70 @@ def create_admin_router(
         company_id: Optional[int] = Query(None),
         agency_id: Optional[int] = Query(None),
         object_catalog_id: Optional[int] = Query(None),
+        ctx: AuthContext = Depends(VIEW),
     ) -> dict:
-        conds: List[str] = []
-        params: List[Any] = []
+        scope, params = ctx.scope_sql("c.group_id")
+        conds: List[str] = [scope]
         for col, val in (("c.group_id", group_id), ("a.company_id", company_id),
                          ("t.agency_id", agency_id), ("t.object_catalog_id", object_catalog_id)):
             if val is not None:
                 conds.append(f"{col} = %s")
                 params.append(val)
-        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        where = " WHERE " + " AND ".join(conds)
         rows = fetch_all(TASK_SELECT + where + " ORDER BY g.name, c.name, a.name, o.name", tuple(params))
         return {"items": rows}
 
     @router.get("/tasks/{task_id}")
-    def get_task(task_id: int) -> dict:
-        return get_task_or_404(task_id)
+    def get_task(task_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
+        return get_task_or_404(task_id, ctx)
 
     @router.post("/tasks", status_code=201)
-    def create_task(body: TaskCreate) -> dict:
+    def create_task(body: TaskCreate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         values = body.model_dump()
         cols = ", ".join(values)
         ph = ", ".join(["%s"] * len(values))
         with tx() as cur:
-            check_task_refs(cur, body.agency_id, body.object_catalog_id)
+            check_task_refs(cur, ctx, body.agency_id, body.object_catalog_id)
             cur.execute(f"INSERT INTO agency_task ({cols}) VALUES ({ph}) RETURNING id", tuple(values.values()))
             new_id = cur.fetchone()["id"]
-        return get_task_or_404(new_id)
+        return get_task_or_404(new_id, ctx)
 
     @router.put("/tasks/{task_id}")
-    def update_task(task_id: int, body: TaskUpdate) -> dict:
+    def update_task(task_id: int, body: TaskUpdate, ctx: AuthContext = Depends(CONFIG)) -> dict:
         values = {k: v for k, v in body.model_dump(exclude_unset=True).items()
                   if v is not None or k in TASK_NULLABLE_FIELDS}
         with tx() as cur:
+            check(cur, ctx, "config.manage", "task", task_id, "Tarea")
             cur.execute("SELECT agency_id, object_catalog_id FROM agency_task WHERE id = %s", (task_id,))
             current = cur.fetchone()
-            if not current:
-                raise not_found("Tarea")
             if "agency_id" in values or "object_catalog_id" in values:
                 check_task_refs(
-                    cur,
+                    cur, ctx,
                     values.get("agency_id", current["agency_id"]),
                     values.get("object_catalog_id", current["object_catalog_id"]),
                 )
             apply_update(cur, "agency_task", task_id, values)
-        return get_task_or_404(task_id)
+        return get_task_or_404(task_id, ctx)
 
     @router.delete("/tasks/{task_id}")
-    def delete_task(task_id: int) -> dict:
+    def delete_task(task_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
         with tx() as cur:
+            check(cur, ctx, "config.manage", "task", task_id, "Tarea")
             cur.execute("DELETE FROM agency_task WHERE id = %s", (task_id,))
-            if cur.rowcount == 0:
-                raise not_found("Tarea")
         return {"status": "ok", "deleted": task_id}
 
     @router.post("/tasks/{task_id}/enable")
-    def enable_task(task_id: int) -> dict:
-        return _set_flag("agency_task", task_id, "is_active", True, "Tarea", get_task_or_404)
+    def enable_task(task_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "task", "agency_task", task_id, "is_active", True, "Tarea",
+                         get_task_or_404)
 
     @router.post("/tasks/{task_id}/disable")
-    def disable_task(task_id: int) -> dict:
-        return _set_flag("agency_task", task_id, "is_active", False, "Tarea", get_task_or_404)
+    def disable_task(task_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
+        return _set_flag(ctx, "config.manage", "task", "agency_task", task_id, "is_active", False, "Tarea",
+                         get_task_or_404)
 
     @router.post("/tasks/{task_id}/reset-last-run")
-    def reset_task_last_run(task_id: int) -> dict:
+    def reset_task_last_run(task_id: int, ctx: AuthContext = Depends(CONFIG)) -> dict:
         """
         Pone last_run_at en NULL y reinicia el watermark de task_sync_state: la
         próxima ejecución hará carga completa ('{last_run}' = 1900-01-01).
@@ -967,9 +1041,8 @@ def create_admin_router(
         antes del reinicio vuelva a fijar el watermark.
         """
         with tx() as cur:
+            check(cur, ctx, "config.manage", "task", task_id, "Tarea")
             cur.execute("UPDATE agency_task SET last_run_at = NULL WHERE id = %s", (task_id,))
-            if cur.rowcount == 0:
-                raise not_found("Tarea")
             cur.execute(
                 """
                 INSERT INTO task_sync_state (task_id, watermark, watermark_kind, watermark_reset_at)
@@ -982,23 +1055,15 @@ def create_admin_router(
             if on_watermark_reset is not None:
                 # Cierra incidencias de "tipo de reloj distinto" de la tarea (motivo watermark_reset).
                 on_watermark_reset(cur, task_id)
-        return get_task_or_404(task_id)
+        return get_task_or_404(task_id, ctx)
 
     # ── Helpers compartidos (definidos al final; usan closures de arriba) ────
-    def _set_flag(table: str, row_id: int, column: str, value: bool, what: str,
-                  getter: Callable[[int], Dict[str, Any]]) -> Dict[str, Any]:
+    def _set_flag(ctx: AuthContext, perm: str, kind: str, table: str, row_id: int, column: str, value: Any,
+                  what: str, getter: Callable[[int, AuthContext], Dict[str, Any]]) -> Dict[str, Any]:
         with tx() as cur:
+            check(cur, ctx, perm, kind, row_id, what)
+            # `table`/`column` son literales internos, nunca del usuario.
             cur.execute(f"UPDATE {table} SET {column} = %s WHERE id = %s", (value, row_id))
-            if cur.rowcount == 0:
-                raise not_found(what)
-        return getter(row_id)
-
-    def _set_token(table: str, column: str, row_id: int, token: Optional[str], what: str,
-                   getter: Callable[[int], Dict[str, Any]]) -> Dict[str, Any]:
-        with tx() as cur:
-            cur.execute(f"UPDATE {table} SET {column} = %s WHERE id = %s", (token, row_id))
-            if cur.rowcount == 0:
-                raise not_found(what)
-        return getter(row_id)
+        return getter(row_id, ctx)
 
     return router
