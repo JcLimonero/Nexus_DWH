@@ -8,6 +8,7 @@ import { useApi } from "@/lib/api";
 import type { Agency, Company, Group, ListResponse, TaskHealth } from "@/lib/types";
 import { cx, fmtNumber, tzLabel } from "@/lib/format";
 import { Badge, Button, Card, IconButton, Input, PageHeader, StatusBadge, Switch } from "@/components/ui/primitives";
+import { DestinationBadge, sslLabel } from "@/components/destination";
 import { DataState, EmptyState, NotFoundState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { FilterBar, useUrlFilters } from "@/components/scope-filters";
@@ -77,6 +78,8 @@ export default function GrupoDetallePage() {
       .forEach((t) => m.set(t.agency_id, [...(m.get(t.agency_id) ?? []), t]));
     return m;
   }, [tasks, f.status, f.q]);
+
+  const companyById = useMemo(() => new Map((companyList.data?.items ?? []).map((c) => [c.id, c])), [companyList.data]);
 
   const companies = useMemo<CompanyBlock[]>(() => {
     const needle = f.q.trim().toLowerCase();
@@ -157,6 +160,10 @@ export default function GrupoDetallePage() {
                   </code>
                 </span>
               )}
+              <span className="text-xs text-slate-500">
+                Esquema <code className="font-mono text-slate-700">{g.warehouse_schema}</code> · ssl {sslLabel(g.warehouse_sslmode)}
+                {g.custom_destination_count > 0 && <> · {g.custom_destination_count} empresa(s) con destino propio</>}
+              </span>
             </div>
 
             <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
@@ -244,6 +251,14 @@ export default function GrupoDetallePage() {
                       <span className="text-xs text-slate-500">
                         {c.agencies.length} agencia(s) · {cCount} extractor(es)
                       </span>
+                      {companyById.get(c.id) && (
+                        <span className="flex items-center gap-1 text-xs text-slate-500">
+                          <DestinationBadge source={companyById.get(c.id)!.effective_warehouse.source} />
+                          <code className="font-mono text-slate-600" title="Esquema destino">
+                            {companyById.get(c.id)!.effective_warehouse.schema}
+                          </code>
+                        </span>
+                      )}
                     </button>
                     {cOpen && c.agencies.length === 0 && (
                       <Card className="px-4 py-4 text-sm text-slate-500">

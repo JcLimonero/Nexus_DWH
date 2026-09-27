@@ -3,7 +3,7 @@
 import { useState, type FormEvent } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
-import type { Company, Group, ListResponse, SourceType } from "@/lib/types";
+import type { Company, EffectiveWarehouse, Group, ListResponse, SourceType } from "@/lib/types";
 import { DEFAULT_PORTS, SOURCE_TYPE_LABELS } from "@/lib/format";
 import { Badge, Button, Card, Field, IconButton, Input, PageHeader, Select, Switch } from "@/components/ui/primitives";
 import { Modal } from "@/components/ui/modal";
@@ -15,6 +15,17 @@ import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
 import { useSession } from "@/components/session";
 import { FilterBar, useUrlFilters } from "@/components/scope-filters";
+import {
+  ConnectionTestPanel,
+  DestinationChangeNotice,
+  warehouseLocation,
+  EMPTY_WAREHOUSE,
+  EffectiveDestination,
+  WarehouseFields,
+  validateWarehouse,
+  warehouseBody,
+  type WarehouseForm,
+} from "@/components/destination";
 
 const FILTER_KEYS = ["group_id"] as const;
 
@@ -32,6 +43,9 @@ interface FormState {
   refresh_seconds: string;
   verbose_logging: boolean;
   is_enabled: boolean;
+  /** true = usa el destino del grupo (predeterminado) */
+  inherit_warehouse: boolean;
+  warehouse: WarehouseForm;
 }
 
 const EMPTY: FormState = {
@@ -48,7 +62,40 @@ const EMPTY: FormState = {
   refresh_seconds: "60",
   verbose_logging: false,
   is_enabled: true,
+  inherit_warehouse: true,
+  warehouse: EMPTY_WAREHOUSE,
 };
+
+function companyWarehouse(c: Company): WarehouseForm {
+  if (c.warehouse_mode !== "custom") return EMPTY_WAREHOUSE;
+  return {
+    host: c.warehouse_host ?? "",
+    port: String(c.warehouse_port),
+    database: c.warehouse_database ?? "",
+    username: c.warehouse_username ?? "",
+    password: "",
+    clear_password: false,
+    schema: c.warehouse_schema || "public",
+    sslmode: c.warehouse_sslmode || "prefer",
+    sslrootcert: c.warehouse_sslrootcert ?? "",
+  };
+}
+
+/** Cambios sin guardar en origen o destino (la prueba de conexión usa lo guardado). */
+function connectionDirty(c: Company | null, f: FormState, kind: "source" | "dwh"): boolean {
+  if (!c) return true;
+  if (kind === "source") {
+    return (
+      c.source_type !== f.source_type || String(c.source_port) !== f.source_port || (c.source_host ?? "") !== f.source_host ||
+      (c.source_database ?? "") !== f.source_database || (c.source_username ?? "") !== f.source_username ||
+      (c.source_dsn ?? "") !== f.source_dsn || Boolean(f.source_password) || f.clear_password
+    );
+  }
+  if ((c.warehouse_mode === "custom") === f.inherit_warehouse) return true;
+  if (f.inherit_warehouse) return false;
+  const saved = companyWarehouse(c);
+  return (Object.keys(saved) as (keyof WarehouseForm)[]).some((k) => k !== "clear_password" && saved[k] !== f.warehouse[k]) || f.warehouse.clear_password;
+}
 
 const SECRET_TEXT_FIELDS = ["source_host", "source_database", "source_username", "source_dsn"] as const;
 
@@ -64,6 +111,7 @@ export default function EmpresasPage() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [saving, setSaving] = useState(false);
+  const [resetSync, setResetSync] = useState(true);
   const items = data?.items ?? [];
   // Solo los grupos donde puede crear/mover empresas (config.manage).
   const groupList = (groups.data?.items ?? []).filter((g) => can("config.manage", g.id));
@@ -71,6 +119,16 @@ export default function EmpresasPage() {
   const formGroup = form.group_id ? Number(form.group_id) : null;
   const formCfg = editing ? can("config.manage", editing.group_id) : true;
   const formCred = editing ? can("credentials.manage", editing.group_id) : can("credentials.manage", formGroup);
+
+  // ¿Cambia el destino efectivo (modo, ubicación del destino propio o grupo heredado)? → aviso de reinicio.
+  const destinationChanged = Boolean(
+    editing &&
+      formCred &&
+      !editing.secrets_hidden &&
+      ((editing.warehouse_mode === "custom") === form.inherit_warehouse ||
+        (!form.inherit_warehouse && warehouseLocation(companyWarehouse(editing)) !== warehouseLocation(form.warehouse)) ||
+        (form.inherit_warehouse && Number(form.group_id) !== editing.group_id)),
+  );
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -103,7 +161,10 @@ export default function EmpresasPage() {
       refresh_seconds: String(c.refresh_seconds),
       verbose_logging: c.verbose_logging,
       is_enabled: c.is_enabled,
+      inherit_warehouse: c.warehouse_mode !== "custom",
+      warehouse: companyWarehouse(c),
     });
+    setResetSync(true);
     setOpen(true);
   }
 
@@ -136,8 +197,33 @@ export default function EmpresasPage() {
       });
       if (form.source_password) body.source_password = form.source_password;
       if (editing && form.clear_password && !form.source_password) body.clear_password = true;
+      // Destino: heredar el del grupo (predeterminado) o uno propio completo.
+      if (form.inherit_warehouse) {
+        if (!editing || editing.warehouse_mode === "custom") body.warehouse_mode = "inherit";
+      } else {
+        // Host/base/usuario no descifrables: se conservan si quedan vacíos (el backend valida el resultado).
+        const undecryptable = editing?.decrypt_errors ?? [];
+        const problem = validateWarehouse(form.warehouse, {
+          requireConnection: !undecryptable.some((k) => k.startsWith("warehouse_")),
+        });
+        if (problem) {
+          toast.error(problem);
+          return;
+        }
+        body.warehouse_mode = "custom";
+        Object.assign(
+          body,
+          warehouseBody(form.warehouse, {
+            isEdit: Boolean(editing && editing.warehouse_mode === "custom"),
+            hasPassword: Boolean(editing?.warehouse_has_password),
+            undecryptable,
+            clearKey: "warehouse_clear_password",
+          }),
+        );
+      }
     }
 
+    if (destinationChanged) body.reset_sync = resetSync;
     setSaving(true);
     const res = await run<Company>("save", editing ? `admin/companies/${editing.id}` : "admin/companies", {
       method: editing ? "PUT" : "POST",
@@ -149,12 +235,27 @@ export default function EmpresasPage() {
   }
 
   const usesDsn = form.source_type === "sqlserver" || form.source_type === "pervasive" || form.source_type === "firebird";
+  // Destino heredado: el del grupo elegido en el formulario.
+  const formGroupRow = (groups.data?.items ?? []).find((g) => g.id === formGroup) ?? null;
+  const inheritedSummary: EffectiveWarehouse | null = formGroupRow
+    ? {
+        source: "group",
+        host: formGroupRow.secrets_hidden ? null : formGroupRow.warehouse_host,
+        port: formGroupRow.warehouse_port,
+        database: formGroupRow.secrets_hidden ? null : formGroupRow.warehouse_database,
+        schema: formGroupRow.warehouse_schema,
+        sslmode: formGroupRow.warehouse_sslmode,
+        configured: formGroupRow.secrets_hidden || Boolean(formGroupRow.warehouse_host),
+      }
+    : editing && editing.effective_warehouse.source === "group" && formGroup === editing.group_id
+      ? editing.effective_warehouse
+      : null;
 
   return (
     <>
       <PageHeader
         title="Empresas"
-        description="Razones sociales: conexión a la BD de origen (DMS) y token del cliente ETL."
+        description="Razones sociales: conexión a la BD de origen (DMS), destino (el del grupo o uno propio) y token del cliente ETL."
         actions={
           canCreate ? (
             <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate}>
@@ -181,6 +282,7 @@ export default function EmpresasPage() {
               <tr>
                 <Th>Empresa</Th>
                 <Th>Origen</Th>
+                <Th>Destino (DWH)</Th>
                 <Th>Token (x-token)</Th>
                 <Th className="text-right">Agencias / Objetos</Th>
                 <Th>Activa</Th>
@@ -216,6 +318,9 @@ export default function EmpresasPage() {
                         </p>
                       </>
                     )}
+                  </Td>
+                  <Td>
+                    <EffectiveDestination eff={c.effective_warehouse} />
                   </Td>
                   <Td>
                     <TokenField
@@ -284,7 +389,7 @@ export default function EmpresasPage() {
         onClose={() => setOpen(false)}
         size="lg"
         title={editing ? `Editar empresa: ${editing.name}` : "Nueva empresa"}
-        description="El token se genera automáticamente al crear la empresa."
+        description="El token se genera automáticamente al crear la empresa. El destino es el del grupo salvo que configures uno propio."
         footer={
           <>
             <Button variant="secondary" onClick={() => setOpen(false)}>
@@ -358,6 +463,72 @@ export default function EmpresasPage() {
             </div>
           )}
           </fieldset>
+          {editing && (
+            <div className="sm:col-span-6">
+              <ConnectionTestPanel
+                targetKind="company_source"
+                companyId={editing.id}
+                title="Probar conexión al origen"
+                canRun={can("config.manage", editing.group_id)}
+                disabledReason={formCred && connectionDirty(editing, form, "source") ? "Hay cambios sin guardar en el origen: la prueba usa la configuración guardada." : null}
+              />
+            </div>
+          )}
+
+          <div className="sm:col-span-6">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Destino (DWH)</h3>
+            <p className="mt-1 text-xs text-slate-500">
+              De forma predeterminada la empresa carga en el destino de su grupo. Desactiva la opción para usar un destino propio (otro servidor, base, esquema o SSL).
+            </p>
+          </div>
+          <div className="sm:col-span-6">
+            <Switch
+              checked={form.inherit_warehouse}
+              disabled={!formCred}
+              onChange={(v) => set("inherit_warehouse", v)}
+              label="Usar el destino del grupo"
+              description={
+                form.inherit_warehouse
+                  ? "Recomendado. Los cambios en el destino del grupo aplican automáticamente a esta empresa."
+                  : "Al volver a activarla se descarta el destino propio guardado."
+              }
+            />
+          </div>
+          {form.inherit_warehouse ? (
+            <div className="sm:col-span-6 rounded-md border border-slate-200 px-3 py-2">
+              {inheritedSummary ? (
+                <EffectiveDestination eff={inheritedSummary} />
+              ) : (
+                <p className="text-xs text-slate-500">Selecciona un grupo para ver su destino.</p>
+              )}
+            </div>
+          ) : (
+            <WarehouseFields
+              idPrefix="c-wh"
+              value={form.warehouse}
+              onChange={(w) => set("warehouse", w)}
+              disabled={!formCred}
+              isEdit={Boolean(editing && editing.warehouse_mode === "custom")}
+              hasPassword={Boolean(editing?.warehouse_has_password)}
+              hasCa={editing?.warehouse_has_sslrootcert}
+            />
+          )}
+          {editing && destinationChanged && (
+            <div className="sm:col-span-6">
+              <DestinationChangeNotice tasks={editing.task_count} reset={resetSync} onReset={setResetSync} />
+            </div>
+          )}
+          {editing && (
+            <div className="sm:col-span-6">
+              <ConnectionTestPanel
+                targetKind="company_dwh"
+                companyId={editing.id}
+                title={editing.warehouse_mode === "custom" ? "Probar conexión al destino propio" : "Probar conexión al destino (del grupo)"}
+                canRun={can("config.manage", editing.group_id)}
+                disabledReason={formCred && connectionDirty(editing, form, "dwh") ? "Hay cambios sin guardar en el destino: la prueba usa la configuración guardada." : null}
+              />
+            </div>
+          )}
           <fieldset disabled={!formCfg} className="contents">
 
           <div className="sm:col-span-6">

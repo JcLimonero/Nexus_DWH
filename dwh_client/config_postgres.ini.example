@@ -68,6 +68,15 @@ agency_token =
 ; inventory_tick_seconds = 60
 ; inventory_statement_timeout_seconds = 60
 
+; "Probar conexión" pedida desde el panel (sección 22): hilo propio, solo lectura, nunca bloquea el
+; ETL. false = el agente no anuncia la capacidad (el panel dirá "sin agente en línea").
+; connection_test_enabled = true
+; connection_test_poll_seconds = 10
+; Separación mínima entre pruebas a la MISMA conexión y tope por minuto (evitan bloquear la cuenta
+; en la base del cliente por intentos repetidos).
+; connection_test_min_spacing_seconds = 30
+; connection_test_max_per_minute = 6
+
 ; source (defecto) | agent_local | agent_utc
 ; watermark_clock = source
 ; watermark_overlap_seconds = 120

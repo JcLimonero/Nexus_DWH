@@ -248,7 +248,10 @@ def create_table_if_missing(
     """
     # Asegurar que el schema exista
     schema, _ = split_schema_table(table)
-    cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(schema)}")
+    cursor.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (schema,))
+    if cursor.fetchone() is None:
+        # Solo si no existe: CREATE SCHEMA IF NOT EXISTS exige CREATE sobre la base aunque el esquema exista.
+        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(schema)}")
 
     has_source_id = any((c or "").lower() == "id" for c in columns)
     col_defs: List[str] = []
@@ -544,6 +547,8 @@ class RunContext:
 # ─────────────────────────────────────────────────────────────────────────────
 def register_task_secrets(task: Dict[str, Any], warehouse: Dict[str, Any]) -> None:
     src = task.get("source") or {}
+    if isinstance(task.get("warehouse"), dict) and task["warehouse"]:
+        warehouse = task["warehouse"]  # destino efectivo de la tarea (Nexus >= 5.3)
     SECRETS.add(src.get("host"), src.get("username"), src.get("password"), src.get("database"), src.get("dsn"),
                 warehouse.get("host"), warehouse.get("username"), warehouse.get("password"),
                 warehouse.get("database"))
@@ -662,6 +667,8 @@ def connect_source(src: Dict[str, Any], settings: Any, ctx: RunContext) -> Tuple
 
 
 def connect_dwh(warehouse: Dict[str, Any], settings: Any, ctx: RunContext) -> Any:
+    from .destination import pg_ssl_kwargs, warehouse_schema
+
     if not warehouse.get("host"):
         raise ConfigError("No hay host DWH configurado.")
     opts = [f"-c statement_timeout={int(settings.dwh_statement_timeout_seconds) * 1000}"]
@@ -671,10 +678,21 @@ def connect_dwh(warehouse: Dict[str, Any], settings: Any, ctx: RunContext) -> An
         host=str(warehouse["host"]), port=int(warehouse.get("port") or 5432),
         dbname=str(warehouse.get("database", "")), user=str(warehouse.get("username", "")),
         password=str(warehouse.get("password", "")), connect_timeout=int(settings.db_connect_timeout_seconds),
-        options=" ".join(opts), application_name="nexus-dwh-agent",
+        options=" ".join(opts), application_name="nexus-dwh-agent", **pg_ssl_kwargs(warehouse, settings),
     )
     conn.set_client_encoding("UTF8")
     ctx.add_cancel_hook(conn.cancel)
+    schema = warehouse_schema(warehouse)
+    if schema != "public":
+        # El DDL del catálogo sin esquema (create_table_sql / constraint) va al esquema destino.
+        # SET de sesión + COMMIT inmediato (un ROLLBACK posterior no lo revierte).
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (schema,))
+        if cur.fetchone() is None:
+            # Solo si no existe (CREATE SCHEMA IF NOT EXISTS exige CREATE sobre la base aunque exista).
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(schema)}")
+        cur.execute(f"SET search_path TO {quote_ident(schema)}, public")
+        conn.commit()
     return conn
 
 
@@ -832,7 +850,11 @@ def run_task(task: Dict[str, Any], warehouse: Dict[str, Any], previous_watermark
     task_id = task["task_id"]
     try:
         ctx.stage = "config"
-        load_table = str(task["load_table"]).lower()
+        from .destination import effective_load_table
+        if isinstance(task.get("warehouse"), dict) and task["warehouse"]:
+            # Destino efectivo de la tarea (Nexus >= 5.3) sobre el general: nunca se carga en otro DWH.
+            warehouse = task["warehouse"]
+        load_table = effective_load_table(str(task["load_table"]), warehouse or {})
         src = task.get("source") or {}
         if not warehouse or not warehouse.get("host"):
             raise ConfigError("Conexión al DWH no configurada.")

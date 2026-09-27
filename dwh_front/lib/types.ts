@@ -19,6 +19,8 @@ interface TokenInfo {
   token_hidden?: boolean;
 }
 
+export type SslMode = "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full";
+
 export interface Group extends Timestamps, SecretInfo, TokenInfo {
   id: number;
   name: string;
@@ -27,8 +29,69 @@ export interface Group extends Timestamps, SecretInfo, TokenInfo {
   warehouse_port: number;
   warehouse_database: string | null;
   warehouse_username: string | null;
+  /** Esquema destino por defecto (tablas del catálogo sin esquema). */
+  warehouse_schema: string;
+  warehouse_sslmode: SslMode;
+  /** PEM de la CA; null sin credentials.manage (ver has_sslrootcert). */
+  warehouse_sslrootcert: string | null;
+  has_sslrootcert: boolean;
+  /** Empresas del grupo con destino propio. */
+  custom_destination_count: number;
+  /** Extractores de las empresas que heredan el destino del grupo (aviso de reinicio de carga). */
+  inherited_task_count: number;
   is_enabled: boolean;
   company_count: number;
+}
+
+/** Destino que usa realmente la empresa (propio o heredado del grupo). */
+export interface EffectiveWarehouse {
+  source: "group" | "company";
+  /** null sin credentials.manage */
+  host: string | null;
+  port: number;
+  database: string | null;
+  schema: string;
+  sslmode: SslMode;
+  configured: boolean;
+}
+
+export type ConnectionTestKind = "group_dwh" | "company_dwh" | "company_source";
+export type ConnectionTestStatus = "pending" | "running" | "ok" | "failed" | "expired" | "no_agent";
+
+export interface ConnectionTestCheck {
+  code: string;
+  ok: boolean | null;
+  severity: "error" | "warning" | "info";
+  message: string;
+}
+
+export interface ConnectionTest {
+  id: string;
+  target_kind: ConnectionTestKind;
+  group_id: number;
+  company_id: number | null;
+  status: ConnectionTestStatus;
+  requested_by: string;
+  installation_id: string | null;
+  installation_name: string | null;
+  eligible_installations: number;
+  created_at: string;
+  claimed_at: string | null;
+  finished_at: string | null;
+  expires_at: string | null;
+  error_code: string | null;
+  message: string | null;
+  /** La configuración cambió desde que se hizo la prueba. */
+  config_changed: boolean;
+  result: {
+    checks: ConnectionTestCheck[];
+    server_version: string | null;
+    ssl_in_use: boolean | null;
+    ssl_version: string | null;
+    schema_exists: boolean | null;
+    duration_ms: number | null;
+    agent_version: string;
+  } | null;
 }
 
 export interface Company extends Timestamps, SecretInfo, TokenInfo {
@@ -43,12 +106,26 @@ export interface Company extends Timestamps, SecretInfo, TokenInfo {
   source_database: string | null;
   source_username: string | null;
   source_dsn: string | null;
+  /** inherit = usa el destino del grupo; custom = destino propio. */
+  warehouse_mode: "inherit" | "custom";
+  warehouse_host: string | null;
+  warehouse_port: number;
+  warehouse_database: string | null;
+  warehouse_username: string | null;
+  warehouse_schema: string;
+  warehouse_sslmode: SslMode;
+  warehouse_sslrootcert: string | null;
+  warehouse_has_password: boolean;
+  warehouse_has_sslrootcert: boolean;
+  effective_warehouse: EffectiveWarehouse;
   verbose_logging: boolean;
   refresh_seconds: number;
   is_enabled: boolean;
   group_enabled: boolean;
   agency_count: number;
   object_count: number;
+  /** Extractores de la empresa (aviso de reinicio de carga al cambiar el destino). */
+  task_count: number;
 }
 
 export interface Agency extends Timestamps, TokenInfo {
@@ -286,6 +363,9 @@ export interface Installation {
   created_at: string;
   failures_24h: number;
   last_execution_at: string | null;
+  /** Tareas que Nexus retiene a este agente por versión (< 5.3), con su motivo (sección 22.4). */
+  withheld_tasks?: { task_id: number; reason: "destination_per_company" | "ssl_enforced" | "schema_ddl" | string }[];
+  withheld_at?: string | null;
   legacy: false;
 }
 

@@ -6,7 +6,7 @@ Documento único para entender y operar el **stack DWH de Nexus**:
 - `dwh_client/` — **cliente ETL** que corre en cada sede y carga datos al DWH.
 - `dwh_api/` — app de **monitoreo** (consume los endpoints `/monitor/*` del backend).
 - `dwh_front/` — **panel web de administración** (Next.js) para dar de alta grupos, empresas, agencias, catálogo y tareas, y ver el monitor (solo variante PostgreSQL; ver sección 16).
-- Distribución del agente (Nuitka, servicio de Windows, firma y actualizaciones): sección 21. Resumen de entrega del endurecimiento (fases 1–5): [ENTREGA_ENDURECIMIENTO.md](ENTREGA_ENDURECIMIENTO.md).
+- Distribución del agente (Nuitka, servicio de Windows, firma y actualizaciones): sección 21. Destino (DWH) configurable por grupo/empresa, esquema, SSL/TLS y "Probar conexión": sección 22. Resumen de entrega del endurecimiento (fases 1–5): [ENTREGA_ENDURECIMIENTO.md](ENTREGA_ENDURECIMIENTO.md).
 - **Encriptación de secretos** con Fernet (opcional, recomendada en producción).
 
 El stack existe en **dos variantes** equivalentes:
@@ -271,6 +271,7 @@ Agente v5 (solo PostgreSQL; detalle en la sección 17):
 
 - `POST /agent/enroll`, `GET /agent/tasks`, `POST /agent/executions`, `PUT /agent/executions/{id}`, `POST /agent/heartbeat`, `POST /agent/events`, `POST /agent/credentials/rotate`, `GET /agent/whoami`.
 - Inventario estructural (sección 19): `POST /agent/inventory/lease`, `POST /agent/inventory/snapshots`.
+- Prueba de conexión (sección 22, agente 5.3): `POST /agent/connection-tests/claim`, `POST /agent/connection-tests/{id}/result`.
 
 Monitor (todos requieren header `x-monitor-token`):
 
@@ -288,7 +289,8 @@ Administración (solo PostgreSQL; **sesión de usuario** `Authorization: Bearer 
 
 - `GET /admin/whoami`, `GET /admin/stats` — validación del token y conteos para el dashboard.
 - Grupos: `GET|POST /admin/groups`, `GET|PUT|DELETE /admin/groups/{id}`, `POST /admin/groups/{id}/enable|disable`, `POST /admin/groups/{id}/regenerate-token`, `DELETE /admin/groups/{id}/token`.
-- Empresas: `GET|POST /admin/companies` (`?group_id=`), `GET|PUT|DELETE /admin/companies/{id}`, `POST .../enable|disable`, `POST .../regenerate-token`.
+- Empresas: `GET|POST /admin/companies` (`?group_id=`), `GET|PUT|DELETE /admin/companies/{id}`, `POST .../enable|disable`, `POST .../regenerate-token`. Grupos y empresas aceptan `warehouse_schema`, `warehouse_sslmode`, `warehouse_sslrootcert`; empresas además `warehouse_mode` (`inherit|custom`) + `warehouse_*` y `warehouse_clear_password`; salida `effective_warehouse` (sección 22).
+- Prueba de conexión (la ejecuta un agente): `POST /admin/connection-tests` (`{target_kind: group_dwh|company_dwh|company_source, group_id|company_id}`), `GET /admin/connection-tests/{id}`, `GET /admin/connection-tests?target_kind=&group_id=&company_id=&limit=` (sección 22.3).
 - Agencias: `GET|POST /admin/agencies` (`?group_id=&company_id=`), `GET|PUT|DELETE /admin/agencies/{id}`, `POST .../enable|disable`, `POST .../regenerate-token`, `DELETE .../token`.
 - Catálogo: `GET|POST /admin/objects` (`?group_id=&company_id=`), `GET|PUT|DELETE /admin/objects/{id}`, `POST .../enable|disable`.
 - Instalaciones: `GET /admin/installations` (`?group_id=&status=`), `GET /admin/installations/{id}`, `POST .../revoke` (`{"reason"}`), `POST .../rotate` (marca rotación; el panel nunca ve el secreto).
@@ -738,12 +740,14 @@ El cliente oficial de la variante PostgreSQL es `dwh_client/client_postgres.py` 
 |---|---|
 | `POST /agent/enroll` | Alta con token de enrolamiento (header `x-group-token` / `x-agency-token` / `x-token`). 201 → `installation_id`, `secret`, `scope`. |
 | `GET /agent/whoami` | Identidad y alcance. |
-| `GET /agent/tasks` | Tareas autorizadas + credenciales de origen (por empresa) y DWH (del grupo) descifradas, `query_version`, `query_hash`, estado de sync (`watermark`, `watermark_kind`, `last_success_at`, `watermark_reset_at`…), `refresh_seconds`, `config_max_age_seconds`, `credential_rotation_required`. Cada entrega se audita en `task_download_log` (instalación, tarea, versión, IP, fecha; **sin SQL**). |
+| `GET /agent/tasks` | Tareas autorizadas + credenciales de origen (por empresa) y DWH descifradas (general del alcance y, desde 5.3, `warehouse` **efectivo por tarea** con esquema y SSL; tareas retenidas a agentes anteriores en `withheld_tasks`, sección 22.4), `query_version`, `query_hash`, estado de sync (`watermark`, `watermark_kind`, `last_success_at`, `watermark_reset_at`…), `refresh_seconds`, `config_max_age_seconds`, `credential_rotation_required`. Cada entrega se audita en `task_download_log` (instalación, tarea, versión, IP, fecha; **sin SQL**). |
 | `POST /agent/executions` | Inicio de ejecución, idempotente por `execution_id` (UUID generado por el agente). |
 | `PUT /agent/executions/{id}` | Avance/fin (`running|success|failed|interrupted`), filas, etapa de fallo, código y mensaje saneado, avisos, `checkpoint {watermark, kind}`. Idempotente; ver 17.3. |
 | `POST /agent/heartbeat` | Latido (sección 17.6). |
 | `POST /agent/events` | Eventos genéricos (`queue_overflow`, `agent_started`, `agent_stopping`, `config_stale`, `credential_rotated`, `warning`, `dead_letter`), deduplicados por `event_id`. |
 | `POST /agent/credentials/rotate` | Rotación del secreto (la pide el agente). |
+| `POST /agent/connection-tests/claim` | (5.3) Toma una prueba de conexión pendiente de su alcance (sección 22.3). |
+| `POST /agent/connection-tests/{id}/result` | (5.3) Resultado saneado de la prueba (solo la instalación que la tomó). |
 
 Errores con cuerpo `{"detail": {"code": "...", "message": "..."}}`: `missing_credentials`, `invalid_credentials`, `installation_revoked` (401); `scope_disabled`, `task_out_of_scope` (403); `execution_conflict` (409). `/agent/*` no expone CORS.
 
@@ -831,6 +835,7 @@ Hilo independiente con su propia sesión HTTP: cada `heartbeat_seconds` (defecto
   - `007_inventario_estructural`: `monitored_database` (+ `_link`, `_event`), `inventory_snapshot`, `inventory_object_state`, `inventory_baseline` (+ `_version`), `structural_change` (+ `_event`) y `task_execution.ddl_applied` (sección 19). Solo crea tablas/columnas nuevas.
   - `008_inventario_ajustes`: identidad débil del servidor (`engine_identity_weak`), `allow_engine_duplicate`, estado `out_of_scope` de las alertas y limpieza de `monitored_database_link` al borrar grupo (FK) o empresa (trigger).
   - `009_usuarios_permisos`: `panel_user`, `panel_permission`, `panel_role`, `panel_role_permission` (roles sembrados), `panel_user_role` (rol por alcance de grupo), `panel_session`, `panel_audit_log` y columnas `*_user_id` junto a los actores de texto (`incident`, `incident_event`, `structural_change`, `structural_change_event`, `monitored_database`, `monitored_database_event`, `inventory_baseline_version`, `client_events.acknowledged_by/_at`, `installation.revoked_by`). Solo crea tablas/columnas; no crea usuarios (sección 20).
+  - `010_destino_configurable`: esquema destino y SSL/TLS del DWH del grupo (`client_group.warehouse_schema|sslmode|sslrootcert`), destino propio por empresa (`company.warehouse_mode` + campos `warehouse_*`, todas las empresas existentes quedan en `inherit`) y tabla `connection_test` (sección 22). Solo agrega columnas con valores por defecto y una tabla.
 - **Ojo con `001` en BD grandes**: hace `UPDATE` masivos sobre `activity_log` y `client_events` (relleno de ids y recorte de tokens) en una sola transacción: puede tardar y generar mucho WAL/bloqueos si `activity_log` es grande. Recomendado: purgar/archivar `activity_log` antiguo antes, ejecutarla en ventana de mantenimiento y con respaldo.
 - Compatibles con BD existentes (probado sobre una copia de la BD de desarrollo y sobre una BD "legada" creada en las pruebas).
 
@@ -846,7 +851,7 @@ Hilo independiente con su propia sesión HTTP: cada `heartbeat_seconds` (defecto
 
 Agente (`[nexus]`): `ca_bundle`, `mode`, `allow_insecure_http`, `installation_name`. (`token`, `group_token`, `agency_token` pasan a ser solo de enrolamiento.)
 
-Agente (`[agent]`): `data_dir`, `log_dir`, `log_retention_days`, `credential_scope`, `heartbeat_seconds`, `tick_seconds`, `config_max_age_seconds`, `http_connect_timeout`, `http_read_timeout`, `api_retry_base_seconds`, `api_retry_max_seconds`, `run_all_on_start`, `task_retry_attempts`, `task_retry_backoff_seconds`, `shutdown_grace_seconds`, `queue_max_items`, `queue_retention_days`, `queue_backoff_base_seconds`, `queue_backoff_max_seconds`, `db_connect_timeout_seconds`, `source_statement_timeout_seconds`, `dwh_statement_timeout_seconds`, `dwh_lock_timeout_seconds`, `fetch_chunk_rows`, `watermark_clock`, `watermark_overlap_seconds`, `legacy_watermark_overlap_seconds`, `queue_max_server_errors`, `queue_poison_min_seconds`, `queue_parked_retry_seconds`. Variable de entorno opcional `NEXUS_AGENT_CONFIG` (ruta del INI). Plantilla comentada: `dwh_client/config_postgres.ini.example`.
+Agente (`[agent]`): `data_dir`, `log_dir`, `log_retention_days`, `credential_scope`, `heartbeat_seconds`, `tick_seconds`, `config_max_age_seconds`, `http_connect_timeout`, `http_read_timeout`, `api_retry_base_seconds`, `api_retry_max_seconds`, `run_all_on_start`, `task_retry_attempts`, `task_retry_backoff_seconds`, `shutdown_grace_seconds`, `queue_max_items`, `queue_retention_days`, `queue_backoff_base_seconds`, `queue_backoff_max_seconds`, `db_connect_timeout_seconds`, `source_statement_timeout_seconds`, `dwh_statement_timeout_seconds`, `dwh_lock_timeout_seconds`, `fetch_chunk_rows`, `watermark_clock`, `watermark_overlap_seconds`, `legacy_watermark_overlap_seconds`, `queue_max_server_errors`, `queue_poison_min_seconds`, `queue_parked_retry_seconds`, `connection_test_enabled`, `connection_test_poll_seconds` (sección 22). Variable de entorno opcional `NEXUS_AGENT_CONFIG` (ruta del INI). Plantilla comentada: `dwh_client/config_postgres.ini.example`.
 
 Backend: `[database] auto_migrate`; `[agent] config_max_age_seconds`, `rotation_grace_seconds`, `heartbeat_retention_days`, `download_log_retention_days`, `legacy_endpoints`, `future_tolerance_hours`; `[server] max_body_bytes`, `agent_max_body_bytes`, `enroll_max_body_bytes`; variable de entorno `NEXUS_CONFIG_FILE` (ruta alternativa del `config.ini`, usada por las pruebas). Panel: `NEXT_PUBLIC_DWH_TIMEZONE`.
 
@@ -1057,7 +1062,7 @@ Alcance: comparación **estructural** (tablas, vistas, vistas materializadas, ta
 ### 19.3. Alcance, exclusiones y origen opcional
 
 - Se inventarían **todos los esquemas de usuario autorizados** (no solo los objetos del catálogo Nexus), para detectar tablas/vistas extra. Siempre se excluyen `pg_catalog`, `information_schema`, `pg_toast*`, `pg_temp_*`. Por base: patrones de inclusión/exclusión (`fnmatch`, p. ej. `ventas_*`) y `[inventory] default_schema_exclude` global. El backend vuelve a aplicar el filtro.
-- **DWH**: se registra solo cuando un agente lo alcanza (`dwh_auto_monitor`).
+- **DWH**: se registra solo cuando un agente lo alcanza (`dwh_auto_monitor`). Desde la sección 22, el **destino propio** de una empresa es su propia base monitoreada (misma identidad estable = mismo registro; ver 22.5).
 - **Origen (DMS)**: **opcional y explícito**: se registra por empresa en el panel (`POST /admin/monitored-databases {"kind":"source","company_id":…}`) y queda **deshabilitado** salvo que se habilite. Hoy el agente inventaría orígenes PostgreSQL; otros motores se registran pero reportan "No se pudo verificar la estructura" (`ENGINE_UNSUPPORTED`).
 - Frecuencia configurable por base (`scan_interval_seconds`, defecto `default_interval_seconds` = 3600), independiente del ETL; "Inventariar ahora" pide uno inmediato.
 
@@ -1443,3 +1448,92 @@ cd dwh_client && NEXUS_TEST_AGENT_EXE=build/dist/NexusAgent/NexusAgent .venv/bin
 ### 21.13. Pendiente
 
 No probado por falta de certificado: las ramas de Authenticode de los scripts (firmante fijado, primer paquete firmado, rechazo de firmado→sin firmar) solo están revisadas, no ejecutadas. Certificado de firma de código (token/HSM o Azure Trusted Signing) y su configuración en el CI; clave Ed25519 de publicación de producción y su custodia; primera ejecución del job `agente-windows` (compilación, servicio con cuenta virtual, DPAPI) y prueba en un Windows Server real de la sede (drivers ODBC SQL Server/Pervasive/Firebird y `fbclient.dll`); SID de servicio `restricted`; credencial de inventario separada por grupo; `pip --require-hashes` para el build (hoy versiones fijadas sin hashes); instalador MSI (hoy scripts PowerShell).
+
+---
+
+## 22. Destino (DWH) configurable: esquema, SSL/TLS, destino por empresa y "Probar conexión"
+
+Módulos `dwh_back/destination_postgres.py` (regla del destino efectivo), `dwh_back/connection_tests_postgres.py` (prueba de conexión), `dwh_client/nexus_agent/destination.py` (agente) y `dwh_front/components/destination.tsx` (panel). Requiere la migración `010_destino_configurable` y, para las funciones nuevas, el agente **5.3.0**.
+
+### 22.1. Destino efectivo (regla única)
+
+- El **grupo** define el destino predeterminado: host, puerto, base, usuario, contraseña (como antes) + **esquema destino** (`warehouse_schema`, defecto `public`) + **SSL/TLS** (`warehouse_sslmode`, defecto `prefer`; `warehouse_sslrootcert` = PEM de la CA, opcional).
+- Cada **empresa** usa por defecto el destino de su grupo (`company.warehouse_mode = 'inherit'`, valor de todas las empresas existentes tras la migración). Con `warehouse_mode = 'custom'` usa un **destino propio completo** (mismos campos; host/base/usuario/contraseña cifrados `ENC:` igual que el resto). No se mezclan campos: o todo del grupo o todo de la empresa. Volver a `inherit` **borra** el destino propio guardado (no quedan credenciales sin uso).
+- La misma regla (SQL `CASE WHEN c.warehouse_mode = 'custom' …`) se usa en `/agent/tasks`, en los endpoints legados, en el inventario, en la prueba de conexión y en el panel.
+- **Esquema**: una tabla del catálogo **sin** esquema (`clientes`) se carga en `<esquema efectivo>.clientes`; un esquema explícito (`dwh.carter`) se respeta. El backend ya entrega `load_table` calificado (los agentes anteriores entienden `esquema.tabla`) y el agente 5.3 además fija `search_path = <esquema>, public` en la sesión del DWH, así el DDL del catálogo sin esquema (`create_table_sql`, constraint) queda en ese esquema. Si el esquema no existe, el agente lo crea (solo si no existe: `CREATE SCHEMA` exige privilegio `CREATE` sobre la base). Validación: `^[a-z_][a-z0-9_]{0,62}$`, sin `pg_*` ni `information_schema`; siempre se cita con comillas dobles.
+- **SSL/TLS** (`sslmode` de libpq): `disable`, `allow`, `prefer` (defecto, comportamiento previo: cifra si el servidor lo ofrece, sin verificar), `require` (falla si no hay SSL; con CA indicada libpq verifica como `verify-ca`), `verify-ca` (**CA obligatoria**: el backend rechaza guardar `verify-ca` sin el PEM), **`verify-full`** (CA + nombre del host; **recomendado** cuando el tráfico sale de la red local; la CA es **opcional**: sin ella el agente usa el almacén de CAs del sistema, `sslrootcert=system`, libpq ≥ 16). El PEM de la CA no es secreto: el agente lo escribe en `<data_dir>/certs/<sha256>.pem` (0600 en POSIX; nombre temporal único + reemplazo atómico) y borra los que ya no usa ninguna configuración vigente ni una prueba en curso. Un error de SSL se reporta con el código estable `DWH_SSL_ERROR` (servidor sin SSL, certificado no verificable, CA inválida).
+
+### 22.2. Permisos (sección 20)
+
+- Destino del grupo (host/puerto/base/usuario/contraseña, **esquema, SSL, CA**) y destino de la empresa (**incluido el cambio de modo** heredar ↔ propio): `credentials.manage` sobre el grupo. Nombre, habilitado, etc.: `config.manage`.
+- Sin `credentials.manage` el panel ve el **modo**, el **esquema** y el `sslmode` (no son secretos) y un resumen del destino efectivo sin host/base (`effective_warehouse.host = null`); el PEM de la CA solo como `has_sslrootcert`. La contraseña nunca se devuelve (`has_password` / `warehouse_has_password`).
+- **Probar conexión**: `config.manage` sobre el grupo (ver el resultado: `view`). Fuera del alcance → 404.
+
+### 22.3. Probar conexión (la ejecuta el agente, nunca Nexus)
+
+Regla de arquitectura: Nexus **no** abre conexiones hacia las bases ni servidores de los clientes; toda conexión la inicia el agente (saliente, HTTPS). Por eso la prueba es asíncrona:
+
+1. Panel → `POST /admin/connection-tests {target_kind, group_id | company_id}` con `target_kind` = `group_dwh` (DWH del grupo), `company_dwh` (destino **efectivo** de la empresa) o `company_source` (origen/DMS de la empresa). Usa la configuración **guardada** (el panel deshabilita el botón con cambios sin guardar). Auditado como `connection_test.request`.
+2. Si no hay ninguna instalación **en línea** (último contacto < `[connection_test] online_seconds`, defecto 180 s) con alcance y que anuncie la capacidad `connection-test` en su heartbeat (agente 5.3+) → `no_agent` inmediato con el motivo. Si hay → `pending`.
+3. El agente consulta `POST /agent/connection-tests/claim` cada `[agent] connection_test_poll_seconds` (defecto 10 s; el heartbeat además devuelve `connection_tests_pending` y lo despierta) en un **hilo propio** que nunca bloquea al ETL. Solo recibe pruebas de **su alcance** y con credenciales que ya recibiría para sus tareas: alcance grupo → cualquier prueba del grupo; alcance empresa/agencia → pruebas de su empresa y la del DWH del grupo solo si su empresa lo hereda.
+4. El agente responde `POST /agent/connection-tests/{id}/result` (solo la instalación que la tomó; otra → 404; repetido → 409; **fuera de plazo → 410** y la prueba queda `expired`). Nexus vuelve a sanear los mensajes con las credenciales del alcance; `error_code` solo se acepta con formato `^[A-Z0-9_]{1,64}$` y sin contener un secreto conocido (si no → `INVALID_CODE`) y `agent_version` solo como versión (`^[0-9A-Za-z.+-]{0,50}$`, si no `?`).
+5. **Límites** (cada prueba es un inicio de sesión en la base del cliente: se evita bloquear su cuenta por intentos repetidos): si ya hay una prueba **abierta** para el mismo destino/origen se devuelve esa (200, `reused: true`; idempotente); entre pruebas del mismo destino debe pasar `min_interval_seconds` (30; si no, **429** `too_soon` con `Retry-After`; las `no_agent` no cuentan); como máximo `max_open_per_group` (5) abiertas por grupo (429 `too_many_open`) y `max_per_user_per_minute` (10) solicitudes por usuario (429 `rate_limited`). El agente además separa `connection_test_min_spacing_seconds` (30) las pruebas a la **misma** conexión y no toma más de `connection_test_max_per_minute` (6).
+6. `pending` sin tomar (`pending_ttl_seconds`, 120 s) → `expired`/`NOT_CLAIMED`; tomada sin resultado (`running_ttl_seconds` + `agent_timeout_seconds`) → `expired`/`NO_RESULT`. Retención `retention_days` (30). `GET /admin/connection-tests/{id}` y `GET /admin/connection-tests?target_kind=…&group_id=…&company_id=…&limit=…` (el panel muestra la última). `config_changed = true` si la configuración cambió después de la prueba (huella sin contraseña).
+
+Qué comprueba el agente (**solo lectura**: sesión `default_transaction_read_only`, `statement_timeout`/`connect_timeout` = `agent_timeout_seconds`, `lock_timeout` 3 s; no crea nada):
+
+- DWH: `CONNECT` (conexión + autenticación con el `sslmode`/CA configurados), versión del servidor, **SSL en uso** (`pg_stat_ssl` de su propia sesión; aviso si va sin cifrar), `SCHEMA_EXISTS`, `SCHEMA_USAGE` y `CREATE_TABLE` (`has_schema_privilege`) o, si el esquema no existe, `CREATE_SCHEMA` (`has_database_privilege(…, 'CREATE')`). Resultado `ok` si conecta y puede usar (o crear) el esquema; si no, `failed` con `DWH_INSUFFICIENT_PRIVILEGE`.
+- Origen: `CONNECT` con los drivers del ETL (PostgreSQL, MySQL, SQL Server/Pervasive por ODBC, Firebird) y `QUERY` (`SELECT 1`, Firebird `FROM RDB$DATABASE`). No se inventaría ni se leen datos.
+- Códigos de error estables del agente (`DWH_AUTH_FAILED`, `DWH_SSL_ERROR`, `DWH_CONNECTION_FAILED`, `DWH_DATABASE_NOT_FOUND`, `SOURCE_…`, …) y mensajes saneados (§17.7): nunca host, usuario, contraseña ni DSN.
+
+### 22.4. Compatibilidad
+
+- **Agentes 5.3** envían `x-nexus-agent-features: destination-v2,connection-test` en cada petición y `features` en el heartbeat. `GET /agent/tasks` entrega además `warehouse` **por tarea** (destino efectivo con `schema`, `sslmode`, `sslrootcert`, `source`) y `withheld_tasks`.
+- **Agentes anteriores (5.0–5.2)** solo conocen el `warehouse` general (alcance grupo → DWH del grupo; alcance empresa/agencia → destino efectivo de su empresa). Nexus **retiene** (no entrega; queda en `withheld_tasks` de la respuesta, en el log del backend y en **Instalaciones** del panel: "Tareas retenidas: N — actualice el agente a 5.3") las tareas que un agente anterior no ejecutaría correctamente:
+  - `destination_per_company`: la **conexión** efectiva de la tarea difiere de ese `warehouse` (se compara host, puerto, base, **usuario**, contraseña, `sslmode` y CA; misma base con otro usuario también cuenta);
+  - `ssl_enforced`: `sslmode` `require`/`verify-ca`/`verify-full` (un agente anterior se conectaría con `prefer`);
+  - `schema_ddl`: esquema destino ≠ `public`, tabla del catálogo sin esquema y `create_table_sql`/`create_constraint_sql` que no mencionan el esquema destino (sin el `search_path` del 5.3 ese DDL crearía objetos en `public`). Heurística conservadora: si el DDL ya califica con `<esquema>.` no se retiene.
+  - Lo que sí reciben: la tabla destino ya calificada (`esquema.tabla`), así que las cargas sin DDL del catálogo quedan en el esquema correcto. Actualice a 5.3 antes de configurar destinos propios, SSL obligatorio o esquemas con DDL de catálogo.
+- **Agente 5.3 contra un Nexus anterior**: sin `warehouse` por tarea usa el general (comportamiento previo); la prueba de conexión responde 404 y el hilo consulta muy de vez en cuando (600 s).
+- **Legado v3/v4** (`/configs`, `/agency-configs`): reciben el destino **efectivo** en los mismos campos (`dwh_*`) y la tabla calificada con el esquema. **No se les puede retener nada** (su contrato no lo contempla), así que con estos clientes: el SSL obligatorio **no** se aplica (se conectan con el comportamiento por defecto de su driver) y el DDL del catálogo sin esquema (`query_tabla_destino`, `query_constraint`) se ejecuta en `public` aunque el esquema destino sea otro. Migre esas sedes a 5.3 antes de usar esas opciones (o califique el DDL del catálogo con el esquema). `/group-configs` (un único DWH por respuesta) **excluye** las tareas de empresas con destino propio.
+
+### 22.4.1. Cuándo aplican los cambios y reinicio de la carga
+
+- Un cambio de destino (grupo o empresa) se guarda al instante en Nexus; cada agente lo toma en su **siguiente refresco** de configuración (`refresh_seconds` de la empresa, defecto 60 s). La tarea que **ya está corriendo** termina (o falla) en el destino **anterior**: su transacción se confirma o revierte allí. Si Nexus no está disponible, el agente sigue con la configuración que tenía en memoria hasta `config_max_age_seconds` (defecto 900 s); pasado ese plazo no inicia tareas nuevas (§17.5), así que nunca carga indefinidamente en un destino viejo.
+- **Reinicio de la carga**: cuando cambia la **ubicación física** del destino efectivo de una empresa (host, puerto, base o esquema; no usuario, contraseña ni SSL) —por editar el destino del grupo (afecta a las empresas que lo heredan), el destino propio, el modo heredar ↔ propio o mover la empresa de grupo— Nexus reinicia **automáticamente** el watermark y `last_run_at` de los extractores de esas empresas (igual que "Reiniciar última ejecución": la próxima ejecución hace carga completa en las tablas nuevas; los checkpoints de ejecuciones iniciadas antes se ignoran). El `PUT` acepta `reset_sync: false` para no reiniciar. La respuesta trae `destination_changed_companies` y `sync_reset_tasks`, y se audita `destination.change` (empresas cuyo destino cambió, nombres de los campos enviados —nunca valores—, extractores reiniciados).
+- El panel lo avisa **antes de guardar** ("Cambia el destino: al guardar se reiniciará la carga de N extractor(es)") con el interruptor *Reiniciar la carga (recomendado)*, activado por defecto.
+- El reinicio es **conservador**: abarca todos los extractores de las empresas afectadas, incluso los de tablas con esquema explícito en el catálogo (p. ej. `dwh.carter`, que no cambian de ubicación si solo cambia el esquema) y los casos en que el host solo cambia de nombre (IP ↔ DNS del mismo servidor). La recarga completa es inocua con claves de upsert, pero en tablas **sin claves** (inserción simple) duplica filas: en esos casos desactive el interruptor.
+
+### 22.5. Inventario (sección 19) con destinos por empresa
+
+- Un destino propio es **su propia** base monitoreada (`kind = dwh`) por identidad estable (`host:puerto/base`): se registra automáticamente (`dwh_auto_monitor`) cuando un agente con credenciales de ese destino pide el lease. Dos empresas con el mismo destino propio (o un destino propio igual al del grupo) comparten **un solo** registro, sin duplicados.
+- El agente 5.3 declara en el lease `dwh_identities` (las identidades de todos los DWH para los que tiene credenciales: el general y los de sus tareas) y elige la conexión por identidad (nunca otra conexión). Un agente anterior solo recibe su DWH principal.
+- El DWH del grupo solo se ofrece si alguna empresa del alcance lo usa (o el alcance es de grupo). Un destino propio se inventaría cuando la empresa tiene al menos una tarea autorizada (es de ahí de donde el agente obtiene las credenciales).
+- "Configuración vigente" de una base DWH considera también los destinos propios de las empresas del grupo.
+
+### 22.6. Panel
+
+- **Grupos** → editar: sección *Destino: Data Warehouse* con esquema destino, `sslmode` (con explicación de cada modo), certificado de la CA (PEM) y **Probar conexión** (estados: esperando a un agente → el agente está probando → resultado con cada verificación; *sin agente en línea*; *sin respuesta*). La lista muestra esquema, ssl y cuántas empresas tienen destino propio.
+- **Empresas** → editar: *Probar conexión al origen*; sección *Destino (DWH)* con el interruptor **Usar el destino del grupo** (activado por defecto; muestra el destino heredado). Al desactivarlo aparecen los campos del destino propio. *Probar conexión al destino* prueba el destino efectivo. La lista tiene la columna *Destino (DWH)* con la insignia *Destino del grupo* / *Destino propio*, esquema y ssl.
+- **Detalle de grupo** (`/grupos/[id]`): esquema/ssl del grupo y, por empresa, la insignia de destino y su esquema.
+
+### 22.7. Variables nuevas
+
+- Backend `[connection_test]`: `enabled` (true), `pending_ttl_seconds` (120), `running_ttl_seconds` (120), `online_seconds` (180), `agent_timeout_seconds` (15), `retention_days` (30), `poll_seconds` (10, sugerencia al agente), `min_interval_seconds` (30), `max_open_per_group` (5), `max_per_user_per_minute` (10).
+- Agente `[agent]`: `connection_test_enabled` (true; `false` = el agente no anuncia la capacidad ni consulta pruebas), `connection_test_poll_seconds` (10), `connection_test_min_spacing_seconds` (30), `connection_test_max_per_minute` (6).
+- API: `PUT /admin/groups/{id}` y `PUT /admin/companies/{id}` aceptan `reset_sync` (true); salida `inherited_task_count` (grupo) y `task_count` (empresa). `installation.withheld_tasks`/`withheld_at` en `/admin/installations`.
+- BD: `installation.withheld_tasks|withheld_at`; `client_group.warehouse_schema|warehouse_sslmode|warehouse_sslrootcert`; `company.warehouse_mode|warehouse_host|warehouse_port|warehouse_database|warehouse_username|warehouse_password|warehouse_schema|warehouse_sslmode|warehouse_sslrootcert`; tabla `connection_test`.
+
+### 22.8. Pruebas
+
+- `dwh_back/tests/test_destination.py` (19; las 6 últimas son regresiones de la validación: resultado hostil con secreto en `error_code`/`agent_version`, límites —60 solicitudes = 1 prueba, 429 por intervalo, por grupo y por usuario—, resultado fuera de plazo 410, retención `schema_ddl` y misma base con otro usuario, reinicio de la carga al cambiar el destino —y no al cambiar solo la contraseña— con auditoría y `reset_sync: false`, `verify-ca` sin CA 422): cifrado y resumen efectivo; validaciones (esquema, sslmode, PEM, puerto, destino propio incompleto, datos sin modo `custom`); permisos (`config.manage` vs `credentials.manage`, lectura sin host, otro grupo 404); volver a heredar borra el destino propio; `/agent/tasks` con destino por tarea y tabla calificada; retención para agentes anteriores (`destination_per_company`, `ssl_enforced`) sin registrar la descarga; endpoints legados con destino efectivo y `/group-configs` sin empresas con destino propio; prueba `no_agent`, permisos y alcance del panel, ciclo completo (claim por alcance, otra instalación 404, repetido 409, saneamiento, auditoría, `config_changed`), alcance de instalaciones de empresa, vencimiento; inventario con destino propio (agente anterior vs 5.3, sin duplicados, destino compartido).
+- `dwh_client/tests/test_destination_integration.py` (7, contenedores locales; incluye un usuario con `USAGE`+`CREATE` en el esquema destino pero **sin** `CREATE` en la base que crea tablas nuevas —antes fallaba con "permission denied for database"—): carga real en el destino del grupo (esquema del grupo) y en un destino propio (otra base del contenedor DWH y otro esquema, DDL del catálogo vía `search_path`); `require` contra el contenedor sin SSL → `DWH_SSL_ERROR` limpio en la carga y en la prueba; prueba correcta (versión, SSL no usado con aviso, privilegios; esquema inexistente sin crearlo), contraseña errónea (`DWH_AUTH_FAILED`) y usuario sin privilegios (`DWH_INSUFFICIENT_PRIVILEGE`), origen; inventario con dos bases DWH sin duplicados; sin credenciales en logs ni resultados.
+- `dwh_client/tests/test_units.py`: pruebas espaciadas y con tope por minuto en el agente, escritura concurrente atómica de la CA y CA en uso no borrada, esquema/tabla efectiva, `sslmode`/CA (archivo 0600, limpieza, `system`), clasificación `DWH_SSL_ERROR`, elección del DWH por identidad en el inventario, capacidades del heartbeat y cabecera.
+
+### 22.9. Pendiente / fuera de alcance
+
+- Probar valores **sin guardar** del formulario (hoy se guarda y luego se prueba; enviar credenciales no guardadas al agente exigiría almacenarlas temporalmente).
+- Certificado de **cliente** (`sslcert`/`sslkey`) para autenticación mutua TLS con el DWH.
+- SSL/TLS para los **orígenes** (SQL Server usa `TrustServerCertificate=yes` como antes).
+- Separar credenciales de inventario por propósito (sigue §19.1).
+- Canal residual en `error_code` de la prueba de conexión: un agente comprometido podría enviar un dato transformado (mayúsculas, `_`) que pase el formato; el agente ya posee esas credenciales, así que el riesgo es bajo (cerrarlo exigiría una lista cerrada de códigos).

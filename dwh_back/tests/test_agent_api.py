@@ -97,7 +97,7 @@ def test_migracion_sobre_bd_legada_recorta_tokens_y_rellena_ids():
             cur.execute("INSERT INTO activity_log (token, method, endpoint, status_code) VALUES ('company-token-completo-abcdefgh', 'GET', '/configs', 200)")
         conn.commit()
         applied = migrate.run_migrations(conn, baseline=False, log=lambda *_: None)
-        assert applied == ["001", "002", "003", "004", "005", "006", "007", "008", "009"]
+        assert applied == ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010"]
         with conn.cursor() as cur:
             cur.execute("SELECT token, company_id, group_id, task_id, auth_kind FROM client_events ORDER BY id")
             rows = cur.fetchall()

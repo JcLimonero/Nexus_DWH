@@ -76,6 +76,13 @@ class Settings:
     inventory_tick_seconds: int = 60
     inventory_statement_timeout_seconds: int = 60
 
+    connection_test_enabled: bool = True      # "Probar conexión" del panel (sección 22)
+    connection_test_poll_seconds: int = 10
+    # Protección de la base del cliente (cada prueba es un inicio de sesión): separación mínima
+    # entre pruebas a la MISMA conexión y tope de pruebas por minuto.
+    connection_test_min_spacing_seconds: int = 30
+    connection_test_max_per_minute: int = 6
+
     watermark_clock: str = "source"           # source | agent_local | agent_utc
     watermark_overlap_seconds: int = 120
     legacy_watermark_overlap_seconds: int = 3600
@@ -226,6 +233,11 @@ def load_settings(config_path: Optional[str] = None, data_dir: Optional[str] = N
     s.inventory_enabled = _bool(ini, "agent", "inventory_enabled", True)
     s.inventory_tick_seconds = _int(ini, "agent", "inventory_tick_seconds", 60, 5)
     s.inventory_statement_timeout_seconds = _int(ini, "agent", "inventory_statement_timeout_seconds", 60, 1)
+
+    s.connection_test_enabled = _bool(ini, "agent", "connection_test_enabled", True)
+    s.connection_test_poll_seconds = _int(ini, "agent", "connection_test_poll_seconds", 10, 3)
+    s.connection_test_min_spacing_seconds = _int(ini, "agent", "connection_test_min_spacing_seconds", 30, 0)
+    s.connection_test_max_per_minute = _int(ini, "agent", "connection_test_max_per_minute", 6, 1)
 
     s.watermark_clock = (_get(ini, "agent", "watermark_clock", "source") or "source").lower()
     if s.watermark_clock not in ("source", "agent_local", "agent_utc"):

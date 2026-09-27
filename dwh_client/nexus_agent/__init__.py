@@ -13,6 +13,7 @@ este paquete contiene los módulos testeables:
   etl         extracción / transformación / carga (una transacción por tarea)
   agent       orquestación: scheduler, worker, heartbeat, envío de la cola, inventario
   inventory   inventario estructural de solo lectura (sección 19)
+  destination destino efectivo (esquema, SSL/TLS) y prueba de conexión (sección 22)
   cli         línea de comandos (consola, --service, --selftest, --verify-update)
   winservice  servicio de Windows (pywin32) con parada ordenada (sección 21)
   selftest    autodiagnóstico sin red ni BD (drivers, TLS, SQLite)
@@ -21,4 +22,8 @@ este paquete contiene los módulos testeables:
   release_keys  claves PÚBLICAS de publicación confiables (compiladas en el ejecutable)
 """
 
-AGENT_VERSION = "5.2.0"
+AGENT_VERSION = "5.3.0"
+# Capacidades que el agente anuncia a Nexus (cabecera x-nexus-agent-features y heartbeat):
+#   destination-v2   destino por tarea (destino propio de empresa), esquema destino y SSL/TLS;
+#   connection-test  ejecuta "Probar conexión" pedida desde el panel (sección 22).
+AGENT_FEATURES = ("destination-v2", "connection-test")

@@ -183,3 +183,24 @@ password = TU_PASSWORD_AQUI
 ; evidence_window_days = 7
 ; Agrupar las particiones bajo su tabla raíz (una alerta en la raíz, no una por partición).
 ; collapse_partitions = true
+
+[connection_test]
+; "Probar conexión" del panel (sección 22 de DWH_README.md). La ejecuta SIEMPRE un agente en
+; línea con alcance (Nexus nunca se conecta a las bases de los clientes).
+; enabled = true
+; Sin agente que la tome en este tiempo → "Sin respuesta" (expired).
+; pending_ttl_seconds = 120
+; Tomada por un agente sin resultado en este tiempo (+ agent_timeout_seconds) → expired.
+; running_ttl_seconds = 120
+; Instalación "en línea" para poder pedir la prueba: último contacto dentro de esta ventana (s).
+; online_seconds = 180
+; Timeout de conexión/sentencia que se pide al agente (s, máx. 120).
+; agent_timeout_seconds = 15
+; retention_days = 30
+; Sugerencia al agente de cada cuánto consultar pruebas pendientes (s).
+; poll_seconds = 10
+; Límites (cada prueba es un inicio de sesión en la base del cliente): intervalo mínimo entre pruebas del
+; mismo destino (s), pruebas abiertas por grupo y solicitudes por usuario por minuto (→ 429).
+; min_interval_seconds = 30
+; max_open_per_group = 5
+; max_per_user_per_minute = 10

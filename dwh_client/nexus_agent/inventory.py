@@ -138,12 +138,14 @@ def connect_readonly_pg(params: Dict[str, Any], settings: Any) -> Any:
     st = max(1, int(getattr(settings, "inventory_statement_timeout_seconds", 60))) * 1000
     opts = (f"-c statement_timeout={st} -c lock_timeout=5000 -c default_transaction_read_only=on "
             f"-c idle_in_transaction_session_timeout={st * 2}")
+    from .destination import pg_ssl_kwargs
+
     conn = psycopg2.connect(
         host=str(params.get("host") or ""), port=int(params.get("port") or 5432),
         dbname=str(params.get("database") or ""), user=str(params.get("username") or ""),
         password=str(params.get("password") or ""),
         connect_timeout=int(getattr(settings, "db_connect_timeout_seconds", 15)),
-        options=opts, application_name="nexus-dwh-inventory",
+        options=opts, application_name="nexus-dwh-inventory", **pg_ssl_kwargs(params, settings),
     )
     conn.set_client_encoding("UTF8")
     # Transacción de solo lectura y vista consistente del catálogo.
@@ -350,15 +352,30 @@ def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def dwh_identity_of(wh: Dict[str, Any]) -> Optional[str]:
+    if not (wh or {}).get("host"):
+        return None
+    return connection_identity("dwh", "postgresql", wh.get("host"), wh.get("port") or 5432, wh.get("database"))
+
+
 def target_connection(target: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Credenciales (ya en memoria, de GET /agent/tasks) para el objetivo; nunca se piden aparte."""
+    """
+    Credenciales (ya en memoria, de GET /agent/tasks) para el objetivo; nunca se piden aparte.
+    DWH: el destino (del grupo o propio de una empresa) cuya identidad estable coincide con la
+    del objetivo; sin coincidencia no se inventaría (nunca se usa otra conexión).
+    """
+    from .destination import all_warehouses
+
     if target.get("kind") == "dwh":
-        wh = cfg.get("warehouse") or {}
-        if not wh.get("host"):
+        key = (target.get("identity_key") or "").strip()
+        candidates = all_warehouses(cfg)
+        wh = next((w for w in candidates if dwh_identity_of(w) == key), None) if key else \
+            (cfg.get("warehouse") or None)
+        if not wh or not wh.get("host"):
             return None
         return {"engine": "postgresql", "host": wh.get("host"), "port": wh.get("port") or 5432,
                 "database": wh.get("database"), "username": wh.get("username"), "password": wh.get("password"),
-                "dsn": ""}
+                "dsn": "", "sslmode": wh.get("sslmode") or "", "sslrootcert": wh.get("sslrootcert") or ""}
     for t in cfg.get("tasks") or []:
         if int(t.get("company_id") or 0) == int(target.get("company_id") or -1):
             src = t.get("source") or {}
@@ -369,9 +386,12 @@ def target_connection(target: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
 
 
 def capabilities(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    from .destination import all_warehouses
+
     wh = cfg.get("warehouse") or {}
     companies = sorted({int(t["company_id"]) for t in cfg.get("tasks") or [] if t.get("company_id")})
-    return {"dwh": bool(wh.get("host")), "source_company_ids": companies}
+    identities = sorted({k for k in (dwh_identity_of(w) for w in all_warehouses(cfg)) if k})
+    return {"dwh": bool(wh.get("host")), "source_company_ids": companies, "dwh_identities": identities}
 
 
 def build_snapshot(target: Dict[str, Any], conn_params: Dict[str, Any], settings: Any,

@@ -150,6 +150,7 @@ export default function InstalacionesPage() {
                           <Badge tone="amber">Desactualizada</Badge>
                         </div>
                       )}
+                      {i.withheld_tasks && i.withheld_tasks.length > 0 && <WithheldTasks items={i.withheld_tasks} />}
                     </Td>
                     <Td className="text-right tabular-nums">
                       {hb?.queue_depth ?? "—"}
@@ -266,5 +267,22 @@ export default function InstalacionesPage() {
         </DataState>
       </Card>
     </>
+  );
+}
+
+const WITHHELD_REASONS: Record<string, string> = {
+  destination_per_company: "destino propio de la empresa",
+  ssl_enforced: "SSL obligatorio",
+  schema_ddl: "DDL del catálogo sin esquema",
+};
+
+/** Tareas que Nexus no entrega a este agente por su versión (sección 22.4). */
+function WithheldTasks({ items }: { items: { task_id: number; reason: string }[] }) {
+  const reasons = Array.from(new Set(items.map((w) => WITHHELD_REASONS[w.reason] ?? w.reason)));
+  return (
+    <div className="mt-1 max-w-[16rem] whitespace-normal font-sans" title={`Tareas: ${items.map((w) => w.task_id).join(", ")}`}>
+      <Badge tone="amber">Tareas retenidas: {items.length}</Badge>
+      <p className="mt-0.5 text-xs text-amber-800">Actualice el agente a 5.3 ({reasons.join(", ")}).</p>
+    </div>
   );
 }
