@@ -246,6 +246,13 @@ class Checkpoint(_In):
     kind: Literal["source_clock", "agent_local", "agent_utc"] = "source_clock"
 
 
+class DdlApplied(_In):
+    """DDL que aplicó el agente Nexus en la ejecución (sin SQL): evidencia para el inventario estructural."""
+    object: str = Field(..., max_length=300)
+    action: Literal["create_table", "add_column", "constraint_ddl", "catalog_ddl"]
+    columns: List[Short] = Field(default_factory=list, max_length=200)
+
+
 class ExecutionUpdateBody(_In):
     event_id: Optional[uuid.UUID] = None
     task_id: int = Field(..., ge=1, le=INT_MAX)
@@ -264,6 +271,7 @@ class ExecutionUpdateBody(_In):
     error_message: Optional[str] = Field(None, max_length=4000)
     warnings: List[Short] = Field(default_factory=list, max_length=20)
     checkpoint: Optional[Checkpoint] = None
+    ddl_applied: List[DdlApplied] = Field(default_factory=list, max_length=50)
     agent_seq: int = Field(..., ge=1, le=BIGINT_MAX)
     client_version: str = Field("", max_length=50)
     event_time: Optional[datetime] = None
@@ -341,6 +349,7 @@ def create_agent_routers(
     download_log_retention_days: int = 30,
     future_tolerance_hours: int = 26,
     health: Optional[Any] = None,
+    inventory: Optional[Any] = None,
 ) -> Tuple[APIRouter, APIRouter, APIRouter]:
     """
     Devuelve (agent_router, admin_router, monitor_router).
@@ -814,6 +823,7 @@ def create_agent_routers(
                     rows_read = %s, rows_loaded = %s, rows_inserted = %s, rows_updated = %s,
                     error_code = %s, error_message_sanitized = %s, warnings = %s,
                     checkpoint_confirmed = %s, checkpoint_kind = %s,
+                    ddl_applied = %s,
                     event_time = COALESCE(%s, event_time),
                     started_at = COALESCE(started_at, %s),
                     query_version = COALESCE(query_version, %s),
@@ -826,6 +836,8 @@ def create_agent_routers(
                  to_utc(body.finished_at), body.duration_ms, body.rows_read, body.rows_loaded,
                  body.rows_inserted, body.rows_updated, err_code, err_msg, json.dumps(warnings),
                  naive(cp.watermark) if cp else None, cp.kind[:16] if cp else None,
+                 json.dumps([{"object": d.object.strip().lower(), "action": d.action,
+                              "columns": [c_ for c_ in d.columns][:200]} for d in body.ddl_applied]),
                  to_utc(body.event_time), to_utc(body.started_at), body.query_version, body.client_version,
                  body.agent_seq, str(execution_id)),
             )
@@ -833,6 +845,9 @@ def create_agent_routers(
             sync_changed = False
             if body.status in TERMINAL:
                 sync_changed = apply_sync_state(cur, ctx, ex, body, err_code, cp)
+                if inventory is not None and body.ddl_applied:
+                    # Evidencia (no atribución) para alertas estructurales ya detectadas.
+                    inventory.on_execution_ddl(cur, ex, ex.get("ddl_applied") or [])
                 if health is not None:
                     health.on_execution_terminal(
                         cur, installation_id=str(ctx.id), installation_name=ctx.name, task=t, ex=ex,
@@ -923,6 +938,11 @@ def create_agent_routers(
                     scope={"group_id": ctx.group_id, "company_id": ctx.company_id, "agency_id": ctx.agency_id},
                     event_type=body.event_type, payload=payload)
         return {"status": "ok", "duplicate": not created}
+
+    # ── Inventario estructural (sección 19) ─────────────────────────────────
+    if inventory is not None:
+        from inventory_postgres import register_agent_inventory_routes
+        register_agent_inventory_routes(agent, authenticate, inventory)
 
     # ── Rotación de credencial ──────────────────────────────────────────────
     @agent.post("/credentials/rotate")

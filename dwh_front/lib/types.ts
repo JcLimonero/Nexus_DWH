@@ -499,3 +499,219 @@ export interface NotificationChannel {
   created_at: string;
   updated_at: string;
 }
+
+// ── Inventario estructural (sección 19) ─────────────────────────────────────
+export type MonitoredKind = "dwh" | "source";
+export type MonitoredState = "awaiting_first_snapshot" | "baseline_pending" | "monitoring";
+export type VerificationStatus = "never" | "verified" | "partial" | "unverifiable";
+export type EffectiveStatus = VerificationStatus | "disabled" | "duplicate";
+export type ObjectType = "table" | "view" | "matview" | "foreign_table";
+export type ChangeKind = "object_added" | "object_removed" | "object_modified";
+export type ChangeStatus = "pending" | "acknowledged" | "superseded" | "reverted" | "out_of_scope";
+export type Attribution = "client" | "nexus";
+
+export interface MonitoredLink {
+  group_id: number;
+  group_name: string | null;
+  company_id: number | null;
+  company_name: string | null;
+}
+
+export interface MonitoredDatabase {
+  id: number;
+  kind: MonitoredKind;
+  engine: string;
+  identity_key: string;
+  display_name: string;
+  group_id: number | null;
+  group_name: string | null;
+  company_id: number | null;
+  company_name: string | null;
+  enabled: boolean;
+  scan_interval_seconds: number;
+  schema_include: string[];
+  schema_exclude: string[];
+  default_schema_exclude: string[];
+  view_definitions_enabled: boolean;
+  engine_identity: string | null;
+  engine_identity_strength: string | null;
+  duplicate_of_id: number | null;
+  allow_engine_duplicate: boolean;
+  engine_identity_weak: string | null;
+  lease_installation_id: string | null;
+  lease_installation_name: string | null;
+  lease_active: boolean;
+  lease_until: string | null;
+  scan_requested_at: string | null;
+  state: MonitoredState;
+  verification_status: VerificationStatus;
+  effective_status: EffectiveStatus;
+  stale: boolean;
+  last_attempt_at: string | null;
+  last_verified_at: string | null;
+  last_verified_snapshot_id: number | null;
+  last_reason_code: string | null;
+  baseline_version: number;
+  baseline_approved_at: string | null;
+  baseline_approved_by: string | null;
+  pending_changes: number;
+  baseline_objects: number;
+  observed_objects: number;
+  links: MonitoredLink[];
+  created_at: string;
+  warning?: string;
+}
+
+export interface InventorySnapshot {
+  id: number;
+  installation_id: string | null;
+  installation_name: string | null;
+  captured_at: string | null;
+  received_at: string;
+  status: "complete" | "partial" | "unreliable";
+  reason_code: string | null;
+  object_count: number;
+  schemas_verified: string[];
+  schemas_unverifiable: { schema_name: string; reason: string }[];
+  agent_version: string;
+  server_version: string;
+  processing: Record<string, unknown>;
+}
+
+export interface MonitoredEvent {
+  id: number;
+  event_type: string;
+  actor: string;
+  message: string | null;
+  data: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface MonitoredDatabaseDetail extends MonitoredDatabase {
+  snapshots: InventorySnapshot[];
+  events: MonitoredEvent[];
+  config_current: boolean;
+}
+
+export interface ColumnStructure {
+  type: string;
+  not_null: boolean;
+  default: string | null;
+  [k: string]: unknown;
+}
+
+export interface ObjectStructure {
+  columns?: Record<string, ColumnStructure>;
+  constraints?: Record<string, { type: string; definition: string }>;
+  indexes?: Record<string, { unique: boolean; definition: string }>;
+  definition_hash?: string;
+  [k: string]: unknown;
+}
+
+export interface BaselineItem {
+  schema_name: string;
+  name: string;
+  type: ObjectType;
+  fingerprint: string;
+  columns: number;
+  constraints: number;
+  indexes: number;
+  has_definition_hash: boolean;
+  structure: ObjectStructure;
+  nexus_catalog_match: boolean;
+}
+
+export interface BaselineResponse {
+  view: "approved" | "proposal";
+  state: MonitoredState;
+  total: number;
+  items: BaselineItem[];
+  snapshot: { id: number; status: string; received_at: string; captured_at: string | null; schemas_verified: string[]; schemas_unverifiable: { schema_name: string; reason: string }[]; object_count: number } | null;
+  baseline_version: number;
+}
+
+export interface StructuralDiff {
+  kind: string;
+  item: string | null;
+  before: unknown;
+  after: unknown;
+}
+
+export interface Evidence {
+  type: "nexus_execution" | "nexus_catalog";
+  note: string;
+  execution_id?: string;
+  task_id?: number;
+  installation_id?: string | null;
+  finished_at?: string | null;
+  action?: string;
+  columns?: string[];
+  object_catalog_id?: number;
+  object_name?: string;
+  company_id?: number;
+}
+
+export interface StructuralChange {
+  id: number;
+  monitored_database_id: number;
+  schema_name: string;
+  object_name: string;
+  object_type: ObjectType;
+  change_kind: ChangeKind;
+  change_types: string[];
+  baseline_fingerprint: string | null;
+  observed_fingerprint: string;
+  first_detected_at: string;
+  last_observed_at: string;
+  observation_count: number;
+  status: ChangeStatus;
+  status_changed_at: string;
+  supersedes_id: number | null;
+  superseded_by_id: number | null;
+  attribution: Attribution | null;
+  ack_by: string | null;
+  ack_at: string | null;
+  ack_comment: string | null;
+  ticket_ref: string | null;
+  reclassified_at: string | null;
+  reclassified_by: string | null;
+  row_version: number;
+  evidence: Evidence[];
+  evidence_count: number;
+  baseline_version: number;
+  database_kind: MonitoredKind;
+  database_name: string;
+  group_id: number | null;
+  group_name: string | null;
+  company_id: number | null;
+  company_name: string | null;
+}
+
+export interface StructuralChangeDetail extends StructuralChange {
+  diffs: StructuralDiff[];
+  previous_structure: ObjectStructure | null;
+  current_structure: ObjectStructure | null;
+  previous_definition_hash: string | null;
+  current_definition_hash: string | null;
+  definitions_stored: boolean;
+  definitions_viewable: boolean;
+  events: MonitoredEvent[];
+  object_history: { id: number; change_kind: ChangeKind; status: ChangeStatus; first_detected_at: string; attribution: Attribution | null; ack_at: string | null }[];
+  database_state: { state: MonitoredState; verification_status: VerificationStatus; last_verified_at: string | null };
+  labels: Record<string, string>;
+}
+
+export interface StructureBadge {
+  pending_changes: number;
+  unverifiable_databases: number;
+  awaiting_baseline: number;
+}
+
+export interface InventorySummary {
+  databases: number;
+  by_status: Partial<Record<EffectiveStatus, number>>;
+  pending_changes: number;
+  awaiting_baseline: number;
+  unverifiable: number;
+  permissions: Record<string, string>;
+}

@@ -62,6 +62,12 @@ agency_token =
 ; dwh_lock_timeout_seconds = 300
 ; fetch_chunk_rows = 20000
 
+; Inventario estructural de solo lectura (sección 19). Nexus decide qué bases y cada cuánto;
+; este es solo el ciclo en que el agente pregunta. Timeout por sentencia de las consultas al catálogo.
+; inventory_enabled = true
+; inventory_tick_seconds = 60
+; inventory_statement_timeout_seconds = 60
+
 ; source (defecto) | agent_local | agent_utc
 ; watermark_clock = source
 ; watermark_overlap_seconds = 120

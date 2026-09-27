@@ -15,6 +15,8 @@ api.py — cliente HTTP de la API /agent de Nexus.
   (su propia ``requests.Session``).
 """
 
+import gzip
+import json
 import os
 import platform
 import socket
@@ -129,26 +131,35 @@ class NexusApi:
         return {"x-installation-id": cred.installation_id, "x-installation-secret": cred.secret}
 
     def request(self, method: str, path: str, *, json_body: Optional[Dict[str, Any]] = None,
-                headers: Optional[Dict[str, str]] = None, auth: bool = True) -> Dict[str, Any]:
+                headers: Optional[Dict[str, str]] = None, auth: bool = True, compress: bool = False) -> Dict[str, Any]:
         used = self.holder.get() if auth else None
         try:
-            return self._request_once(method, path, json_body=json_body, headers=headers, auth=auth)
+            return self._request_once(method, path, json_body=json_body, headers=headers, auth=auth,
+                                      compress=compress)
         except ApiAuthError as exc:
             # Otro hilo pudo rotar el secreto mientras esta petición iba en vuelo:
             # se reintenta UNA vez con la credencial vigente antes de darla por mala.
             if auth and exc.code != "installation_revoked" and self.holder.get() is not used:
-                return self._request_once(method, path, json_body=json_body, headers=headers, auth=auth)
+                return self._request_once(method, path, json_body=json_body, headers=headers, auth=auth,
+                                          compress=compress)
             raise
 
     def _request_once(self, method: str, path: str, *, json_body: Optional[Dict[str, Any]] = None,
-                      headers: Optional[Dict[str, str]] = None, auth: bool = True) -> Dict[str, Any]:
+                      headers: Optional[Dict[str, str]] = None, auth: bool = True,
+                      compress: bool = False) -> Dict[str, Any]:
         hdrs = dict(headers or {})
         if auth:
             hdrs.update(self._auth_headers())
         url = f"{self.base}{path}"
+        kwargs: Dict[str, Any] = {"json": json_body}
+        if compress and json_body is not None:
+            # Cuerpo grande (inventario): gzip; Nexus lo descomprime con límite (anti zip-bomb).
+            kwargs = {"data": gzip.compress(json.dumps(json_body, separators=(",", ":"),
+                                                       ensure_ascii=False).encode("utf-8"), 6)}
+            hdrs.update({"Content-Type": "application/json", "Content-Encoding": "gzip"})
         try:
-            r = self.session.request(method, url, json=json_body, headers=hdrs, timeout=self.timeout,
-                                     allow_redirects=False)
+            r = self.session.request(method, url, headers=hdrs, timeout=self.timeout,
+                                     allow_redirects=False, **kwargs)
         except requests.RequestException as exc:
             raise ApiUnavailable(0, "network_error", redact_text(f"{type(exc).__name__}: {exc}", max_len=200))
         status = r.status_code
@@ -202,3 +213,10 @@ class NexusApi:
 
     def rotate_credentials(self) -> Dict[str, Any]:
         return self.request("POST", "/agent/credentials/rotate")
+
+    # Inventario estructural (sección 19)
+    def inventory_lease(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.request("POST", "/agent/inventory/lease", json_body=payload)
+
+    def inventory_snapshot(self, payload: Dict[str, Any], compress: bool = True) -> Dict[str, Any]:
+        return self.request("POST", "/agent/inventory/snapshots", json_body=payload, compress=compress)

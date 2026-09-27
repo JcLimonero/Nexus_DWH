@@ -9,6 +9,8 @@ Hilos:
   * heartbeat: POST /agent/heartbeat cada ``heartbeat_seconds`` con su propia
     sesión HTTP; no comparte locks con el ETL (lee contadores atómicos).
   * sender: vacía la cola local (SQLite) en orden de agent_seq, con backoff.
+  * inventory: inventario estructural de solo lectura de las bases que Nexus le
+    asigne (lease), con su propia sesión HTTP y frecuencia independiente del ETL.
 
 Autorización con caducidad: la config (credenciales + SQL) vive SOLO en
 memoria y vale ``config_max_age_seconds``. Si Nexus no responde durante más
@@ -41,6 +43,7 @@ from .api import (
     installation_info,
 )
 from .credstore import CredentialStore, InstallationCredential
+from .inventory import InventoryRunner
 from .etl import RunContext, TaskResult, parse_watermark, register_task_secrets, run_task, watermark_iso
 from .localstate import LocalState, OutboxItem
 from .logsetup import get_logger
@@ -402,6 +405,7 @@ class Agent:
             rows_read=res.rows_read if res else None, rows_loaded=res.rows_loaded if res else None,
             rows_inserted=res.rows_inserted if res else None, rows_updated=res.rows_updated if res else None,
             error_code=code, error_message=message, warnings=list(res.warnings) if res else [],
+            ddl_applied=list(ctx.ddl_applied)[:50],
             event_time=iso_utc(finished),
         )
         checkpoint = None
@@ -684,10 +688,21 @@ class Agent:
             finally:
                 self._busy.clear()
 
+    def _inventory_loop(self) -> None:
+        api = self.api_factory(self.settings, self.holder)  # sesión HTTP propia
+        try:
+            InventoryRunner(self.settings, api, self.fresh_config, stop_event=self.stop_event,
+                            on_api_ok=self.mark_api_ok).loop()
+        finally:
+            api.close()
+
     def start_threads(self) -> None:
         self._sender_stop_deadline = float("inf")
-        for name, target in (("heartbeat", self._heartbeat_loop), ("sender", self._sender_loop),
-                             ("worker", self._worker_loop)):
+        threads = [("heartbeat", self._heartbeat_loop), ("sender", self._sender_loop),
+                   ("worker", self._worker_loop)]
+        if self.settings.inventory_enabled:
+            threads.append(("inventory", self._inventory_loop))
+        for name, target in threads:
             th = threading.Thread(target=target, name=name, daemon=True)
             th.start()
             self._threads.append(th)

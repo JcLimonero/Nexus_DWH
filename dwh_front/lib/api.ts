@@ -14,6 +14,10 @@ function extractDetail(data: unknown, fallback: string): string {
   if (data && typeof data === "object" && "detail" in data) {
     const d = (data as { detail: unknown }).detail;
     if (typeof d === "string") return d;
+    // Errores con código: {"detail": {"code": "...", "message": "..."}}
+    if (d && typeof d === "object" && !Array.isArray(d) && typeof (d as { message?: unknown }).message === "string") {
+      return (d as { message: string }).message;
+    }
     // Errores de validación de FastAPI: [{loc, msg}, ...]
     if (Array.isArray(d)) {
       return d
