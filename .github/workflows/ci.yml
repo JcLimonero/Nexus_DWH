@@ -114,6 +114,10 @@ jobs:
       - name: Ejecutable compilado --version / --selftest / --verify-update
         run: |
           $exe = "build\dist\NexusAgent\NexusAgent.exe"
+          Write-Host "PowerShell $($PSVersionTable.PSVersion)"
+          # Sonda (no bloqueante): captura de la salida del .exe con el operador de llamada de pwsh.
+          try { $o = & (Resolve-Path $exe).Path --version; Write-Host "captura con & OK: $o" }
+          catch { Write-Host "captura con & FALLA: $($_.Exception.Message)" }
           & $exe --version; if ($LASTEXITCODE) { exit 1 }
           & $exe --selftest; if ($LASTEXITCODE) { exit 1 }
           & $exe --verify-update build\dist\NexusAgent --allow-same-version --allow-unsigned-manifest; if ($LASTEXITCODE) { exit 1 }
@@ -139,9 +143,9 @@ jobs:
           # is redirected"). -EncodedCommand evita problemas de comillas en rutas con espacios.
           $winps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
           function Invoke-Script([string]$Invocation) {
-            $cmd = "try { `$global:LASTEXITCODE = `$null; $Invocation; if (`$null -eq `$LASTEXITCODE) { exit 99 }; exit `$LASTEXITCODE } " +
+            $cmd = "`$ProgressPreference = 'SilentlyContinue'; try { `$global:LASTEXITCODE = `$null; $Invocation; if (`$null -eq `$LASTEXITCODE) { exit 99 }; exit `$LASTEXITCODE } " +
                    "catch { Write-Host ('ERROR no controlado: ' + `$_.Exception.Message); exit 1 }"
-            & $winps -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd)))
+            & $winps -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd)))
           }
           function Show-Diagnostics {
             try {
@@ -157,10 +161,21 @@ jobs:
             } catch { Write-Host "Diagnóstico incompleto: $($_.Exception.Message)" }
           }
           function Assert($cond, $msg) { if (-not $cond) { Show-Diagnostics; Write-Host "::error::$msg"; exit 1 } }
+          trap { Show-Diagnostics; break }
+          # La versión se lee con stdout redirigido explícitamente: "(& NexusAgent.exe --version)" falla
+          # en el pwsh del runner ("StandardOutputEncoding is only supported when standard output is
+          # redirected").
+          function Get-AgentVersion([string]$Exe) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo $Exe, '--version'
+            $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $out = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -ne 0) { throw "$Exe --version terminó con $($p.ExitCode)" }
+            return $out.Trim()
+          }
           function Assert-OldVersionRunning($label) {
             Start-Sleep -Seconds 5
             Assert ((Get-Service NexusAgent).Status -eq 'Running') "${label}: el servicio no está en ejecución tras la vuelta atrás"
-            $v = (& "$installed\NexusAgent.exe" --version).Trim()
+            $v = Get-AgentVersion "$installed\NexusAgent.exe"
             Assert ($v -eq $script:origVersion) "${label}: versión instalada $v, se esperaba $script:origVersion"
             Assert (-not (Get-ChildItem 'C:\Program Files' -Directory -Filter 'NexusAgent.new-*')) "${label}: quedó una carpeta de trabajo"
           }
@@ -168,7 +183,7 @@ jobs:
           # 1) Instalación sin token: arranca, comprueba DPAPI con su cuenta y se detiene con código 2.
           Invoke-Script "& '$pkg\scripts\install_service.ps1' -PackageDir '$pkg' -ApiUrl 'http://127.0.0.1:9' -AllowUnsignedManifest"
           Assert ($LASTEXITCODE -eq 2) "install_service.ps1 debía terminar con 2 (sin token), fue $LASTEXITCODE"
-          $script:origVersion = (& "$installed\NexusAgent.exe" --version).Trim()
+          $script:origVersion = Get-AgentVersion "$installed\NexusAgent.exe"
           sc.exe qc NexusAgent; sc.exe qprivs NexusAgent; sc.exe qfailure NexusAgent; sc.exe query NexusAgent
           $svc = Get-CimInstance Win32_Service -Filter "Name='NexusAgent'"
           Assert ($svc.StartName -eq 'NT SERVICE\NexusAgent') "Cuenta del servicio: $($svc.StartName)"
@@ -271,7 +286,14 @@ jobs:
       - name: Nombre del artefacto
         id: name
         run: |
-          $v = (& build\dist\NexusAgent\NexusAgent.exe --version).Trim()
+          function Get-AgentVersion([string]$Exe) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo $Exe, '--version'
+            $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $out = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -ne 0) { throw "$Exe --version terminó con $($p.ExitCode)" }
+            return $out.Trim()
+          }
+          $v = Get-AgentVersion (Resolve-Path build\dist\NexusAgent\NexusAgent.exe).Path
           "artifact=NexusAgent-$v-windows-x64-SIN-FIRMAR" >> $env:GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
@@ -335,7 +357,14 @@ jobs:
           if ($LASTEXITCODE) { exit 1 }
           python packaging\verify_package.py build\dist\NexusAgent
           if ($LASTEXITCODE) { exit 1 }
-          $v = (& build\dist\NexusAgent\NexusAgent.exe --version).Trim()
+          function Get-AgentVersion([string]$Exe) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo $Exe, '--version'
+            $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); $out = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+            if ($p.ExitCode -ne 0) { throw "$Exe --version terminó con $($p.ExitCode)" }
+            return $out.Trim()
+          }
+          $v = Get-AgentVersion (Resolve-Path build\dist\NexusAgent\NexusAgent.exe).Path
           "ARTIFACT=NexusAgent-$v-windows-x64-firmado" >> $env:GITHUB_ENV
       - uses: actions/upload-artifact@v4
         with:

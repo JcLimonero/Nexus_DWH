@@ -51,6 +51,19 @@ $account = "NT SERVICE\$ServiceName"
 
 function Fail([string]$msg, [int]$code = 1) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit $code }
 
+function Get-AgentVersion([string]$Exe) {
+  # Captura explícita de stdout: en pwsh 7.x "(& NexusAgent.exe --version)" puede fallar con
+  # "StandardOutputEncoding is only supported when standard output is redirected".
+  $psi = New-Object System.Diagnostics.ProcessStartInfo $Exe, '--version'
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEnd()
+  $p.WaitForExit()
+  if ($p.ExitCode -ne 0) { throw "$Exe --version terminó con $($p.ExitCode)" }
+  return $out.Trim()
+}
+
 function Invoke-Icacls([string[]]$IcaclsArgs) {
   & icacls.exe @IcaclsArgs | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "icacls $($IcaclsArgs -join ' ') -> $LASTEXITCODE" }
@@ -101,7 +114,7 @@ if (-not (Test-Path $installedExe)) { Fail "No hay agente instalado en $InstallD
 if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { Fail "No existe el servicio $ServiceName." }
 if (-not (Test-Path $PackageDir -PathType Container)) { Fail "No existe la carpeta del paquete $PackageDir." }
 $PackageDir = (Resolve-Path $PackageDir).Path
-$currentVersion = (& $installedExe --version).Trim()
+$currentVersion = Get-AgentVersion $installedExe
 
 # -- 1. Copia de trabajo solo para Administradores ---------------------------
 $stamp = Get-Date -Format 'yyyyMMddHHmmss'
@@ -228,7 +241,7 @@ if (-not $swapped) { Remove-Staging }
 try { Start-Service -Name $ServiceName -ErrorAction Stop } catch { $problems += "Start-Service: $($_.Exception.Message)" }
 Start-Sleep -Seconds 5
 $status = (Get-Service -Name $ServiceName).Status
-$restoredVersion = if (Test-Path $installedExe) { (& $installedExe --version).Trim() } else { '(sin programa)' }
+$restoredVersion = if (Test-Path $installedExe) { try { Get-AgentVersion $installedExe } catch { "(error: $($_.Exception.Message))" } } else { '(sin programa)' }
 if ($problems.Count -gt 0 -or $status -ne 'Running' -or $restoredVersion -ne $currentVersion) {
   Write-Host "ATENCIÓN: la restauración NO quedó completa. Servicio: $status. Programa en ${InstallDir}: $restoredVersion." -ForegroundColor Red
   foreach ($p in $problems) { Write-Host "  - $p" -ForegroundColor Red }
