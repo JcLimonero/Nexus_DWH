@@ -130,11 +130,31 @@ class AuthSettings:
     allow_static_token: bool = False
     static_token: str = ""
     # Proxies de confianza (p. ej. el servidor del panel Next en la misma máquina): solo de
-    # ellos se acepta X-Forwarded-For para conocer la IP real del usuario (límite por IP).
+    # ellos (y con panel_proxy_key) se acepta x-nexus-client-ip para conocer la IP real del
+    # usuario (límite por IP). Direcciones o redes CIDR (contenedores: 10.0.0.0/8,172.16.0.0/12).
     trusted_proxies: Tuple[str, ...] = ("127.0.0.1", "::1")
     # Secreto compartido con el servidor del panel (DWH_PANEL_PROXY_KEY): solo con él se
     # acepta la IP del usuario que envía el panel (x-nexus-client-ip).
     panel_proxy_key: str = ""
+
+    def is_trusted_proxy(self, ip: str) -> bool:
+        """``ip`` coincide con una entrada de ``trusted_proxies`` (dirección exacta o red CIDR)."""
+        if not ip:
+            return False
+        if ip in self.trusted_proxies:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        for entry in self.trusted_proxies:
+            try:
+                net = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                continue
+            if addr.version == net.version and addr in net:
+                return True
+        return False
 
     @classmethod
     def from_ini(cls, ini: Any, static_token: str = "") -> "AuthSettings":
@@ -287,7 +307,7 @@ class AuthService:
         """
         peer = request.client.host if request.client else ""
         key = request.headers.get("x-nexus-proxy-key", "")
-        if peer in self.s.trusted_proxies and self.s.panel_proxy_key and key \
+        if self.s.is_trusted_proxy(peer) and self.s.panel_proxy_key and key \
                 and hmac.compare_digest(key.encode("utf-8"), self.s.panel_proxy_key.encode("utf-8")):
             raw = request.headers.get("x-nexus-client-ip", "").strip()
             try:
@@ -302,7 +322,7 @@ class AuthService:
         sin clave) o loopback → "" (sin límite por IP; queda el bloqueo por usuario): nunca se
         bloquea a todos los usuarios por los fallos de otros.
         """
-        if not ip or ip in self.s.trusted_proxies:
+        if not ip or self.s.is_trusted_proxy(ip):
             return ""
         try:
             if ipaddress.ip_address(ip).is_loopback:

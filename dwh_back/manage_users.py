@@ -15,13 +15,13 @@ Otros comandos:
     python manage_users.py deactivate --username X           (cierra sus sesiones)
     python manage_users.py revoke-sessions --username X
 
-Usa el mismo config.ini que el backend (o --config / NEXUS_CONFIG_FILE) y requiere
+Usa el mismo config.ini que el backend (o --config / NEXUS_CONFIG_FILE; opcional con las
+variables NEXUS__DATABASE__* del contenedor) y requiere
 la migración 009 aplicada (python migrate.py). Cada acción queda en panel_audit_log
 con actor "cli".
 """
 
 import argparse
-import configparser
 import getpass
 import json
 import os
@@ -35,20 +35,16 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
+from nexus_config import db_connect_params, default_config_path, load_config  # noqa: E402
 from panel_auth import password_problems, valid_username  # noqa: E402
 
 
 def connect(config_path: str):
-    ini = configparser.ConfigParser()
-    if not ini.read(config_path):
-        sys.exit(f"No se pudo leer {config_path}")
-    return psycopg2.connect(
-        host=ini.get("database", "host", fallback="127.0.0.1"),
-        port=ini.getint("database", "port", fallback=5432),
-        user=ini.get("database", "user", fallback="postgres"),
-        password=ini.get("database", "password", fallback=""),
-        dbname=ini.get("database", "db", fallback="nexus_config"),
-    ), ini
+    # config.ini opcional + variables NEXUS__<SECCION>__<CLAVE> (contenedores, DWH_README.md §23).
+    ini, info = load_config(config_path)
+    if not info["file_loaded"] and not any(k.startswith("database.") for k in info["applied"]):
+        sys.exit(f"No se pudo leer {config_path} ni hay variables NEXUS__DATABASE__*.")
+    return psycopg2.connect(connect_timeout=10, **db_connect_params(ini)), ini
 
 
 def read_password(args: argparse.Namespace, username: str, min_length: int) -> str:
@@ -76,7 +72,7 @@ def audit(cur, action: str, target_id, details=None) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Usuarios del panel Nexus DWH")
-    ap.add_argument("--config", default=os.environ.get("NEXUS_CONFIG_FILE") or os.path.join(APP_DIR, "config.ini"))
+    ap.add_argument("--config", default=default_config_path())
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("create-superadmin", help="Crea un superadministrador")
     c.add_argument("--username", required=True)

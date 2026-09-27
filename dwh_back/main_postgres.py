@@ -31,7 +31,6 @@ Endpoints administración (requieren header x-admin-token; ver admin_postgres.py
 """
 
 import argparse
-import configparser
 import hmac
 import json
 import logging
@@ -71,14 +70,17 @@ if getattr(sys, "frozen", False):
 else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# NEXUS_CONFIG_FILE permite usar otro config.ini (p. ej. pruebas automatizadas).
-CONFIG_PATH = os.environ.get("NEXUS_CONFIG_FILE", "").strip() or os.path.join(_APP_DIR, "config.ini")
-_ini = configparser.ConfigParser()
-_ini.read(CONFIG_PATH)
-
 # Los módulos hermanos (admin_postgres, agent_postgres, redact) se importan por nombre.
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
+
+from nexus_config import db_connect_params, default_config_path, load_config  # noqa: E402
+
+# NEXUS_CONFIG_FILE permite usar otro config.ini (p. ej. pruebas automatizadas). El archivo es
+# OPCIONAL: las variables NEXUS__<SECCION>__<CLAVE> definen o sobrescriben cualquier valor
+# (contenedores/Coolify, DWH_README.md §23).
+CONFIG_PATH = default_config_path()
+_ini, _CONFIG_INFO = load_config(CONFIG_PATH)
 
 from redact import redact_text, token_prefix  # noqa: E402
 
@@ -88,12 +90,21 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 server_log = logging.getLogger("nexus.server")
+# Solo nombres (nunca valores) de lo que vino del entorno.
+if _CONFIG_INFO["applied"]:
+    server_log.info("Configuración desde variables de entorno: %s", ", ".join(_CONFIG_INFO["applied"]))
+if _CONFIG_INFO["invalid"]:
+    server_log.warning("Variables NEXUS__ ignoradas (formato NEXUS__SECCION__CLAVE): %s",
+                       ", ".join(_CONFIG_INFO["invalid"]))
+if not _CONFIG_INFO["file_loaded"] and not _CONFIG_INFO["applied"]:
+    server_log.warning("Sin config.ini ni variables NEXUS__*: se usan los valores por defecto.")
 
-DB_HOST       = _ini.get("database", "host",     fallback="127.0.0.1")
-DB_PORT       = _ini.getint("database", "port",  fallback=5432)
-DB_NAME       = _ini.get("database", "db",       fallback="nexus_config")
-DB_USER       = _ini.get("database", "user",     fallback="postgres")
-DB_PASS       = _ini.get("database", "password", fallback="")
+_DB_PARAMS    = db_connect_params(_ini)
+DB_HOST       = _DB_PARAMS["host"]
+DB_PORT       = _DB_PARAMS["port"]
+DB_NAME       = _DB_PARAMS["dbname"]
+DB_USER       = _DB_PARAMS["user"]
+DB_PASS       = _DB_PARAMS["password"]
 MONITOR_TOKEN = _ini.get("monitor",  "token",    fallback="")
 CONFIG_SECRET_KEY = _ini.get(
     "security", "config_secret_key",
@@ -226,7 +237,7 @@ class GroupConfigsResponse(BaseModel):
 from db_pool import BoundedPool  # noqa: E402
 
 DB_POOL = BoundedPool(
-    dict(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, dbname=DB_NAME,
+    dict(_DB_PARAMS,
          connect_timeout=_ini.getint("database", "connect_timeout_seconds", fallback=5),
          application_name=_ini.get("database", "application_name", fallback="nexus_dwh_back")[:60]),
     minconn=_ini.getint("database", "pool_min", fallback=5),

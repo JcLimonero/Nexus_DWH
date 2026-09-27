@@ -21,11 +21,11 @@ Uso:
     python migrate.py --config /ruta/config.ini
 
 La conexión se toma de [database] del config.ini del backend (o del archivo
-indicado en --config / variable NEXUS_CONFIG_FILE).
+indicado en --config / variable NEXUS_CONFIG_FILE) y de las variables
+NEXUS__DATABASE__* (el archivo es opcional en contenedores; DWH_README.md §23).
 """
 
 import argparse
-import configparser
 import hashlib
 import os
 import re
@@ -40,6 +40,11 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+import nexus_config as _cfg  # noqa: E402
+
 BASELINE_FILE = os.path.join(APP_DIR, "schema_postgres.sql")
 MIGRATIONS_DIR = os.path.join(APP_DIR, "migrations")
 _MIGRATION_RE = re.compile(r"^(\d{3,})_([A-Za-z0-9_\-]+)\.sql$")
@@ -48,20 +53,15 @@ _LOCK_KEY = 834_120_551
 
 
 def default_config_path() -> str:
-    return os.environ.get("NEXUS_CONFIG_FILE", "").strip() or os.path.join(APP_DIR, "config.ini")
+    return _cfg.default_config_path()
 
 
 def load_db_params(config_path: Optional[str] = None) -> Dict[str, Any]:
-    ini = configparser.ConfigParser()
-    ini.read(config_path or default_config_path())
-    return {
-        "host": ini.get("database", "host", fallback="127.0.0.1"),
-        "port": ini.getint("database", "port", fallback=5432),
-        "dbname": ini.get("database", "db", fallback="nexus_config"),
-        "user": ini.get("database", "user", fallback="postgres"),
-        "password": ini.get("database", "password", fallback=""),
-        "connect_timeout": 10,
-    }
+    # config.ini opcional + variables NEXUS__DATABASE__* (DWH_README.md §23).
+    ini, _info = _cfg.load_config(config_path or default_config_path())
+    params = _cfg.db_connect_params(ini)
+    params["connect_timeout"] = 10
+    return params
 
 
 def _sha256(text: str) -> str:
