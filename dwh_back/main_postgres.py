@@ -18,6 +18,10 @@ Endpoints monitor (requieren header x-monitor-token):
   GET  /monitor/activity         → log HTTP del backend
   PUT  /monitor/events/{id}/ack  → reconocer una alerta
   PUT  /monitor/events/ack-all   → reconocer todas las alertas
+
+Endpoints administración (requieren header x-admin-token; ver admin_postgres.py):
+  /admin/*                       → CRUD de grupos, companies, agencias,
+                                   catálogo de objetos y tareas (panel dwh_front)
 """
 
 import argparse
@@ -31,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -64,6 +69,21 @@ CONFIG_SECRET_KEY = _ini.get(
     "security", "config_secret_key",
     fallback=os.environ.get("NEXUS_CONFIG_SECRET_KEY", ""),
 ).strip()
+# Token del panel de administración (/admin/*). Vacío = admin deshabilitado (503).
+ADMIN_TOKEN = (
+    _ini.get("admin", "token", fallback="").strip()
+    or os.environ.get("NEXUS_ADMIN_TOKEN", "").strip()
+)
+# Orígenes permitidos para CORS (separados por coma). Vacío = sin CORS
+# (el panel dwh_front usa un proxy del lado servidor y no lo necesita).
+CORS_ORIGINS = [
+    o.strip()
+    for o in (
+        _ini.get("cors", "origins", fallback="").strip()
+        or os.environ.get("NEXUS_CORS_ORIGINS", "").strip()
+    ).split(",")
+    if o.strip()
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,13 +389,15 @@ async def activity_logging_middleware(request: Request, call_next):
 
     finally:
         elapsed_ms = int((time.time() - start) * 1000)
-        company_name, group_name = resolve_request_identity(
-            company_token, group_token, agency_token
-        )
-        _log_activity(
-            request_token, company_name, group_name, method, endpoint,
-            status_code, elapsed_ms, error_detail, client_ip,
-        )
+        # Las validaciones de sesión del panel (/admin/whoami OK) no se registran.
+        if not (endpoint == "/admin/whoami" and status_code < 400):
+            company_name, group_name = resolve_request_identity(
+                company_token, group_token, agency_token
+            )
+            _log_activity(
+                request_token, company_name, group_name, method, endpoint,
+                status_code, elapsed_ms, error_detail, client_ip,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1324,6 +1346,53 @@ def acknowledge_all_events(x_monitor_token: str = Header(...)) -> dict:
     finally:
         conn.close()
     return {"status": "ok", "acknowledged": affected}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Administración (/admin/*) y CORS
+# ─────────────────────────────────────────────────────────────────────────────
+from admin_postgres import create_admin_router  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
+from fastapi.exception_handlers import request_validation_exception_handler  # noqa: E402
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(request: Request, exc: RequestValidationError):
+    """
+    En /admin/* no se devuelve el valor recibido (`input`/`ctx`) en los errores
+    422: podría ser una contraseña y el middleware guarda el cuerpo del error
+    en activity_log. El resto de endpoints conserva la respuesta estándar.
+    """
+    if not request.url.path.startswith("/admin"):
+        return await request_validation_exception_handler(request, exc)
+    errors = [
+        {"type": e.get("type"), "loc": list(e.get("loc", ())), "msg": e.get("msg")}
+        for e in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+app.include_router(
+    create_admin_router(
+        get_connection=get_connection,
+        get_secret_cipher=get_secret_cipher,
+        decrypt_config_secret=decrypt_config_secret,
+        admin_token=ADMIN_TOKEN,
+        group_token_column_exists=group_token_column_exists,
+        agency_token_column_exists=agency_token_column_exists,
+    )
+)
+
+# Solo si hay orígenes configurados. Se agrega al final para que quede como
+# middleware más externo.
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["content-type", "x-admin-token", "x-monitor-token"],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

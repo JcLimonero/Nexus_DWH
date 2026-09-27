@@ -35,3 +35,15 @@ logs/
 # Otros
 .DS_Store
 Thumbs.db
+
+# Secretos / entorno (nunca versionar)
+.env
+.env.*
+!.env.example
+.vault.map
+.env.sh
+
+# Frontend (dwh_front)
+node_modules/
+.next/
+*.tsbuildinfo

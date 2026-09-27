@@ -5,6 +5,7 @@ Documento único para entender y operar el **stack DWH de Nexus**:
 - `dwh_back/` — servidor de **configuración + monitor** (FastAPI).
 - `dwh_client/` — **cliente ETL** que corre en cada sede y carga datos al DWH.
 - `dwh_api/` — app de **monitoreo** (consume los endpoints `/monitor/*` del backend).
+- `dwh_front/` — **panel web de administración** (Next.js) para dar de alta grupos, empresas, agencias, catálogo y tareas, y ver el monitor (solo variante PostgreSQL; ver sección 16).
 - **Encriptación de secretos** con Fernet (opcional, recomendada en producción).
 
 El stack existe en **dos variantes** equivalentes:
@@ -73,7 +74,7 @@ El cliente ETL tiene **tres modos** según qué token(s) tenga configurados. Pri
 | **Agencia** | `agency_token` | `GET /agency-configs` con `x-agency-token` | Solo tareas ligadas a esa agencia |
 | **Company** (legado/por defecto) | `token` | `GET /configs` con `x-token` | Todas las tareas de la company (todas sus agencias) |
 
-Deja vacíos los modos que no uses. El flujo por grupo requiere columna `client_group.group_token`; el de agencia requiere `agency.agency_token` (scripts de migración incluidos en `dwh_back/`).
+Deja vacíos los modos que no uses. El flujo por grupo requiere columna `client_group.group_token`; el de agencia requiere `agency.agency_token` (ambas columnas las crea/agrega `dwh_back/schema_postgres.sql`).
 
 > En la variante **MySQL** el `main.py` implementa hoy solo el flujo company (`/configs`). La variante **PostgreSQL** (`main_postgres.py`) implementa **los tres**.
 
@@ -184,6 +185,9 @@ Los **clientes ETL** reciben el valor **ya descifrado** por HTTPS. La seguridad 
 
 - `main.py` — Servidor (**MySQL**). Endpoints `/configs`, `/configs/{id}/last_run`, `/client-event`, `/monitor/*`.
 - `main_postgres.py` — Servidor (**PostgreSQL**). Además expone `/agency-configs`, `/group-configs`.
+- `admin_postgres.py` — API de administración `/admin/*` (CRUD de la configuración; la monta `main_postgres.py`).
+- `schema_postgres.sql` — esquema **idempotente** de la BD de configuración PostgreSQL.
+- `seed_dev_postgres.sql` — datos ficticios **solo para desarrollo local**.
 - `encrypt_config_secret.py` — utilidad de cifrado/descifrado Fernet.
 - `requirements.txt` / `requirements_postgres.txt` — dependencias Python.
 - `config.ini.example`, `config_postgres.ini.example` — plantillas de configuración.
@@ -226,6 +230,16 @@ token = TU_MONITOR_TOKEN
 
 [security]
 ; config_secret_key = TU_FERNET_KEY_AQUI
+
+[admin]
+; Token del panel/API de administración /admin/*. También: NEXUS_ADMIN_TOKEN.
+; Vacío = /admin/* responde 503.
+; token = TU_ADMIN_TOKEN
+
+[cors]
+; Orígenes permitidos (coma). También: NEXUS_CORS_ORIGINS. Vacío (default) = sin CORS.
+; El panel dwh_front usa un proxy del lado servidor y no necesita CORS.
+; origins = https://otra-app.midominio.com
 ```
 
 ### 6.4. Endpoints (resumen)
@@ -245,6 +259,23 @@ Monitor (todos requieren header `x-monitor-token`):
 - `GET /monitor/activity` — log HTTP del backend (usualmente solo errores).
 - `PUT /monitor/events/{id}/ack` — reconocer una alerta puntual.
 - `PUT /monitor/events/ack-all` — reconocer todas las alertas pendientes.
+
+Administración (solo PostgreSQL, header `x-admin-token`; ver `admin_postgres.py`):
+
+- `GET /admin/whoami`, `GET /admin/stats` — validación del token y conteos para el dashboard.
+- Grupos: `GET|POST /admin/groups`, `GET|PUT|DELETE /admin/groups/{id}`, `POST /admin/groups/{id}/enable|disable`, `POST /admin/groups/{id}/regenerate-token`, `DELETE /admin/groups/{id}/token`.
+- Empresas: `GET|POST /admin/companies` (`?group_id=`), `GET|PUT|DELETE /admin/companies/{id}`, `POST .../enable|disable`, `POST .../regenerate-token`.
+- Agencias: `GET|POST /admin/agencies` (`?group_id=&company_id=`), `GET|PUT|DELETE /admin/agencies/{id}`, `POST .../enable|disable`, `POST .../regenerate-token`, `DELETE .../token`.
+- Catálogo: `GET|POST /admin/objects` (`?group_id=&company_id=`), `GET|PUT|DELETE /admin/objects/{id}`, `POST .../enable|disable`.
+- Tareas: `GET|POST /admin/tasks` (`?group_id=&company_id=&agency_id=&object_catalog_id=`), `GET|PUT|DELETE /admin/tasks/{id}`, `POST .../enable|disable`, `POST /admin/tasks/{id}/reset-last-run`.
+
+Reglas de la API admin:
+
+- Los campos sensibles (`source_*`, `warehouse_*`) se guardan **cifrados `ENC:`** si el backend tiene `config_secret_key`; si no, en texto plano. Se puede pegar un valor ya cifrado (`ENC:...`) si el backend puede descifrarlo.
+- Las **contraseñas nunca se devuelven** (solo `has_password`). En un `PUT`, contraseña vacía u omitida = se conserva; `clear_password: true` la borra. Host/BD/usuario sí se devuelven descifrados al admin.
+- Los tokens (`group_token`, `company_token`, `agency_token`) se generan en el servidor (`secrets.token_urlsafe(32)`) y se pueden regenerar.
+- Los errores de validación `422` de `/admin/*` no incluyen el valor recibido (para no registrar contraseñas en `activity_log`).
+- `PUT` es parcial (solo los campos enviados). Errores: `401` token admin inválido, `503` admin no configurado, `404` no existe, `409` nombre/token duplicado o registro con dependientes (no se borra en cascada: primero hay que borrar/mover los hijos), `422` validación (p. ej. objeto de otra empresa en una tarea).
 
 Salud:
 
@@ -352,7 +383,11 @@ App complementaria que consume `/monitor/*` con el token de monitor:
 ### 10.1. Crear la BD de configuración
 
 - **MySQL**: crea la base y ejecuta los scripts `*.sql` correspondientes de `dwh_back/` para crear tablas e inserts iniciales.
-- **PostgreSQL**: usa `dwh_back/schema_postgres.sql` para instalaciones nuevas; para migrar desde la versión en español usa `migrate_config_spanish_to_english.sql`. Mira `english_name_mapping.md` para el orden exacto.
+- **PostgreSQL**: usa `dwh_back/schema_postgres.sql`. Es **idempotente** (no borra nada): sirve para instalaciones nuevas y para actualizar una BD existente (agrega `group_token`, `agency_token`, `run_on_company_token`, `static_columns` si faltan y amplía a `TEXT` los campos sensibles).
+  ```
+  psql -h HOST -U postgres -d mgd_dwh_config -f dwh_back/schema_postgres.sql
+  ```
+  Para desarrollo local puedes cargar además `dwh_back/seed_dev_postgres.sql` (datos ficticios).
 
 ### 10.2. Preparar el backend
 
@@ -381,6 +416,8 @@ python main_postgres.py --host 0.0.0.0 --port 8000
 Verifica: `http://HOST:8000/health` → `{"status":"ok"}`.
 
 ### 10.3. Dar de alta una company/agencia
+
+> En la variante PostgreSQL lo recomendado es hacerlo desde el **panel web** (`dwh_front`, sección 16), que genera los tokens y cifra las credenciales. Los pasos manuales equivalentes son:
 
 1. Inserta `client_group`/`grupo` con `warehouse_host`, `warehouse_database`, etc.
 2. Inserta `company`/`razon_social` con `source_host`, credenciales de origen y un `company_token` único.
@@ -514,3 +551,57 @@ Si el IDE falla con “Maven artifact ... cannot be resolved”, descarga el JAR
 ## 15. Convenciones de rename (BD)
 
 Si vas a trabajar con la variante PostgreSQL y aún ves nombres en español en la BD, consulta `dwh_back/english_name_mapping.md`. Allí está la tabla completa de equivalencias y el orden recomendado para ejecutar `migrate_config_spanish_to_english.sql` sin perder datos.
+
+---
+
+## 16. Panel web (`dwh_front`)
+
+Panel de administración en **Next.js 14 (App Router) + TypeScript + Tailwind**, en español. Solo para la variante **PostgreSQL** (usa `/admin/*` de `main_postgres.py`).
+
+### 16.1. Qué permite
+
+- **Dashboard**: conteos (grupos, empresas, agencias, tareas), estado por cliente ETL (`/monitor/clients`: última conexión, última ejecución, errores pendientes) y últimos errores sin reconocer.
+- **Grupos / Empresas / Agencias**: alta, edición, baja, habilitar/deshabilitar; tokens con mostrar/copiar/regenerar (y revocar en grupo/agencia); contraseñas de **solo escritura**.
+- **Catálogo de objetos**: tabla destino, `create_table_sql`, `upsert_keys`, constraint y `static_columns` (editores monoespaciados).
+- **Tareas**: por agencia, `extract_sql`, `schedule_seconds` (con atajos), activa, modo empresa (`run_on_company_token`), última ejecución y reinicio de `last_run_at`; filtros por grupo/empresa/agencia.
+- **Eventos**: `/monitor/events` con filtros, reconocer uno o todos.
+- **Actividad**: `/monitor/activity` (log HTTP).
+
+### 16.2. Seguridad
+
+- Login en `/login` con el **token de administrador** del backend. Una ruta del servidor Next lo valida (`GET /admin/whoami`) y lo guarda en una cookie **httpOnly, SameSite=Strict** (Secure en producción). Cerrar sesión la borra.
+- El navegador **nunca** habla directo con el backend: todo pasa por el proxy `app/api/dwh/[...path]` (solo rutas `/admin/*` y `/monitor/*`), que agrega `x-admin-token` desde la cookie.
+- El **token de monitor** vive solo en el servidor del panel (`DWH_MONITOR_TOKEN`); el proxy lo agrega a `/monitor/*` únicamente tras validar la sesión admin.
+- `middleware.ts` redirige a `/login` si no hay sesión.
+
+### 16.3. Variables de entorno (`dwh_front/.env.local`, no se versiona)
+
+| Variable | Descripción |
+|----------|-------------|
+| `DWH_API_URL` | URL base del backend (p. ej. `http://127.0.0.1:8000`). |
+| `DWH_MONITOR_TOKEN` | Igual a `[monitor] token` del backend. |
+| `DWH_COOKIE_SECURE` | Opcional (`true`/`false`). Por defecto `true` en producción. |
+
+Plantilla: `dwh_front/.env.example`.
+
+### 16.4. Arranque local (desarrollo)
+
+```
+# 1) BD de configuración (Docker, puerto 5546)
+docker run -d --name nexus_dwh_pg_dev -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=mgd_dwh_config -p 5546:5432 postgres:16-alpine
+docker exec -i nexus_dwh_pg_dev psql -U postgres -d mgd_dwh_config < dwh_back/schema_postgres.sql
+docker exec -i nexus_dwh_pg_dev psql -U postgres -d mgd_dwh_config < dwh_back/seed_dev_postgres.sql
+
+# 2) Backend (config.ini con [database] port=5546, [monitor], [security], [admin])
+cd dwh_back
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements_postgres.txt
+.venv/bin/python main_postgres.py --port 8010
+
+# 3) Panel
+cd dwh_front
+cp .env.example .env.local      # DWH_API_URL=http://127.0.0.1:8010 y DWH_MONITOR_TOKEN
+pnpm install
+pnpm dev                        # http://localhost:3000
+```
+
+Producción: `pnpm build && pnpm start` detrás de HTTPS. Comprobaciones: `pnpm typecheck`, `pnpm lint`, `pnpm build`.

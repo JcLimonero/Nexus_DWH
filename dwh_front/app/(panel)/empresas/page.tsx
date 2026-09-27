@@ -1,0 +1,342 @@
+"use client";
+
+import { useState, type FormEvent } from "react";
+import { Pencil, Plus, Trash2 } from "lucide-react";
+import { qs, useApi } from "@/lib/api";
+import type { Company, Group, ListResponse, SourceType } from "@/lib/types";
+import { DEFAULT_PORTS, SOURCE_TYPE_LABELS } from "@/lib/format";
+import { Badge, Button, Card, Field, IconButton, Input, PageHeader, Select, Switch } from "@/components/ui/primitives";
+import { Modal } from "@/components/ui/modal";
+import { DataState } from "@/components/ui/states";
+import { Table, Td, Th, Tr } from "@/components/ui/table";
+import { TokenField } from "@/components/ui/token";
+import { PasswordInput, SecretNotice } from "@/components/password-input";
+import { useActions } from "@/components/use-actions";
+import { useToast } from "@/components/ui/feedback";
+
+interface FormState {
+  group_id: string;
+  name: string;
+  source_type: SourceType;
+  source_host: string;
+  source_port: string;
+  source_database: string;
+  source_username: string;
+  source_password: string;
+  clear_password: boolean;
+  source_dsn: string;
+  refresh_seconds: string;
+  verbose_logging: boolean;
+  is_enabled: boolean;
+}
+
+const EMPTY: FormState = {
+  group_id: "",
+  name: "",
+  source_type: "sqlserver",
+  source_host: "",
+  source_port: "1433",
+  source_database: "",
+  source_username: "",
+  source_password: "",
+  clear_password: false,
+  source_dsn: "",
+  refresh_seconds: "60",
+  verbose_logging: false,
+  is_enabled: true,
+};
+
+const SECRET_TEXT_FIELDS = ["source_host", "source_database", "source_username", "source_dsn"] as const;
+
+export default function EmpresasPage() {
+  const [groupFilter, setGroupFilter] = useState("");
+  const { data, loading, error, reload } = useApi<ListResponse<Company>>(`admin/companies${qs({ group_id: groupFilter })}`);
+  const groups = useApi<ListResponse<Group>>("admin/groups");
+  const { run } = useActions(reload);
+  const toast = useToast();
+  const [editing, setEditing] = useState<Company | null>(null);
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState<FormState>(EMPTY);
+  const [saving, setSaving] = useState(false);
+  const items = data?.items ?? [];
+  const groupList = groups.data?.items ?? [];
+
+  const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
+
+  function changeType(t: SourceType) {
+    setForm((f) => {
+      // Si el puerto sigue siendo el predeterminado del tipo anterior, se ajusta al nuevo.
+      const wasDefault = String(DEFAULT_PORTS[f.source_type]) === f.source_port || !f.source_port;
+      return { ...f, source_type: t, source_port: wasDefault ? String(DEFAULT_PORTS[t]) : f.source_port };
+    });
+  }
+
+  function openCreate() {
+    setEditing(null);
+    setForm({ ...EMPTY, group_id: groupFilter || (groupList[0] ? String(groupList[0].id) : "") });
+    setOpen(true);
+  }
+  function openEdit(c: Company) {
+    setEditing(c);
+    setForm({
+      group_id: String(c.group_id),
+      name: c.name,
+      source_type: c.source_type,
+      source_host: c.source_host ?? "",
+      source_port: String(c.source_port),
+      source_database: c.source_database ?? "",
+      source_username: c.source_username ?? "",
+      source_password: "",
+      clear_password: false,
+      source_dsn: c.source_dsn ?? "",
+      refresh_seconds: String(c.refresh_seconds),
+      verbose_logging: c.verbose_logging,
+      is_enabled: c.is_enabled,
+    });
+    setOpen(true);
+  }
+
+  async function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    const port = Number(form.source_port);
+    const refresh = Number(form.refresh_seconds);
+    if (!form.group_id) return toast.error("Selecciona un grupo.");
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return toast.error("El puerto debe estar entre 1 y 65535.");
+    if (!Number.isInteger(refresh) || refresh < 5 || refresh > 86400) return toast.error("El refresco debe estar entre 5 y 86400 segundos.");
+
+    const body: Record<string, unknown> = {
+      group_id: Number(form.group_id),
+      name: form.name.trim(),
+      source_type: form.source_type,
+      source_port: port,
+      refresh_seconds: refresh,
+      verbose_logging: form.verbose_logging,
+      is_enabled: form.is_enabled,
+    };
+    const undecryptable = editing?.decrypt_errors ?? [];
+    SECRET_TEXT_FIELDS.forEach((k) => {
+      if (undecryptable.includes(k) && !form[k]) return;
+      body[k] = form[k].trim();
+    });
+    if (form.source_password) body.source_password = form.source_password;
+    if (editing && form.clear_password && !form.source_password) body.clear_password = true;
+
+    setSaving(true);
+    const res = await run<Company>("save", editing ? `admin/companies/${editing.id}` : "admin/companies", {
+      method: editing ? "PUT" : "POST",
+      body,
+      success: editing ? "Empresa actualizada." : "Empresa creada.",
+    });
+    setSaving(false);
+    if (res) setOpen(false);
+  }
+
+  const usesDsn = form.source_type === "sqlserver" || form.source_type === "pervasive" || form.source_type === "firebird";
+
+  return (
+    <>
+      <PageHeader
+        title="Empresas"
+        description="Razones sociales: conexión a la BD de origen (DMS) y token del cliente ETL."
+        actions={
+          <>
+            <Select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)} className="w-48" aria-label="Filtrar por grupo">
+              <option value="">Todos los grupos</option>
+              {groupList.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </Select>
+            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={groupList.length === 0} title={groupList.length === 0 ? "Crea primero un grupo" : undefined}>
+              Nueva empresa
+            </Button>
+          </>
+        }
+      />
+      <Card>
+        <DataState
+          loading={loading}
+          error={error}
+          hasData={Boolean(data)}
+          empty={items.length === 0}
+          onRetry={reload}
+          emptyTitle="No hay empresas"
+          emptyDescription={groupList.length === 0 ? "Primero crea un grupo." : "Crea una empresa para asignarle agencias y tareas."}
+        >
+          <Table>
+            <thead>
+              <tr>
+                <Th>Empresa</Th>
+                <Th>Origen</Th>
+                <Th>Token (x-token)</Th>
+                <Th className="text-right">Agencias / Objetos</Th>
+                <Th>Activa</Th>
+                <Th className="text-right">Acciones</Th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {items.map((c) => (
+                <Tr key={c.id}>
+                  <Td>
+                    <p className="font-medium text-slate-900">{c.name}</p>
+                    <p className="text-xs text-slate-500">
+                      {c.group_name}
+                      {!c.group_enabled && <span className="ml-1 text-amber-600">(grupo deshabilitado)</span>}
+                    </p>
+                  </Td>
+                  <Td>
+                    <Badge tone="blue">{SOURCE_TYPE_LABELS[c.source_type] ?? c.source_type}</Badge>
+                    <p className="mt-1 font-mono text-xs">
+                      {c.source_dsn ? `DSN=${c.source_dsn}` : `${c.source_host || "—"}:${c.source_port}`}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {c.source_database || "—"} · {c.source_username || "—"} {c.has_password ? "" : "· sin contraseña"}
+                    </p>
+                  </Td>
+                  <Td>
+                    <TokenField
+                      token={c.company_token}
+                      onRegenerate={() =>
+                        run("token", `admin/companies/${c.id}/regenerate-token`, {
+                          success: "Token de empresa regenerado.",
+                          confirm: {
+                            title: "Regenerar token de empresa",
+                            message: `Los clientes ETL que usan el token actual de "${c.name}" dejarán de funcionar hasta que actualices su config.ini.`,
+                            confirmLabel: "Regenerar",
+                            danger: true,
+                          },
+                        })
+                      }
+                    />
+                  </Td>
+                  <Td className="text-right tabular-nums">
+                    {c.agency_count} / {c.object_count}
+                  </Td>
+                  <Td>
+                    <Switch
+                      checked={c.is_enabled}
+                      hideLabel
+                      label={c.is_enabled ? "Deshabilitar empresa" : "Habilitar empresa"}
+                      onChange={(v) => run("toggle", `admin/companies/${c.id}/${v ? "enable" : "disable"}`, { success: v ? "Empresa habilitada." : "Empresa deshabilitada." })}
+                    />
+                  </Td>
+                  <Td className="text-right">
+                    <div className="flex justify-end gap-0.5">
+                      <IconButton label="Editar" onClick={() => openEdit(c)}>
+                        <Pencil className="h-4 w-4" />
+                      </IconButton>
+                      <IconButton
+                        label="Eliminar"
+                        tone="danger"
+                        onClick={() =>
+                          run("delete", `admin/companies/${c.id}`, {
+                            method: "DELETE",
+                            success: "Empresa eliminada.",
+                            confirm: { title: "Eliminar empresa", message: `¿Eliminar "${c.name}"? Esta acción no se puede deshacer.`, confirmLabel: "Eliminar", danger: true },
+                          })
+                        }
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </IconButton>
+                    </div>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        </DataState>
+      </Card>
+
+      <Modal
+        open={open}
+        onClose={() => setOpen(false)}
+        size="lg"
+        title={editing ? `Editar empresa: ${editing.name}` : "Nueva empresa"}
+        description="El token se genera automáticamente al crear la empresa."
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setOpen(false)}>
+              Cancelar
+            </Button>
+            <Button type="submit" form="company-form" loading={saving}>
+              {editing ? "Guardar cambios" : "Crear empresa"}
+            </Button>
+          </>
+        }
+      >
+        <form id="company-form" onSubmit={onSubmit} className="grid gap-4 sm:grid-cols-6">
+          <Field label="Grupo" required className="sm:col-span-3" htmlFor="c-group">
+            <Select id="c-group" required value={form.group_id} onChange={(e) => set("group_id", e.target.value)}>
+              <option value="" disabled>
+                Selecciona…
+              </option>
+              {groupList.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Nombre" required className="sm:col-span-3" htmlFor="c-name">
+            <Input id="c-name" required maxLength={255} value={form.name} onChange={(e) => set("name", e.target.value)} />
+          </Field>
+
+          <div className="sm:col-span-6">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Base de datos de origen</h3>
+          </div>
+          <Field label="Tipo" className="sm:col-span-2" htmlFor="c-type">
+            <Select id="c-type" value={form.source_type} onChange={(e) => changeType(e.target.value as SourceType)}>
+              {Object.entries(SOURCE_TYPE_LABELS).map(([k, v]) => (
+                <option key={k} value={k}>
+                  {v}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Host / IP" className="sm:col-span-3" htmlFor="c-host">
+            <Input id="c-host" value={form.source_host} onChange={(e) => set("source_host", e.target.value)} />
+          </Field>
+          <Field label="Puerto" className="sm:col-span-1" htmlFor="c-port">
+            <Input id="c-port" inputMode="numeric" value={form.source_port} onChange={(e) => set("source_port", e.target.value)} />
+          </Field>
+          <Field label={form.source_type === "firebird" ? "Base de datos (ruta .fdb)" : "Base de datos"} className="sm:col-span-2" htmlFor="c-db">
+            <Input id="c-db" value={form.source_database} onChange={(e) => set("source_database", e.target.value)} />
+          </Field>
+          <Field label="Usuario" className="sm:col-span-2" htmlFor="c-user">
+            <Input id="c-user" autoComplete="off" value={form.source_username} onChange={(e) => set("source_username", e.target.value)} />
+          </Field>
+          <Field label="Contraseña" className="sm:col-span-2" htmlFor="c-pass" hint={editing ? "Vacía = conservar la actual." : undefined}>
+            <PasswordInput id="c-pass" value={form.source_password} onChange={(v) => set("source_password", v)} hasPassword={Boolean(editing?.has_password)} isEdit={Boolean(editing)} />
+          </Field>
+          {usesDsn && (
+            <Field label="DSN ODBC (opcional)" className="sm:col-span-6" htmlFor="c-dsn" hint="Si se indica, el cliente se conecta por DSN en lugar de host/puerto.">
+              <Input id="c-dsn" value={form.source_dsn} onChange={(e) => set("source_dsn", e.target.value)} />
+            </Field>
+          )}
+          {editing?.has_password && (
+            <div className="sm:col-span-6">
+              <Switch checked={form.clear_password} onChange={(v) => set("clear_password", v)} label="Borrar la contraseña guardada" />
+            </div>
+          )}
+
+          <div className="sm:col-span-6">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Cliente ETL</h3>
+          </div>
+          <Field label="Refresco de configuración (s)" className="sm:col-span-2" htmlFor="c-refresh">
+            <Input id="c-refresh" inputMode="numeric" value={form.refresh_seconds} onChange={(e) => set("refresh_seconds", e.target.value)} />
+          </Field>
+          <div className="flex flex-col justify-end gap-3 sm:col-span-4">
+            <Switch checked={form.verbose_logging} onChange={(v) => set("verbose_logging", v)} label="Log detallado (verbose)" />
+            <Switch checked={form.is_enabled} onChange={(v) => set("is_enabled", v)} label="Empresa habilitada" />
+          </div>
+          {editing && (
+            <div className="sm:col-span-6">
+              <SecretNotice encrypted={editing.encrypted_fields} errors={editing.decrypt_errors} />
+            </div>
+          )}
+        </form>
+      </Modal>
+    </>
+  );
+}

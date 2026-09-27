@@ -5,6 +5,9 @@ Sistema de Data Warehouse para Nexus. Incluye:
 - **dwh_back**: API de configuración (FastAPI). Sirve configuraciones a los clientes.
 - **dwh_client**: Cliente ETL que extrae de SQL Server y carga en MySQL DWH.
 - **dwh_api**: Monitor API y CLI para monitorear ejecuciones y errores.
+- **dwh_front**: Panel web (Next.js) para administrar la configuración (grupos, empresas, agencias, catálogo, tareas) y ver el monitor. Requiere la variante PostgreSQL del backend.
+
+Esquema de la BD de configuración (PostgreSQL): `dwh_back/schema_postgres.sql`. Guía completa: [DWH_README.md](DWH_README.md) (el panel web está en la sección 16).
 
 ## Configuración
 

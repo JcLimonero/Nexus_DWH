@@ -15,3 +15,16 @@ password = TU_PASSWORD_AQUI
 ; Optional master key for decrypting ENC:... values stored in the config DB.
 ; You can also provide it via the NEXUS_CONFIG_SECRET_KEY environment variable.
 ; config_secret_key = TU_FERNET_KEY_AQUI
+
+[admin]
+; Token para la API de administración /admin/* (panel web dwh_front).
+; Si se deja vacío (y no existe NEXUS_ADMIN_TOKEN) los endpoints /admin/* responden 503.
+; Genera uno largo: python -c "import secrets; print(secrets.token_urlsafe(48))"
+; token = TU_ADMIN_TOKEN
+
+[cors]
+; Orígenes permitidos (separados por coma). También: variable NEXUS_CORS_ORIGINS.
+; Por defecto vacío = CORS deshabilitado. El panel dwh_front llama al backend
+; desde su servidor (proxy) y NO lo necesita; configúralo solo si algún
+; navegador debe llamar directo al backend.
+; origins = https://otra-app.midominio.com
