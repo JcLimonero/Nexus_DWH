@@ -1,7 +1,8 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { AlertCircle, Inbox, RefreshCw } from "lucide-react";
+import Link from "next/link";
+import { AlertCircle, Inbox, RefreshCw, SearchX } from "lucide-react";
 import { Button, Spinner } from "./primitives";
 
 export function LoadingState({ label = "Cargando…" }: { label?: string }) {
@@ -68,4 +69,18 @@ export function DataState({
   if (error && !hasData) return <ErrorState message={error} onRetry={onRetry} />;
   if (empty) return <EmptyState title={emptyTitle} description={emptyDescription} action={emptyAction} />;
   return <>{children}</>;
+}
+
+/** Recurso inexistente o fuera del alcance del usuario (el backend responde 404 en ambos casos). */
+export function NotFoundState({ title, backHref, backLabel }: { title: string; backHref: string; backLabel: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">
+      <SearchX className="mb-3 h-8 w-8 text-slate-300" />
+      <p className="text-sm font-medium text-slate-700">{title}</p>
+      <p className="mt-1 max-w-md text-xs text-slate-500">No existe o no está dentro de los grupos que su usuario puede ver.</p>
+      <Link href={backHref} className="mt-4 text-sm font-medium text-brand-600 hover:text-brand-700">
+        {backLabel}
+      </Link>
+    </div>
+  );
 }

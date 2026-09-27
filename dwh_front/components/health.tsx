@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { fmtAgo, fmtDateTz } from "@/lib/format";
 import type { Connectivity, Incident, IncidentBadge, IncidentCategory, Severity, TaskHealthState } from "@/lib/types";
 import { Badge } from "@/components/ui/primitives";
 
@@ -132,4 +133,23 @@ export function useAutoRefresh(reload: () => void, ms = 30_000) {
     }, ms);
     return () => clearInterval(id);
   }, [reload, ms]);
+}
+
+/** Estado de una ejecución (task_execution.status). */
+export const EXEC_STATUS: Record<string, { label: string; tone: "green" | "red" | "amber" | "blue" }> = {
+  success: { label: "OK", tone: "green" },
+  failed: { label: "Fallida", tone: "red" },
+  interrupted: { label: "Interrumpida", tone: "amber" },
+  running: { label: "En curso", tone: "blue" },
+};
+
+/** Fecha UTC como "hace X" + fecha completa con zona explícita. */
+export function When({ value, empty = "nunca" }: { value: string | null; empty?: string }) {
+  if (!value) return <span className="text-xs text-slate-400">{empty}</span>;
+  return (
+    <div className="whitespace-nowrap">
+      <p className="text-xs font-medium text-slate-700">{fmtAgo(value)}</p>
+      <p className="text-[11px] text-slate-500">{fmtDateTz(value)}</p>
+    </div>
+  );
 }

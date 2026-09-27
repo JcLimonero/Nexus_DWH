@@ -33,7 +33,7 @@ from typing import Annotated, Any, Callable, Dict, Iterator, List, Literal, Opti
 import psycopg2
 import psycopg2.errors
 import psycopg2.extras
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from panel_auth import AuthContext, AuthService, err, group_of
@@ -228,6 +228,47 @@ class TaskUpdate(_Base):
 
 # Campos de tarea que admiten volver a NULL con un null explícito en el PUT.
 TASK_NULLABLE_FIELDS = ("expected_duration_seconds", "delay_tolerance_seconds")
+
+
+class TaskCloneRequest(_Base):
+    """
+    Clonar extractores (tareas) a otras agencias. El servidor de origen sale de la EMPRESA de la
+    agencia destino: clonar a otra agencia usa automáticamente su origen.
+    """
+    target_agency_ids: List[int] = Field(..., min_length=1, max_length=500)
+    # Si la empresa destino no tiene el objeto (mismo nombre), crear una copia en su catálogo.
+    copy_object_if_missing: bool = True
+    # Estado de las tareas NUEVAS (por defecto deshabilitadas para revisarlas antes).
+    enabled: bool = False
+    # Si la agencia destino ya tiene la tarea: omitirla o actualizar SQL/programación/umbrales.
+    on_conflict: Literal["skip", "update"] = "skip"
+    # Confirmación explícita para sobrescribir la definición de un objeto que difiere en la empresa
+    # destino (solo con on_conflict="update"); sin ella se reporta object_conflict.
+    overwrite_objects: bool = False
+    # Vista previa: calcula el resultado sin guardar nada.
+    dry_run: bool = False
+
+
+class AgencyCloneRequest(TaskCloneRequest):
+    # Subconjunto de tareas de la agencia origen (por defecto, todas).
+    task_ids: Optional[List[int]] = Field(None, min_length=1, max_length=500)
+
+
+# Definición de un objeto del catálogo que debe coincidir para reutilizarlo en otra empresa.
+OBJECT_DEFINITION_FIELDS = ("destination_table", "create_table_sql", "upsert_keys", "constraint_name",
+                            "create_constraint_sql", "static_columns")
+# Columnas copiadas al crear el objeto en la empresa destino.
+OBJECT_COPY_FIELDS = ("name", "description") + OBJECT_DEFINITION_FIELDS + ("is_enabled",)
+# Columnas de la tarea que se copian (is_active lo decide `enabled`; last_run_at no se copia).
+TASK_COPY_FIELDS = ("extract_sql", "schedule_seconds", "run_on_company_token", "expected_duration_seconds",
+                    "delay_tolerance_seconds")
+
+
+def _norm_def(v: Any) -> Any:
+    """None y "" son equivalentes; se ignoran espacios al inicio/fin."""
+    if v is None:
+        return ""
+    return v.strip() if isinstance(v, str) else v
 
 
 
@@ -1056,6 +1097,178 @@ def create_admin_router(
                 # Cierra incidencias de "tipo de reloj distinto" de la tarea (motivo watermark_reset).
                 on_watermark_reset(cur, task_id)
         return get_task_or_404(task_id, ctx)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # CLONAR EXTRACTORES (tareas) A OTRAS AGENCIAS
+    # ════════════════════════════════════════════════════════════════════════
+    # Una tarea = agencia + objeto del catálogo (por EMPRESA) + SQL/programación. El servidor de
+    # origen sale de la empresa de la agencia: al clonar a otra agencia se usa el origen de SU
+    # empresa. Cada destino va en su propio SAVEPOINT (uno que falla no afecta a los demás).
+    def _load_clone_source(cur: Any, task_id: int) -> Dict[str, Any]:
+        cur.execute(
+            f"SELECT t.id, t.agency_id, t.object_catalog_id, {', '.join('t.' + f for f in TASK_COPY_FIELDS)} "
+            "FROM agency_task t WHERE t.id = %s", (task_id,))
+        task = cur.fetchone()
+        if not task:
+            raise not_found("Tarea")
+        cur.execute(f"SELECT id, company_id, {', '.join(OBJECT_COPY_FIELDS)} FROM object_catalog WHERE id = %s",
+                    (task["object_catalog_id"],))
+        return {"task": dict(task), "object": dict(cur.fetchone())}
+
+    def _resolve_clone_targets(cur: Any, ctx: AuthContext, ids: List[int]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for aid in dict.fromkeys(ids):  # sin repetidos, en el orden recibido
+            cur.execute(
+                """SELECT a.id, a.name, a.company_id, c.name AS company_name, c.group_id, g.name AS group_name
+                   FROM agency a JOIN company c ON c.id = a.company_id JOIN client_group g ON g.id = c.group_id
+                   WHERE a.id = %s""", (aid,))
+            r = cur.fetchone()
+            if not r or not ctx.can("view", r["group_id"]):
+                # Fuera del alcance = inexistente: no se revela nombre ni grupo.
+                out.append({"id": aid, "error": "not_found", "message": "Agencia no encontrada."})
+            elif not ctx.can("config.manage", r["group_id"]):
+                out.append({**dict(r), "error": "permission_required",
+                            "message": "Sin permiso «Administrar configuración» en el grupo de la agencia destino."})
+            else:
+                out.append(dict(r))
+        return out
+
+    def _clone_object(cur: Any, src_obj: Dict[str, Any], target: Dict[str, Any],
+                      body: TaskCloneRequest) -> Tuple[Optional[int], str, List[str]]:
+        """(object_id, acción, avisos/campos distintos). acción: reused|created|updated|conflict|missing."""
+        if target["company_id"] == src_obj["company_id"]:
+            return src_obj["id"], "reused", []
+        cur.execute(f"SELECT id, {', '.join(OBJECT_DEFINITION_FIELDS)} FROM object_catalog "
+                    "WHERE company_id = %s AND name = %s", (target["company_id"], src_obj["name"]))
+        row = cur.fetchone()
+        review = ["static_columns_review"] if _norm_def(src_obj.get("static_columns")) else []
+        if row:
+            diff = [f for f in OBJECT_DEFINITION_FIELDS if _norm_def(row[f]) != _norm_def(src_obj[f])]
+            if not diff:
+                return row["id"], "reused", []
+            if body.on_conflict == "update" and body.overwrite_objects:
+                cur.execute(f"UPDATE object_catalog SET {', '.join(f + ' = %s' for f in OBJECT_DEFINITION_FIELDS)} "
+                            "WHERE id = %s", (*[src_obj[f] for f in OBJECT_DEFINITION_FIELDS], row["id"]))
+                return row["id"], "updated", review
+            return row["id"], "conflict", diff
+        if not body.copy_object_if_missing:
+            return None, "missing", []
+        cur.execute(f"INSERT INTO object_catalog (company_id, {', '.join(OBJECT_COPY_FIELDS)}) "
+                    f"VALUES (%s, {', '.join(['%s'] * len(OBJECT_COPY_FIELDS))}) RETURNING id",
+                    (target["company_id"], *[src_obj[f] for f in OBJECT_COPY_FIELDS]))
+        return cur.fetchone()["id"], "created", review
+
+    def _clone_one(cur: Any, src: Dict[str, Any], target: Dict[str, Any], body: TaskCloneRequest) -> Dict[str, Any]:
+        task, obj = src["task"], src["object"]
+        res: Dict[str, Any] = {
+            "source_task_id": task["id"], "object_name": obj["name"], "agency_id": target["id"],
+            "agency_name": target.get("name"), "company_name": target.get("company_name"),
+            "group_name": target.get("group_name"), "status": "error", "code": None, "task_id": None,
+            "object_action": None, "object_id": None, "warnings": [], "message": None,
+        }
+        if target.get("error"):
+            res.update(code=target["error"], message=target["message"])
+            return res
+        if target["id"] == task["agency_id"]:
+            res.update(code="same_agency", message="Es la agencia de origen.")
+            return res
+        cur.execute("SAVEPOINT clone_item")
+        try:
+            obj_id, action, extra = _clone_object(cur, obj, target, body)
+            res.update(object_id=obj_id, object_action=action)
+            if action == "conflict":
+                res.update(status="object_conflict", code="object_conflict", warnings=extra,
+                           message="La empresa destino ya tiene un objeto con ese nombre y otra definición: "
+                                   "no se modificó. Campos distintos: " + ", ".join(extra) + ".")
+            elif action == "missing":
+                res.update(code="object_missing", object_id=None,
+                           message="La empresa destino no tiene el objeto en su catálogo (y no se pidió copiarlo).")
+            else:
+                res["warnings"] = extra
+                cur.execute("SELECT id FROM agency_task WHERE agency_id = %s AND object_catalog_id = %s",
+                            (target["id"], obj_id))
+                existing = cur.fetchone()
+                if existing and body.on_conflict == "skip":
+                    res.update(status="skipped_exists", task_id=existing["id"],
+                               message="La agencia ya tiene este extractor: se omitió.")
+                elif existing:
+                    # Se actualiza SQL/programación/umbrales; is_active y last_run_at se conservan.
+                    cur.execute(f"UPDATE agency_task SET {', '.join(f + ' = %s' for f in TASK_COPY_FIELDS)} "
+                                "WHERE id = %s", (*[task[f] for f in TASK_COPY_FIELDS], existing["id"]))
+                    res.update(status="updated", task_id=existing["id"])
+                else:
+                    cur.execute(f"INSERT INTO agency_task (agency_id, object_catalog_id, is_active, "
+                                f"{', '.join(TASK_COPY_FIELDS)}) VALUES (%s, %s, %s, "
+                                f"{', '.join(['%s'] * len(TASK_COPY_FIELDS))}) RETURNING id",
+                                (target["id"], obj_id, body.enabled, *[task[f] for f in TASK_COPY_FIELDS]))
+                    res.update(status="created", task_id=cur.fetchone()["id"])
+            cur.execute("RELEASE SAVEPOINT clone_item")
+        except psycopg2.Error as exc:
+            cur.execute("ROLLBACK TO SAVEPOINT clone_item")
+            name = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+            res.update(status="error", code="db_error", task_id=None,
+                       message=_CONSTRAINT_MESSAGES.get(name, "No se pudo guardar en la BD."))
+        return res
+
+    def _clone_many(cur: Any, ctx: AuthContext, sources: List[Dict[str, Any]],
+                    body: TaskCloneRequest) -> Dict[str, Any]:
+        targets = _resolve_clone_targets(cur, ctx, body.target_agency_ids)
+        cur.execute("SAVEPOINT clone_all")
+        results = [_clone_one(cur, s, t, body) for s in sources for t in targets]
+        if body.dry_run:
+            cur.execute("ROLLBACK TO SAVEPOINT clone_all")
+            for r in results:  # los ids de lo "creado" no existen en una vista previa
+                if r["status"] == "created":
+                    r["task_id"] = None
+                if r["object_action"] == "created":
+                    r["object_id"] = None
+        summary = {k: sum(1 for r in results if r["status"] == k)
+                   for k in ("created", "updated", "skipped_exists", "object_conflict", "error")}
+        summary["objects_created"] = sum(1 for r in results if r["object_action"] == "created")
+        summary["objects_updated"] = sum(1 for r in results if r["object_action"] == "updated")
+        return {"dry_run": body.dry_run, "results": results, "summary": summary,
+                "target_group_ids": sorted({t["group_id"] for t in targets if not t.get("error")})}
+
+    def _audit_clone(ctx: AuthContext, request: Request, action: str, target_type: str, target_id: int,
+                     source_task_ids: List[int], body: TaskCloneRequest, out: Dict[str, Any]) -> None:
+        if body.dry_run:
+            ctx.audit_target = "__done__"   # vista previa: no modifica nada
+            return
+        auth.audit(ctx, action=action, ip=auth.client_ip(request), status_code=200, target_type=target_type,
+                   target_id=str(target_id), details={
+                       "source_task_ids": source_task_ids,
+                       "target_agency_ids": list(dict.fromkeys(body.target_agency_ids)),
+                       "target_group_ids": out["target_group_ids"],
+                       "options": {k: getattr(body, k) for k in ("copy_object_if_missing", "enabled", "on_conflict",
+                                                                 "overwrite_objects")},
+                       "summary": out["summary"],
+                   })
+
+    @router.post("/tasks/{task_id}/clone")
+    def clone_task(task_id: int, body: TaskCloneRequest, request: Request,
+                   ctx: AuthContext = Depends(CONFIG)) -> dict:
+        with tx() as cur:
+            check(cur, ctx, "config.manage", "task", task_id, "Tarea")
+            out = _clone_many(cur, ctx, [_load_clone_source(cur, task_id)], body)
+        _audit_clone(ctx, request, "tasks.clone", "task", task_id, [task_id], body, out)
+        return {"source_task_id": task_id, **out}
+
+    @router.post("/agencies/{agency_id}/clone-tasks")
+    def clone_agency_tasks(agency_id: int, body: AgencyCloneRequest, request: Request,
+                           ctx: AuthContext = Depends(CONFIG)) -> dict:
+        with tx() as cur:
+            check(cur, ctx, "config.manage", "agency", agency_id, "Agencia")
+            cur.execute("SELECT id FROM agency_task WHERE agency_id = %s ORDER BY id", (agency_id,))
+            own = [r["id"] for r in cur.fetchall()]
+            ids = own if body.task_ids is None else list(dict.fromkeys(body.task_ids))
+            foreign = [i for i in ids if i not in own]
+            if foreign:
+                raise HTTPException(status_code=422, detail="Algunas tareas no pertenecen a la agencia de origen.")
+            if not ids:
+                raise HTTPException(status_code=422, detail="La agencia de origen no tiene extractores.")
+            out = _clone_many(cur, ctx, [_load_clone_source(cur, i) for i in ids], body)
+        _audit_clone(ctx, request, "agencies.clone_tasks", "agency", agency_id, ids, body, out)
+        return {"source_agency_id": agency_id, "source_task_ids": ids, **out}
 
     # ── Helpers compartidos (definidos al final; usan closures de arriba) ────
     def _set_flag(ctx: AuthContext, perm: str, kind: str, table: str, row_id: int, column: str, value: Any,

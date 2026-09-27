@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
@@ -102,7 +103,11 @@ export default function AgenciasPage() {
                 const canCred = can("credentials.manage", a.group_id);
                 return (
                 <Tr key={a.id}>
-                  <Td className="font-medium text-slate-900">{a.name}</Td>
+                  <Td>
+                    <Link href={`/agencias/${a.id}`} className="font-medium text-slate-900 hover:text-brand-700 hover:underline">
+                      {a.name}
+                    </Link>
+                  </Td>
                   <Td>
                     <p>{a.company_name}</p>
                     <p className="text-xs text-slate-500">{a.group_name}</p>

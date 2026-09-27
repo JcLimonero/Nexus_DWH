@@ -3,7 +3,9 @@ import { cx } from "@/lib/format";
 
 export function Table({ children }: { children: ReactNode }) {
   return (
-    <div className="overflow-x-auto">
+    // scroll-x: barra de desplazamiento siempre visible (en macOS la barra "flotante" se oculta y la
+    // tabla parecía cortada en pantallas medianas).
+    <div className="scroll-x overflow-x-auto">
       <table className="min-w-full divide-y divide-slate-200 text-sm">{children}</table>
     </div>
   );
