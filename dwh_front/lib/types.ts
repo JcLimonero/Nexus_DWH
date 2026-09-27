@@ -813,3 +813,45 @@ export interface InventorySummary {
   unverifiable: number;
   permissions: Record<string, string>;
 }
+
+// ── Clonar extractores (tareas) a otras agencias ─────────────────────────────
+export type CloneStatus = "created" | "updated" | "skipped_exists" | "object_conflict" | "error";
+export type CloneObjectAction = "reused" | "created" | "updated" | "conflict" | "missing";
+
+export interface CloneResult {
+  source_task_id: number;
+  object_name: string;
+  agency_id: number;
+  /** null si la agencia no existe o está fuera del alcance (no se revela) */
+  agency_name: string | null;
+  company_name: string | null;
+  group_name: string | null;
+  status: CloneStatus;
+  code: string | null;
+  task_id: number | null;
+  object_action: CloneObjectAction | null;
+  object_id: number | null;
+  /** Otros extractores de la empresa destino que usan ese objeto (conflicto o sobrescritura). */
+  affected_tasks: number | null;
+  /** La agencia, empresa o grupo destino está deshabilitado (el extractor no se ejecutará). */
+  target_disabled: boolean;
+  /** static_columns_review, target_disabled, o los campos distintos en un object_conflict */
+  warnings: string[];
+  message: string | null;
+}
+
+export interface CloneResponse {
+  dry_run: boolean;
+  results: CloneResult[];
+  summary: {
+    created: number;
+    updated: number;
+    skipped_exists: number;
+    object_conflict: number;
+    error: number;
+    objects_created: number;
+    objects_updated: number;
+    targets_disabled: number;
+  };
+  target_group_ids: number[];
+}

@@ -111,6 +111,8 @@ export function qs(params: Record<string, string | number | boolean | null | und
 export function useApi<T>(path: string | null) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Código HTTP del último error (p. ej. 404 = no existe o fuera del alcance). */
+  const [status, setStatus] = useState<number | null>(null);
   const [loading, setLoading] = useState<boolean>(Boolean(path));
   const seq = useRef(0);
 
@@ -119,11 +121,15 @@ export function useApi<T>(path: string | null) {
     const id = ++seq.current;
     setLoading(true);
     setError(null);
+    setStatus(null);
     try {
       const d = await api<T>(path);
       if (id === seq.current) setData(d);
     } catch (e) {
-      if (id === seq.current) setError((e as Error).message);
+      if (id === seq.current) {
+        setError((e as Error).message);
+        setStatus(e instanceof ApiError ? e.status : null);
+      }
     } finally {
       if (id === seq.current) setLoading(false);
     }
@@ -133,5 +139,5 @@ export function useApi<T>(path: string | null) {
     void load();
   }, [load]);
 
-  return { data, error, loading, reload: load, setData };
+  return { data, error, status, loading, reload: load, setData };
 }

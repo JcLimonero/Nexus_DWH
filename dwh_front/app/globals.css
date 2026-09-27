@@ -9,3 +9,19 @@
 body {
   @apply bg-slate-50 text-slate-900 antialiased;
 }
+
+/* Tablas anchas: el desplazamiento horizontal ocurre dentro de la tarjeta y la barra se ve siempre. */
+.scroll-x {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+.scroll-x::-webkit-scrollbar {
+  height: 8px;
+}
+.scroll-x::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 9999px;
+}
+.scroll-x::-webkit-scrollbar-track {
+  background: transparent;
+}

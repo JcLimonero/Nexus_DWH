@@ -22,11 +22,15 @@ export function Modal({
   size?: "sm" | "md" | "lg" | "xl";
 }) {
   const panel = useRef<HTMLDivElement>(null);
+  // onClose en una ref: si el padre se vuelve a renderizar (p. ej. recarga cada 30 s) no se
+  // reinicia el efecto ni se roba el foco del campo que se está editando.
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") closeRef.current();
     };
     document.addEventListener("keydown", onKey);
     const prev = document.body.style.overflow;
@@ -40,7 +44,7 @@ export function Modal({
       document.removeEventListener("keydown", onKey);
       document.body.style.overflow = prev;
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
   const widths = { sm: "max-w-md", md: "max-w-xl", lg: "max-w-3xl", xl: "max-w-5xl" };

@@ -1,6 +1,8 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import Link from "next/link";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useSearchParams } from "next/navigation";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
 import type { Agency, ListResponse } from "@/lib/types";
@@ -46,6 +48,16 @@ export default function AgenciasPage() {
     setForm({ company_id: filter.company_id || "", name: "", is_enabled: true, generate_token: true });
     setOpen(true);
   }
+  // ?nueva=1 (p. ej. desde el detalle de grupo, empresa sin agencias): abre el alta con la empresa del filtro.
+  const params = useSearchParams();
+  const autoOpened = useRef(false);
+  useEffect(() => {
+    if (autoOpened.current || params.get("nueva") !== "1" || companies.length === 0) return;
+    autoOpened.current = true;
+    openCreate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params, companies.length]);
+
   function openEdit(a: Agency) {
     setEditing(a);
     setForm({ company_id: String(a.company_id), name: a.name, is_enabled: a.is_enabled, generate_token: false });
@@ -102,7 +114,11 @@ export default function AgenciasPage() {
                 const canCred = can("credentials.manage", a.group_id);
                 return (
                 <Tr key={a.id}>
-                  <Td className="font-medium text-slate-900">{a.name}</Td>
+                  <Td>
+                    <Link href={`/agencias/${a.id}`} className="font-medium text-slate-900 hover:text-brand-700 hover:underline">
+                      {a.name}
+                    </Link>
+                  </Td>
                   <Td>
                     <p>{a.company_name}</p>
                     <p className="text-xs text-slate-500">{a.group_name}</p>

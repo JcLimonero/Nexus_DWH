@@ -613,8 +613,9 @@ Panel de administración en **Next.js 14 (App Router) + TypeScript + Tailwind**,
 - **Salud**, **Incidencias** y **Notificaciones**: ver sección 18.
 - **Estructura**: inventario estructural, línea base, cambios pendientes y "Dar por entendido" (sección 19). El menú muestra su propio contador (cambios pendientes; rojo si hay bases que no se pudieron verificar), separado del de incidencias. El menú muestra un contador de incidencias abiertas **sin reconocer** (rojo si hay críticas/errores; se consulta cada 30 s).
 - **Grupos / Empresas / Agencias**: alta, edición, baja, habilitar/deshabilitar; tokens con mostrar/copiar/regenerar (y revocar en grupo/agencia); contraseñas de **solo escritura**.
+- **Detalle de grupo y de agencia** (`/grupos/[id]`, `/agencias/[id]`): los **extractores** (tareas) por agencia con su salud, alta de extractores desde el contexto y **clonado** a otras agencias (sección 16.5).
 - **Catálogo de objetos**: tabla destino, `create_table_sql`, `upsert_keys`, constraint y `static_columns` (editores monoespaciados).
-- **Tareas**: por agencia, `extract_sql`, `schedule_seconds` (con atajos), activa, modo empresa (`run_on_company_token`), duración esperada y tolerancia de retraso (opcionales, sección 18), última ejecución y reinicio de `last_run_at`; filtros por grupo/empresa/agencia.
+- **Tareas**: por agencia, `extract_sql`, `schedule_seconds` (con atajos), activa, modo empresa (`run_on_company_token`), duración esperada y tolerancia de retraso (opcionales, sección 18), última ejecución y reinicio de `last_run_at`; filtros por grupo/empresa/agencia; acción **Clonar a otras agencias**.
 - **Eventos**: `/monitor/events` con filtros, reconocer uno o todos.
 - **Actividad**: `/monitor/activity` (log HTTP).
 - **Instalaciones**: agentes enrolados (alcance, estado, último contacto con semáforo, versión, cola, fallos 24 h), acciones **Rotar credencial** y **Revocar**; debajo, **clientes legados** que aún usan tokens.
@@ -670,6 +671,38 @@ pnpm dev                        # http://localhost:3000
 ```
 
 Producción: `pnpm build && pnpm start` detrás de HTTPS. Comprobaciones: `pnpm typecheck`, `pnpm lint`, `pnpm build`.
+
+### 16.5. Vista por grupo y por agencia; clonar extractores
+
+En el panel las **tareas** (`agency_task`) se llaman **extractores**: un extractor = agencia + objeto del catálogo (por empresa) + SQL de extracción, programación y umbrales. El **servidor de origen** no es parte del extractor: sale de la **empresa** de la agencia.
+
+**Grupo** (`/grupos/[id]`, desde la lista de Grupos): nombre, habilitado y destino DWH `host:puerto/base` (solo con `credentials.manage` sobre el grupo; si no, "Destino DWH oculto"); tarjetas de resumen (agencias, extractores activos, con error, retrasados, sin ejecutar; las de estado filtran al pulsarlas); empresas → agencias (secciones plegables, "Expandir/Contraer todo") y, por agencia, sus extractores: objeto → tabla destino, programación ("cada 15 min"), estado de salud (mismas etiquetas que Salud), última carga exitosa (con zona explícita), interruptor **Activo** (solo con `config.manage`; si no, insignia) y **Clonar**. Filtros por estado y búsqueda (extractor, tabla, agencia o `#id`) guardados en la URL (`?status=failing&q=…`). Botones **Nuevo extractor** (del grupo: se elige la agencia entre las del grupo; por agencia: preseleccionada). Las empresas sin agencias también se listan (sin filtros), con el aviso y el enlace **Nueva agencia** (abre el alta en Agencias con la empresa elegida, `?nueva=1`). Datos: `GET /admin/groups/{id}`, `/admin/companies?group_id=`, `/admin/agencies?group_id=`, `/admin/health/tasks?group_id=` (4 peticiones, sin N+1); se actualiza cada 30 s.
+
+**Agencia** (`/agencias/[id]`, desde Agencias, Tareas, Salud o el detalle de grupo): migas Grupos › Grupo › Empresa › Agencia; datos de la agencia; resumen; tabla de extractores (estado, última carga exitosa, última ejecución, punto de sincronización, error actual y errores consecutivos con el desglose por instalación, programación, Activo, **Clonar**, **Editar**/Ver en solo lectura con el mismo formulario de Tareas, `components/task-form.tsx`); **Nuevo extractor** con la agencia preseleccionada y **Clonar a otras agencias** (varios extractores a la vez); debajo, incidencias abiertas de la agencia y las últimas 25 ejecuciones (con enlaces a Incidencias/Ejecuciones ya filtradas). Datos: `GET /admin/agencies/{id}`, `/admin/health/tasks?agency_id=`, `/admin/tasks?agency_id=`, `/admin/executions?agency_id=&limit=25`, `/admin/incidents?agency_id=&view=open`.
+
+Un id inexistente **o de un grupo fuera del alcance** muestra "Grupo/Agencia no encontrada" (el backend responde 404 en ambos casos). En pantallas angostas las tablas se desplazan dentro de su tarjeta (barra siempre visible); la página no se desplaza a lo ancho.
+
+**Clonar extractores** (muchos extractores son iguales entre agencias; solo cambia el servidor de origen):
+
+| Método y ruta | Uso |
+|---|---|
+| `POST /admin/tasks/{id}/clone` | Un extractor → varias agencias |
+| `POST /admin/agencies/{id}/clone-tasks` | Extractores de una agencia (todos o `task_ids`) → varias agencias |
+
+Cuerpo: `target_agency_ids` (obligatorio), `copy_object_if_missing` (true), `enabled` (**false**: los clones se crean deshabilitados para revisarlos), `on_conflict` (`skip` | `update`), `overwrite_objects` (false), `dry_run` (vista previa sin guardar), y en el masivo `task_ids`. Por cada (extractor, agencia destino):
+
+- **Objeto**: misma empresa → se reutiliza. Otra empresa → se busca por **nombre** en su catálogo: definición idéntica (tabla destino, `create_table_sql`, `upsert_keys`, constraint, `static_columns`) → se reutiliza; distinta → `object_conflict` (no se toca) salvo `on_conflict = update` **y** `overwrite_objects = true` (se sobrescribe la definición: afecta a todas las agencias de esa empresa); inexistente → se copia si `copy_object_if_missing` (aviso `static_columns_review`: las columnas estáticas, p. ej. `dn`, suelen ser propias de cada empresa) o error `object_missing`.
+- **Tarea**: si la agencia ya tiene ese objeto → `skipped_exists` (`skip`) o `updated` (`update`: SQL, programación, modo empresa y umbrales; conserva `is_active` y `last_run_at`); si no → `created` con `is_active = enabled`, sin `last_run_at` (primera carga completa); `query_version`/`query_hash` los fija el trigger.
+- **Permisos**: `config.manage` en el grupo de origen **y** en el de cada destino. Un destino inexistente o fuera del alcance devuelve `not_found` sin nombre ni grupo; visible sin permiso → `permission_required`. La propia agencia de origen → `same_agency`.
+- Cada destino va en su **propio SAVEPOINT**: uno que falla no deshace los demás. Respuesta: `results` (por destino: `status` created/updated/skipped_exists/object_conflict/error, `code`, `task_id`, `object_action` reused/created/updated/conflict/missing, `affected_tasks` = otros extractores de la empresa destino que usan ese objeto cuando hay conflicto o sobrescritura, `target_disabled` + aviso si la agencia/empresa/grupo destino está deshabilitado —el clon no se ejecutará—, `warnings`, `message`) y `summary`.
+- Máximo **2000** combinaciones (extractores × agencias) por petición → 422 con mensaje. Los destinos se resuelven en una sola consulta.
+- **Vista previa** (`dry_run`): no escribe nada ni consume secuencias; simula en memoria (un objeto que se copiaría a una empresa se reutiliza para sus demás agencias, igual que al ejecutar). Los mensajes van en futuro ("se omitirá").
+- **Auditoría**: `tasks.clone` / `agencies.clone_tasks` en `panel_audit_log` con totales, listas acotadas a 100 ids (extractores de origen, agencias y grupos destino, extractores escritos), opciones y resumen (sin SQL). La vista previa no se audita. En general, `details` de la auditoría siempre es JSON válido ≤ 4000 caracteres (si no cabe se recortan las listas con `*_total` y `truncated: true`) y, si el registro fallara, se guarda una fila mínima: nunca se pierde.
+- `GET /admin/tasks?light=true` devuelve solo `id`, `agency_id`, `group_id`, `object_catalog_id`, `object_name` (sin SQL); lo usa el diálogo para marcar "Ya lo tiene".
+
+Panel: acción **Clonar** en cada extractor (Tareas, detalle de grupo y de agencia) y **Clonar a otras agencias** en el detalle de agencia (con casillas para elegir extractores). El diálogo lista las agencias destino permitidas agrupadas por grupo/empresa, con búsqueda y la marca "Ya lo tiene"; opciones; **Vista previa** (obligatoria antes de confirmar) y tabla de resultados.
+
+Pruebas: `dwh_back/tests/test_clone_tasks.py` (misma empresa con objeto reutilizado y clon deshabilitado; otra empresa con objeto copiado y aviso de columnas estáticas; objeto idéntico reutilizado; objeto distinto → conflicto, y sobrescritura solo con confirmación; `skip` vs `update` con `query_version`; permiso en origen pero no en destino sin revelar el otro grupo; cruce de grupos con permiso en ambos; vista previa sin cambios ni auditoría; auditoría; clonado masivo con subconjunto) y `test_panel_auth.py::test_vista_grupo_y_agencia_por_alcance` (detalle 404 y listas filtradas vacías fuera del alcance).
 
 ---
 

@@ -644,6 +644,42 @@ def test_aislamiento_detalle_y_mutaciones_404(aenv):
     assert call(e, "super", "GET", f"/admin/groups/{B}").json()["name"] == "Grupo B"
 
 
+def test_vista_grupo_y_agencia_por_alcance(aenv):
+    """Vistas de detalle del panel (/grupos/[id], /agencias/[id]): usan los filtros group_id/agency_id
+    de las listas existentes; fuera del alcance → 404 en el detalle y listas vacías (nunca datos de B)."""
+    e = aenv
+    ids, A, B = e["ids"], e["A"], e["B"]
+    aa1, ab1 = ids["agency_a1"]["id"], ids["agency_b1"]["id"]
+    # Dentro del alcance: detalle + extractores de la agencia y del grupo.
+    ag = call(e, "viewer_a", "GET", f"/admin/agencies/{aa1}", expect=200).json()
+    assert ag["group_id"] == A and ag["company_id"] == ids["company_a"]["id"] and ag["agency_token"] is None
+    ht = call(e, "viewer_a", "GET", f"/admin/health/tasks?agency_id={aa1}", expect=200).json()["items"]
+    assert ht and {t["agency_id"] for t in ht} == {aa1}
+    assert {t["task_id"] for t in ht} == {t["id"] for t in call(e, "viewer_a", "GET", f"/admin/tasks?agency_id={aa1}",
+                                                                   expect=200).json()["items"]}
+    hg = call(e, "viewer_a", "GET", f"/admin/health/tasks?group_id={A}", expect=200).json()["items"]
+    assert {t["group_id"] for t in hg} == {A} and len(hg) > len(ht)
+    assert all(x["agency_id"] == aa1 for x in
+               call(e, "viewer_a", "GET", f"/admin/executions?agency_id={aa1}", expect=200).json()["items"])
+    # Fuera del alcance: detalle 404 (igual que inexistente) y listas filtradas vacías.
+    for path in (f"/admin/groups/{B}", f"/admin/agencies/{ab1}", "/admin/groups/999999", "/admin/agencies/999999"):
+        assert call(e, "viewer_a", "GET", path).status_code == 404, path
+    for path in (f"/admin/health/tasks?group_id={B}", f"/admin/health/tasks?agency_id={ab1}",
+                 f"/admin/tasks?group_id={B}", f"/admin/tasks?agency_id={ab1}", f"/admin/agencies?group_id={B}",
+                 f"/admin/executions?agency_id={ab1}", f"/admin/incidents?agency_id={ab1}&view=open"):
+        assert call(e, "viewer_a", "GET", path, expect=200).json()["items"] == [], path
+    # El superadministrador sí ve B con los mismos filtros (el filtro funciona, no es solo el alcance).
+    assert call(e, "super", "GET", f"/admin/health/tasks?agency_id={ab1}", expect=200).json()["items"]
+    assert call(e, "super", "GET", f"/admin/incidents?agency_id={ab1}&view=open", expect=200).json()["items"]
+    # El lector no puede activar/desactivar extractores (403), config.manage de A sí; en B → 404.
+    # (t_dups ya está inactiva: se activa y se regresa, sin cerrar incidencias de otras pruebas.)
+    t_dups = ids["t_dups"]["id"]
+    assert call(e, "viewer_a", "POST", f"/admin/tasks/{t_dups}/enable").status_code == 403
+    assert call(e, "cfg_a", "POST", f"/admin/tasks/{t_dups}/enable", expect=200).json()["is_active"] is True
+    assert call(e, "cfg_a", "POST", f"/admin/tasks/{t_dups}/disable", expect=200).json()["is_active"] is False
+    assert call(e, "cfg_a", "POST", f"/admin/tasks/{ids['t_b']['id']}/disable").status_code == 404
+
+
 def test_auditoria_por_alcance(aenv):
     e = aenv
     # op_ab reconoció en A (test de matriz) y cfg_a intentó en B (404): la auditoría tiene grupo.

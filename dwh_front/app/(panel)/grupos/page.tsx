@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useApi } from "@/lib/api";
@@ -138,7 +139,7 @@ export default function GruposPage() {
                 <Th>Nombre</Th>
                 <Th>DWH</Th>
                 <Th>Token de grupo</Th>
-                <Th className="text-right">Empresas</Th>
+                <Th className="hidden text-right xl:table-cell">Empresas</Th>
                 <Th>Activo</Th>
                 <Th className="text-right">Acciones</Th>
               </tr>
@@ -149,7 +150,12 @@ export default function GruposPage() {
                 const canCred = can("credentials.manage", g.id);
                 return (
                 <Tr key={g.id}>
-                  <Td className="font-medium text-slate-900">{g.name}</Td>
+                  <Td>
+                    <Link href={`/grupos/${g.id}`} className="font-medium text-slate-900 hover:text-brand-700 hover:underline">
+                      {g.name}
+                    </Link>
+                    <p className="text-xs text-slate-500 xl:hidden">{g.company_count} empresa(s)</p>
+                  </Td>
                   <Td>
                     {g.secrets_hidden ? (
                       <p className="text-xs italic text-slate-400" title="Requiere el permiso «Administrar credenciales» sobre el grupo">
@@ -195,7 +201,7 @@ export default function GruposPage() {
                       }
                     />
                   </Td>
-                  <Td className="text-right tabular-nums">{g.company_count}</Td>
+                  <Td className="hidden text-right tabular-nums xl:table-cell">{g.company_count}</Td>
                   <Td>
                     <Switch
                       checked={g.is_enabled}

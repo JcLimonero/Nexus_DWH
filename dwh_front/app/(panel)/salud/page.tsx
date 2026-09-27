@@ -5,31 +5,14 @@ import { useCallback, useState } from "react";
 import { Info, RefreshCw, Siren } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
 import type { InstallationHealth, TaskHealth } from "@/lib/types";
-import { fmtAgo, fmtDateTz, fmtNumber, fmtSeconds, tzLabel } from "@/lib/format";
+import { fmtDateTz, fmtNumber, fmtSeconds, tzLabel } from "@/lib/format";
 import { Badge, Button, Card, PageHeader, Select } from "@/components/ui/primitives";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { FilterBar, useUrlFilters } from "@/components/scope-filters";
 
 const FILTER_KEYS = ["group_id", "company_id", "agency_id", "task_id", "status"] as const;
-import { CATEGORY_LABEL, CONNECTIVITY, TASK_STATE, WM_KIND_SHORT, fmtSecs, useAutoRefresh } from "@/components/health";
-
-const EXEC_STATUS: Record<string, { label: string; tone: "green" | "red" | "amber" | "blue" }> = {
-  success: { label: "OK", tone: "green" },
-  failed: { label: "Fallida", tone: "red" },
-  interrupted: { label: "Interrumpida", tone: "amber" },
-  running: { label: "En curso", tone: "blue" },
-};
-
-function When({ value, empty = "nunca" }: { value: string | null; empty?: string }) {
-  if (!value) return <span className="text-xs text-slate-400">{empty}</span>;
-  return (
-    <div className="whitespace-nowrap">
-      <p className="text-xs font-medium text-slate-700">{fmtAgo(value)}</p>
-      <p className="text-[11px] text-slate-500">{fmtDateTz(value)}</p>
-    </div>
-  );
-}
+import { CATEGORY_LABEL, CONNECTIVITY, EXEC_STATUS, TASK_STATE, WM_KIND_SHORT, When, fmtSecs, useAutoRefresh } from "@/components/health";
 
 const SOURCE_LABEL: Record<string, string> = { configured: "configurada", history: "p90 historial", default: "por defecto" };
 
@@ -206,7 +189,10 @@ export default function SaludPage() {
                     <Td>
                       <p className="font-medium text-slate-900">{t.object_name}</p>
                       <p className="text-xs text-slate-500">
-                        {t.group_name} / {t.company_name} / {t.agency_name}
+                        {t.group_name} / {t.company_name} /{" "}
+                        <Link href={`/agencias/${t.agency_id}`} className="text-brand-700 hover:underline">
+                          {t.agency_name}
+                        </Link>
                       </p>
                       <p className="font-mono text-[11px] text-slate-400">
                         #{t.task_id} · {t.destination_table}
