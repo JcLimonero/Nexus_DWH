@@ -12,6 +12,7 @@ import { Modal } from "@/components/ui/modal";
 import { useToast } from "@/components/ui/feedback";
 import { useActions } from "@/components/use-actions";
 import { useRefData } from "@/components/ref-data";
+import { useSession } from "@/components/session";
 import { CATEGORY_LABEL, DELIVERY_STATUS, SEVERITY, TRANSITION_LABEL } from "@/components/health";
 
 interface FormState {
@@ -53,7 +54,11 @@ export default function NotificacionesPage() {
   const [chFilter, setChFilter] = useState("");
   const [stFilter, setStFilter] = useState("");
   const deliveries = useApi<{ items: Delivery[] }>(`admin/notification-deliveries${qs({ channel_id: chFilter, status: stFilter, limit: 200 })}`);
-  const { groups } = useRefData();
+  const { groups: allGroups } = useRefData();
+  const { can, canAny, canGlobal } = useSession();
+  // Canal de un grupo: credentials.manage en ese grupo; canal "todos los grupos": alcance global.
+  const groups = allGroups.filter((g) => can("credentials.manage", g.id));
+  const canGlobalChannel = canGlobal("credentials.manage");
   const toast = useToast();
   const { run, busy } = useActions(() => {
     void channels.reload();
@@ -67,7 +72,7 @@ export default function NotificacionesPage() {
 
   function openCreate() {
     setEditing(null);
-    setForm(EMPTY);
+    setForm({ ...EMPTY, group_id: canGlobalChannel ? "" : String(groups[0]?.id ?? "") });
     setOpen(true);
   }
   function openEdit(c: NotificationChannel) {
@@ -147,9 +152,11 @@ export default function NotificacionesPage() {
             >
               Actualizar
             </Button>
-            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate}>
-              Nuevo canal
-            </Button>
+            {canAny("credentials.manage") && (
+              <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate}>
+                Nuevo canal
+              </Button>
+            )}
           </>
         }
       />
@@ -226,6 +233,9 @@ export default function NotificacionesPage() {
                     {c.failed > 0 && <p className="text-red-600">{c.failed} fallida(s)</p>}
                   </Td>
                   <Td className="text-right">
+                    {!can("credentials.manage", c.group_id) ? (
+                      <span className="text-xs text-slate-400">Solo lectura</span>
+                    ) : (
                     <div className="flex justify-end gap-0.5">
                       <IconButton
                         label="Enviar prueba"
@@ -258,6 +268,7 @@ export default function NotificacionesPage() {
                         <Trash2 className="h-4 w-4" />
                       </IconButton>
                     </div>
+                    )}
                   </Td>
                 </Tr>
               ))}
@@ -399,7 +410,9 @@ export default function NotificacionesPage() {
           </Field>
           <Field label="Grupo" className="sm:col-span-3" htmlFor="c-group">
             <Select id="c-group" value={form.group_id} onChange={(e) => set("group_id", e.target.value)}>
-              <option value="">Todos los grupos</option>
+              <option value="" disabled={!canGlobalChannel}>
+                Todos los grupos{canGlobalChannel ? "" : " (requiere alcance global)"}
+              </option>
               {groups.map((g) => (
                 <option key={g.id} value={g.id}>
                   {g.name}

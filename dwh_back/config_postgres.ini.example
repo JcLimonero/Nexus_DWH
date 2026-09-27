@@ -8,6 +8,15 @@ user = postgres
 password = TU_PASSWORD_AQUI
 ; Aplicar migraciones pendientes al arrancar (defecto false: usar migrate.py).
 ; auto_migrate = false
+; Pool de conexiones del backend (db_pool.py). Si todas están ocupadas se espera
+; pool_timeout_seconds y luego se responde 503.
+; Conexiones ociosas que se conservan y reutilizan (psycopg2 cierra las que excedan este número).
+; pool_min = 5
+; pool_max = 20
+; pool_timeout_seconds = 10
+; connect_timeout_seconds = 5
+; Nombre visible en pg_stat_activity.
+; application_name = nexus_dwh_back
 
 [monitor]
 ; Token para acceder a los endpoints /monitor/*
@@ -19,10 +28,35 @@ password = TU_PASSWORD_AQUI
 ; config_secret_key = TU_FERNET_KEY_AQUI
 
 [admin]
-; Token para la API de administración /admin/* (panel web dwh_front).
-; Si se deja vacío (y no existe NEXUS_ADMIN_TOKEN) los endpoints /admin/* responden 503.
-; Genera uno largo: python -c "import secrets; print(secrets.token_urlsafe(48))"
+; El panel usa USUARIOS con contraseña y sesión (sección 20 de DWH_README.md;
+; primer usuario: python manage_users.py create-superadmin --username X).
+; Token ESTÁTICO de emergencia ("break-glass") para /admin/*: equivale a
+; superadministrador y cada uso queda en panel_audit_log. Solo se acepta si
+; allow_static_token = true (por defecto false; déjelo en false en producción).
+; También: NEXUS_ADMIN_TOKEN. Genera uno largo: python -c "import secrets; print(secrets.token_urlsafe(48))"
 ; token = TU_ADMIN_TOKEN
+; allow_static_token = false
+
+[auth]
+; Sesiones del panel: vencimiento absoluto e inactividad (segundos).
+; session_absolute_seconds = 43200
+; session_idle_seconds = 1800
+; Bloqueo por usuario tras N fallos: base × 2^(fallos − N) segundos, con tope.
+; max_failed_attempts = 5
+; lockout_base_seconds = 30
+; lockout_max_seconds = 3600
+; Fallos de inicio de sesión por IP dentro de la ventana → 429.
+; ip_max_failures = 30
+; ip_window_seconds = 900
+; Longitud mínima de contraseña (además: no contener el usuario ni ser común).
+; password_min_length = 12
+; IP real del usuario para el límite por IP: X-Forwarded-For NO se usa. El servidor del panel
+; envía x-nexus-client-ip + x-nexus-proxy-key; solo se acepta si la petición viene de
+; trusted_proxies Y la clave coincide con panel_proxy_key (= DWH_PANEL_PROXY_KEY del panel;
+; también NEXUS_PANEL_PROXY_KEY). Sin clave o IP desconocida: sin límite por IP (solo bloqueo
+; por usuario). Genera la clave: python -c "import secrets; print(secrets.token_urlsafe(32))"
+; trusted_proxies = 127.0.0.1,::1
+; panel_proxy_key =
 
 [cors]
 ; Orígenes permitidos (separados por coma). También: variable NEXUS_CORS_ORIGINS.
@@ -45,8 +79,22 @@ password = TU_PASSWORD_AQUI
 ; legacy_endpoints = true
 ; Tolerancia (horas) para fechas/watermarks "futuros" enviados por el agente.
 ; future_tolerance_hours = 26
+; Límites de tasa (memoria del proceso; 429 + Retry-After):
+; intentos de POST /agent/enroll por IP y minuto
+; enroll_rate_per_minute = 20
+; enrolamientos FALLIDOS por IP y por prefijo del token dentro de la ventana
+; enroll_fail_limit = 10
+; enroll_fail_window_seconds = 900
+; credenciales de instalación inválidas por IP dentro de la ventana
+; auth_fail_limit = 30
+; auth_fail_window_seconds = 300
 
 [server]
+; X-Forwarded-For en el backend (IP real de agentes detrás de un proxy inverso). Defecto false:
+; se usa la IP del socket. Actívelo SOLO si hay un proxy de confianza delante y limite
+; forwarded_allow_ips a su dirección.
+; proxy_headers = false
+; forwarded_allow_ips = 127.0.0.1
 ; Límites de tamaño del cuerpo de las peticiones (bytes); se responde 413.
 ; max_body_bytes = 1048576
 ; agent_max_body_bytes = 262144
@@ -124,8 +172,8 @@ password = TU_PASSWORD_AQUI
 ; max_objects_per_snapshot = 20000
 ; Esquemas excluidos en TODAS las bases (además de los del sistema), separados por coma.
 ; default_schema_exclude =
-; Stand-in del permiso inventory.view_definitions hasta la fase de RBAC: permite ver el SQL
-; (cifrado) de vistas de las bases que tengan "Guardar SQL de vistas" habilitado.
+; Interruptor global para ver el SQL (cifrado) de vistas de las bases con "Guardar SQL de
+; vistas": además hace falta el permiso inventory.view_definitions sobre el grupo (doble llave).
 ; expose_view_definitions = false
 ; Ventana (días) para buscar ejecuciones Nexus con DDL como evidencia técnica.
 ; evidence_window_days = 7

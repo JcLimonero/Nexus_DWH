@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState, type FormEvent } from "react";
-import { History, Pencil, Plus, Trash2 } from "lucide-react";
+import { Eye, History, Pencil, Plus, Trash2 } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
 import type { Agency, CatalogObject, ListResponse, Task } from "@/lib/types";
 import { fmtDate, fmtSeconds } from "@/lib/format";
@@ -9,10 +9,13 @@ import { Badge, Button, Card, Field, IconButton, Input, PageHeader, Select, Swit
 import { Modal } from "@/components/ui/modal";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
-import { HierarchyFilters, type FilterValue } from "@/components/filters";
 import { useRefData } from "@/components/ref-data";
 import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
+import { useSession } from "@/components/session";
+import { FilterBar, useUrlFilters } from "@/components/scope-filters";
+
+const FILTER_KEYS = ["group_id", "company_id", "agency_id"] as const;
 
 interface FormState {
   agency_id: string;
@@ -73,9 +76,11 @@ function AgencyOptions({ agencies }: { agencies: Agency[] }) {
 }
 
 export default function TareasPage() {
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "", agency_id: "" });
-  const { data, loading, error, reload } = useApi<ListResponse<Task>>(`admin/tasks${qs(filter as unknown as Record<string, string>)}`);
-  const { groups, companies, agencies } = useRefData({ agencies: true });
+  const [filter, setFilter, clearFilter] = useUrlFilters(FILTER_KEYS);
+  const { data, loading, error, reload } = useApi<ListResponse<Task>>(`admin/tasks${qs(filter)}`);
+  const { agencies: allAgencies } = useRefData({ agencies: true });
+  const { can, canAny } = useSession();
+  const agencies = allAgencies.filter((a) => can("config.manage", a.group_id));
   const objects = useApi<ListResponse<CatalogObject>>("admin/objects");
   const { run } = useActions(reload);
   const toast = useToast();
@@ -84,10 +89,11 @@ export default function TareasPage() {
   const [form, setForm] = useState<FormState>(EMPTY);
   const [saving, setSaving] = useState(false);
   const items = data?.items ?? [];
+  const readOnly = Boolean(editing && !can("config.manage", editing.group_id));
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
 
-  const selectedAgency = agencies.find((a) => String(a.id) === form.agency_id);
+  const selectedAgency = allAgencies.find((a) => String(a.id) === form.agency_id);
   const objectOptions = useMemo(
     () => (objects.data?.items ?? []).filter((o) => selectedAgency && o.company_id === selectedAgency.company_id),
     [objects.data, selectedAgency],
@@ -149,13 +155,15 @@ export default function TareasPage() {
         title="Tareas"
         description="Objetos del catálogo asignados a cada agencia, con su SQL de extracción y programación."
         actions={
-          <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={agencies.length === 0}>
-            Nueva tarea
-          </Button>
+          canAny("config.manage") ? (
+            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={agencies.length === 0}>
+              Nueva tarea
+            </Button>
+          ) : undefined
         }
       />
       <div className="mb-4">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} agencies={agencies} />
+        <FilterBar values={filter} onChange={setFilter} onClear={clearFilter} fields={[...FILTER_KEYS]} />
       </div>
       <Card>
         <DataState loading={loading} error={error} hasData={Boolean(data)} empty={items.length === 0} onRetry={reload} emptyTitle="No hay tareas" emptyDescription="Ajusta los filtros o crea una tarea.">
@@ -173,7 +181,9 @@ export default function TareasPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {items.map((t) => (
+              {items.map((t) => {
+                const canCfg = can("config.manage", t.group_id);
+                return (
                 <Tr key={t.id}>
                   <Td className="tabular-nums text-slate-500">{t.id}</Td>
                   <Td>
@@ -197,6 +207,7 @@ export default function TareasPage() {
                   <Td>
                     <Switch
                       checked={t.is_active}
+                      disabled={!canCfg}
                       hideLabel
                       label={t.is_active ? "Desactivar tarea" : "Activar tarea"}
                       onChange={(v) => run("toggle", `admin/tasks/${t.id}/${v ? "enable" : "disable"}`, { success: v ? "Tarea activada." : "Tarea desactivada." })}
@@ -204,9 +215,11 @@ export default function TareasPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex justify-end gap-0.5">
-                      <IconButton label="Editar" onClick={() => openEdit(t)}>
-                        <Pencil className="h-4 w-4" />
+                      <IconButton label={canCfg ? "Editar" : "Ver (solo lectura)"} onClick={() => openEdit(t)}>
+                        {canCfg ? <Pencil className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                       </IconButton>
+                      {canCfg && (
+                      <>
                       <IconButton
                         label="Reiniciar última ejecución"
                         disabled={!t.last_run_at}
@@ -236,10 +249,13 @@ export default function TareasPage() {
                       >
                         <Trash2 className="h-4 w-4" />
                       </IconButton>
+                      </>
+                      )}
                     </div>
                   </Td>
                 </Tr>
-              ))}
+                );
+              })}
             </tbody>
           </Table>
         </DataState>
@@ -255,13 +271,16 @@ export default function TareasPage() {
             <Button variant="secondary" onClick={() => setOpen(false)}>
               Cancelar
             </Button>
-            <Button type="submit" form="task-form" loading={saving}>
-              {editing ? "Guardar cambios" : "Crear tarea"}
-            </Button>
+            {!readOnly && (
+              <Button type="submit" form="task-form" loading={saving}>
+                {editing ? "Guardar cambios" : "Crear tarea"}
+              </Button>
+            )}
           </>
         }
       >
-        <form id="task-form" onSubmit={onSubmit} className="grid gap-4 sm:grid-cols-6">
+        <form id="task-form" onSubmit={onSubmit}>
+          <fieldset disabled={readOnly} className="grid gap-4 sm:grid-cols-6">
           <Field label="Agencia" required className="sm:col-span-3" htmlFor="t-agency">
             <Select
               id="t-agency"
@@ -278,7 +297,7 @@ export default function TareasPage() {
               <option value="" disabled>
                 Selecciona…
               </option>
-              <AgencyOptions agencies={agencies} />
+              <AgencyOptions agencies={readOnly && editing ? allAgencies.filter((a) => a.id === editing.agency_id) : agencies} />
             </Select>
           </Field>
           <Field
@@ -340,9 +359,10 @@ export default function TareasPage() {
             <Input id="t-tolerance" inputMode="numeric" placeholder="automática" value={form.delay_tolerance_seconds} onChange={(e) => set("delay_tolerance_seconds", e.target.value)} />
           </Field>
           <div className="grid gap-3 sm:col-span-6 sm:grid-cols-2">
-            <Switch checked={form.is_active} onChange={(v) => set("is_active", v)} label="Tarea activa" />
+            <Switch checked={form.is_active} disabled={readOnly} onChange={(v) => set("is_active", v)} label="Tarea activa" />
             <Switch
               checked={form.run_on_company_token}
+              disabled={readOnly}
               onChange={(v) => set("run_on_company_token", v)}
               label="Incluir en modo empresa (/configs)"
               description="Si se desactiva, solo se entrega a clientes en modo agencia o grupo."
@@ -353,6 +373,7 @@ export default function TareasPage() {
               Última ejecución: {fmtDate(editing.last_run_at)} · Actualizada: {fmtDate(editing.updated_at)}
             </p>
           )}
+          </fieldset>
         </form>
       </Modal>
     </>

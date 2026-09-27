@@ -337,12 +337,47 @@ class InstallationCtx:
 # ─────────────────────────────────────────────────────────────────────────────
 # Router
 # ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class AgentRateLimits:
+    """
+    Límites en memoria (por proceso) del API del agente:
+      * enroll_ip: intentos de POST /agent/enroll por IP (ventana de 60 s).
+      * enroll_fail_ip / enroll_fail_prefix: enrolamientos FALLIDOS por IP y por
+        prefijo (8 caracteres) del token presentado.
+      * auth_fail_ip: credenciales de instalación inválidas por IP (ráfagas).
+    Superado el límite → 429 con Retry-After (sin tocar la BD).
+    """
+    enroll_ip: Any
+    enroll_fail_ip: Any
+    enroll_fail_prefix: Any
+    auth_fail_ip: Any
+
+    @classmethod
+    def from_ini(cls, ini: Any) -> "AgentRateLimits":
+        from ratelimit import SlidingWindowLimiter
+        g = lambda k, d: max(1, ini.getint("agent", k, fallback=d))  # noqa: E731
+        fail_window = g("enroll_fail_window_seconds", 900)
+        return cls(
+            enroll_ip=SlidingWindowLimiter(g("enroll_rate_per_minute", 20), 60),
+            enroll_fail_ip=SlidingWindowLimiter(g("enroll_fail_limit", 10), fail_window),
+            enroll_fail_prefix=SlidingWindowLimiter(g("enroll_fail_limit", 10), fail_window),
+            auth_fail_ip=SlidingWindowLimiter(g("auth_fail_limit", 30), g("auth_fail_window_seconds", 300)),
+        )
+
+
+def rate_limited(retry_after: float, message: str) -> HTTPException:
+    return HTTPException(status_code=429, detail={"code": "rate_limited", "message": message,
+                                                  "retry_after": int(retry_after) + 1},
+                         headers={"Retry-After": str(int(retry_after) + 1)})
+
+
 def create_agent_routers(
     *,
     get_connection: Callable[[], Any],
     decrypt_config_secret: Callable[[Optional[str]], str],
-    admin_token: str,
+    auth: Any,
     monitor_token: str,
+    limits: Optional[AgentRateLimits] = None,
     config_max_age_seconds: int = 900,
     rotation_grace_seconds: int = 3600,
     heartbeat_retention_days: int = 7,
@@ -357,6 +392,11 @@ def create_agent_routers(
     la MISMA transacción que el reporte (dentro de un savepoint: un error del
     gancho nunca tumba el reporte del agente).
     """
+    from panel_auth import AuthContext, group_of
+
+    if limits is None:
+        import configparser as _cp
+        limits = AgentRateLimits.from_ini(_cp.ConfigParser())
 
     # ── BD ──────────────────────────────────────────────────────────────────
     @contextmanager
@@ -395,6 +435,10 @@ def create_agent_routers(
         x_installation_secret: Optional[str] = Header(None, alias="x-installation-secret"),
         authorization: Optional[str] = Header(None),
     ) -> InstallationCtx:
+        ip = request.client.host if request.client else ""
+        wait = limits.auth_fail_ip.blocked(ip)
+        if wait:
+            raise rate_limited(wait, "Demasiadas credenciales de instalación inválidas desde esta dirección.")
         inst_id, secret = x_installation_id, x_installation_secret
         if (not inst_id or not secret) and authorization and authorization.lower().startswith("bearer "):
             raw = authorization[7:].strip()
@@ -405,6 +449,7 @@ def create_agent_routers(
         try:
             iid = uuid.UUID(inst_id.strip())
         except ValueError:
+            limits.auth_fail_ip.hit(ip)
             raise http_error(401, "invalid_credentials", "Credenciales de instalación no válidas.")
         request.state.audit = {"auth_kind": "installation", "installation_id": str(iid)}
         provided = hash_secret(secret.strip())
@@ -434,6 +479,7 @@ def create_agent_routers(
                     and row["previous_valid_until"] > utcnow():
                 used_prev = hmac.compare_digest(provided, row["previous_credential_hash"])
             if not row or not (ok or used_prev):
+                limits.auth_fail_ip.hit(ip)
                 raise http_error(401, "invalid_credentials", "Credenciales de instalación no válidas.")
             request.state.audit.update(
                 group_id=row["group_id"], company_id=row["company_id"], agency_id=row["agency_id"],
@@ -443,7 +489,6 @@ def create_agent_routers(
                 raise http_error(401, "installation_revoked", "La instalación fue revocada. Debe re-enrolarse.")
             if not row["group_enabled"] or not row["company_enabled"] or not row["agency_enabled"]:
                 raise http_error(403, "scope_disabled", "El grupo, empresa o agencia de la instalación está deshabilitado.")
-            ip = request.client.host if request.client else ""
             if ok and row.get("previous_credential_hash"):
                 # El agente ya usa el secreto nuevo: se invalida el anterior y el pendiente.
                 cur.execute(
@@ -514,13 +559,25 @@ def create_agent_routers(
         x_group_token: Optional[str] = Header(None),
         x_agency_token: Optional[str] = Header(None, alias="x-agency-token"),
     ) -> dict:
+        ip = request.client.host if request.client else ""
+        presented = (x_group_token or x_agency_token or x_token or "").strip()
+        prefix_key = presented[:8]
+        # Límite de tasa ANTES de tocar la BD: por IP (todos los intentos) y por IP/prefijo (fallidos).
+        wait = limits.enroll_fail_ip.blocked(ip) or limits.enroll_fail_prefix.blocked(prefix_key) \
+            or limits.enroll_ip.hit_and_check(ip)
+        if wait:
+            request.state.audit = {"auth_kind": "enroll", "token_prefix": token_prefix(presented)}
+            raise rate_limited(wait, "Demasiados intentos de enrolamiento; reintente más tarde.")
         if not (x_token or x_group_token or x_agency_token):
+            limits.enroll_fail_ip.hit(ip)
             raise http_error(401, "missing_enrollment_token", "Falta el token de enrolamiento.")
         with tx() as cur:
             p = resolve_legacy_principal(cur, company_token=x_token or "", group_token=x_group_token or "",
                                          agency_token=x_agency_token or "")
             request.state.audit = {"auth_kind": "enroll"}
             if not p:
+                limits.enroll_fail_ip.hit(ip)
+                limits.enroll_fail_prefix.hit(prefix_key)
                 raise http_error(401, "invalid_enrollment_token", "Token de enrolamiento no válido.")
             request.state.audit.update(group_id=p["group_id"], company_id=p["company_id"],
                                        agency_id=p["agency_id"], group_name=p["group_name"],
@@ -986,16 +1043,10 @@ def create_agent_routers(
     # ═════════════════════════════════════════════════════════════════════════
     # Administración
     # ═════════════════════════════════════════════════════════════════════════
-    configured_admin = (admin_token or "").strip()
-
-    def require_admin(x_admin_token: Optional[str] = Header(None, alias="x-admin-token")) -> None:
-        if not configured_admin:
-            raise HTTPException(status_code=503, detail="Admin no configurado.")
-        provided = (x_admin_token or "").encode("utf-8")
-        if not provided or not hmac.compare_digest(provided, configured_admin.encode("utf-8")):
-            raise HTTPException(status_code=401, detail="Token de administrador no válido.")
-
-    admin = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+    # Permisos: view (consultas por alcance de grupo); credentials.manage (rotar/revocar).
+    VIEW = auth.perm("view")
+    CREDS = auth.perm("credentials.manage")
+    admin = APIRouter(prefix="/admin", tags=["admin"])
 
     INSTALLATION_SELECT = """
         SELECT i.id, i.name, i.hostname, i.os_info, i.scope_type, i.group_id, g.name AS group_name,
@@ -1021,8 +1072,18 @@ def create_agent_routers(
             out[k] = iso(r.get(k))
         return out
 
-    def list_installations(group_id: Optional[int], status: Optional[str]) -> List[Dict[str, Any]]:
+    def list_installations(group_id: Optional[int], status: Optional[str],
+                           ctx: Optional[AuthContext] = None, company_id: Optional[int] = None,
+                           agency_id: Optional[int] = None) -> List[Dict[str, Any]]:
         conds, params = [], []
+        if ctx is not None:
+            sc, sp = ctx.scope_sql("i.group_id")
+            conds.append(sc)
+            params.extend(sp)
+        for col, val in (("i.company_id", company_id), ("i.agency_id", agency_id)):
+            if val is not None:
+                conds.append(f"{col} = %s")
+                params.append(val)
         if group_id is not None:
             conds.append("i.group_id = %s")
             params.append(group_id)
@@ -1034,11 +1095,12 @@ def create_agent_routers(
             cur.execute(INSTALLATION_SELECT + where + " ORDER BY g.name, i.name", tuple(params))
             return [inst_out(r) for r in cur.fetchall()]
 
-    def legacy_clients() -> List[Dict[str, Any]]:
+    def legacy_clients(ctx: Optional[AuthContext] = None) -> List[Dict[str, Any]]:
         """Clientes que aún usan tokens legados (según activity_log de los últimos 30 días)."""
+        sc, sp = ctx.scope_sql("al.group_id") if ctx is not None else ("TRUE", [])
         with tx() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT al.auth_kind, al.group_id, g.name AS group_name, al.company_id, c.name AS company_name,
                        al.agency_id, a.name AS agency_name, al.token AS token_prefix,
                        MAX(al.created_at)::timestamptz AS last_seen_at, COUNT(*) AS requests_30d,
@@ -1050,12 +1112,14 @@ def create_agent_routers(
                 LEFT JOIN agency a ON a.id = al.agency_id
                 WHERE al.auth_kind IN ('group', 'company', 'agency')
                   AND al.group_id IS NOT NULL  -- intentos con token inválido no son "clientes"
+                  AND {sc}
                   AND al.created_at >= NOW() - INTERVAL '30 days'
                   AND (al.endpoint IN ('/configs', '/group-configs', '/agency-configs', '/client-event')
-                       OR al.endpoint LIKE '/configs/%/last_run')
+                       OR al.endpoint LIKE '/configs/%%/last_run')
                 GROUP BY al.auth_kind, al.group_id, g.name, al.company_id, c.name, al.agency_id, a.name, al.token
                 ORDER BY MAX(al.created_at) DESC
-                """
+                """,
+                sp,
             )
             rows = cur.fetchall()
         out = []
@@ -1069,44 +1133,54 @@ def create_agent_routers(
         return out
 
     @admin.get("/installations")
-    def admin_list_installations(group_id: Optional[int] = Query(None), status: Optional[str] = Query(None)) -> dict:
-        return {"items": list_installations(group_id, status)}
+    def admin_list_installations(group_id: Optional[int] = Query(None), status: Optional[str] = Query(None),
+                                 company_id: Optional[int] = Query(None), agency_id: Optional[int] = Query(None),
+                                 ctx: AuthContext = Depends(VIEW)) -> dict:
+        return {"items": list_installations(group_id, status, ctx, company_id, agency_id)}
 
-    @admin.get("/installations/{installation_id}")
-    def admin_get_installation(installation_id: uuid.UUID) -> dict:
+    def get_installation(installation_id: uuid.UUID, ctx: AuthContext) -> dict:
         with tx() as cur:
             cur.execute(INSTALLATION_SELECT + " WHERE i.id = %s", (str(installation_id),))
             r = cur.fetchone()
         if not r:
             raise HTTPException(status_code=404, detail="Instalación no encontrada.")
+        ctx.check("view", r["group_id"], "Instalación")
         return inst_out(r)
 
+    @admin.get("/installations/{installation_id}")
+    def admin_get_installation(installation_id: uuid.UUID, ctx: AuthContext = Depends(VIEW)) -> dict:
+        return get_installation(installation_id, ctx)
+
     @admin.post("/installations/{installation_id}/revoke")
-    def admin_revoke(installation_id: uuid.UUID, body: Optional[RevokeBody] = None) -> dict:
+    def admin_revoke(installation_id: uuid.UUID, body: Optional[RevokeBody] = None,
+                     ctx: AuthContext = Depends(CREDS)) -> dict:
         with tx() as cur:
+            gid = group_of(cur, "installation", installation_id, "Instalación")
+            ctx.check("credentials.manage", gid, "Instalación")
             cur.execute(
                 """UPDATE installation SET status = 'revoked', revoked_at = NOW(), revoked_reason = %s,
+                          revoked_by = %s, revoked_by_user_id = %s,
                           previous_credential_hash = NULL, previous_valid_until = NULL
                    WHERE id = %s""",
-                ((body.reason if body else None), str(installation_id)),
+                ((body.reason if body else None), ctx.actor, ctx.user_id, str(installation_id)),
             )
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Instalación no encontrada.")
-        return admin_get_installation(installation_id)
+        return get_installation(installation_id, ctx)
 
     @admin.post("/installations/{installation_id}/rotate")
-    def admin_rotate(installation_id: uuid.UUID) -> dict:
+    def admin_rotate(installation_id: uuid.UUID, ctx: AuthContext = Depends(CREDS)) -> dict:
         """
         Marca la instalación para rotar su secreto: en su próximo contacto el
         agente recibe credential_rotation_required=true y llama a
         POST /agent/credentials/rotate. El panel nunca ve el secreto.
         """
         with tx() as cur:
+            gid = group_of(cur, "installation", installation_id, "Instalación")
+            ctx.check("credentials.manage", gid, "Instalación")
             cur.execute("UPDATE installation SET rotation_required = TRUE WHERE id = %s AND status = 'active'",
                         (str(installation_id),))
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Instalación no encontrada o revocada.")
-        return admin_get_installation(installation_id)
+        return get_installation(installation_id, ctx)
 
     @admin.get("/executions")
     def admin_executions(
@@ -1115,8 +1189,10 @@ def create_agent_routers(
         installation_id: Optional[uuid.UUID] = Query(None), status: Optional[str] = Query(None),
         failure_stage: Optional[str] = Query(None), since: Optional[datetime] = Query(None),
         until: Optional[datetime] = Query(None), limit: int = Query(200, ge=1, le=2000),
+        ctx: AuthContext = Depends(VIEW),
     ) -> dict:
-        conds, params = [], []
+        sc, params = ctx.scope_sql("e.group_id")
+        conds = [sc]
         for col, val in (("e.group_id", group_id), ("e.company_id", company_id), ("e.agency_id", agency_id),
                          ("e.task_id", task_id)):
             if val is not None:
@@ -1173,8 +1249,10 @@ def create_agent_routers(
         return {"total": len(items), "items": items}
 
     @admin.get("/sync-state")
-    def admin_sync_state(group_id: Optional[int] = Query(None), task_id: Optional[int] = Query(None)) -> dict:
-        conds, params = [], []
+    def admin_sync_state(group_id: Optional[int] = Query(None), task_id: Optional[int] = Query(None),
+                         ctx: AuthContext = Depends(VIEW)) -> dict:
+        sc, params = ctx.scope_sql("c.group_id")
+        conds = [sc]
         if group_id is not None:
             conds.append("c.group_id = %s")
             params.append(group_id)
@@ -1213,8 +1291,8 @@ def create_agent_routers(
         return {"items": items}
 
     @admin.get("/legacy-clients")
-    def admin_legacy_clients() -> dict:
-        return {"items": legacy_clients()}
+    def admin_legacy_clients(ctx: AuthContext = Depends(VIEW)) -> dict:
+        return {"items": legacy_clients(ctx)}
 
     # ═════════════════════════════════════════════════════════════════════════
     # Monitor

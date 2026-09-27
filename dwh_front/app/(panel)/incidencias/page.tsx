@@ -11,8 +11,10 @@ import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { Modal } from "@/components/ui/modal";
 import { useToast } from "@/components/ui/feedback";
-import { HierarchyFilters, type FilterValue } from "@/components/filters";
-import { useRefData } from "@/components/ref-data";
+import { FilterBar, dateRange, useUrlFilters } from "@/components/scope-filters";
+import { useSession } from "@/components/session";
+
+const FILTER_KEYS = ["group_id", "company_id", "agency_id", "task_id", "since", "until"] as const;
 import {
   CATEGORY_LABEL,
   CONNECTIVITY,
@@ -73,13 +75,12 @@ function IncidenciasInner() {
   const params = useSearchParams();
   const router = useRouter();
   const [view, setView] = useState<View>("active");
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "", agency_id: "" });
+  const [filter, setFilter, clearFilter] = useUrlFilters(FILTER_KEYS);
   const [category, setCategory] = useState("");
   const [severity, setSeverity] = useState("");
   const installationId = params.get("installation_id") || "";
   const detailId = params.get("id");
   const [openId, setOpenId] = useState<number | null>(detailId ? Number(detailId) : null);
-  const { groups, companies, agencies } = useRefData({ agencies: true });
 
   useEffect(() => {
     if (detailId) setOpenId(Number(detailId));
@@ -93,6 +94,8 @@ function IncidenciasInner() {
       group_id: filter.group_id,
       company_id: filter.company_id,
       agency_id: filter.agency_id,
+      task_id: filter.task_id,
+      ...dateRange(filter.since, filter.until),
       installation_id: installationId,
       limit: 300,
     })}`,
@@ -143,7 +146,7 @@ function IncidenciasInner() {
       </div>
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} agencies={agencies} />
+        <FilterBar values={filter} onChange={setFilter} onClear={clearFilter} fields={[...FILTER_KEYS]} />
         <Select aria-label="Categoría" className="w-full sm:w-56" value={category} onChange={(e) => setCategory(e.target.value)}>
           <option value="">Todas las categorías</option>
           {Object.entries(CATEGORY_LABEL).map(([k, v]) => (
@@ -247,6 +250,7 @@ function IncidenciasInner() {
 function IncidentDrawer({ id, onClose, onChanged }: { id: number; onClose: () => void; onChanged: () => void }) {
   const { data, loading, error, reload } = useApi<IncidentDetail>(`admin/incidents/${id}`);
   const toast = useToast();
+  const { can } = useSession();
   const [comment, setComment] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -393,6 +397,10 @@ function IncidentDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
           )}
 
           <div className="grid gap-4 border-t border-slate-200 pt-4 sm:grid-cols-2">
+            {!can("incident.acknowledge", i.group_id) && (
+              <p className="text-xs text-slate-500">Sin permiso para reconocer incidencias de este grupo (solo consulta).</p>
+            )}
+            {can("incident.acknowledge", i.group_id) && (
             <div>
               <Field label={i.acknowledged ? "Actualizar reconocimiento" : "Reconocer"} htmlFor="ack-comment" hint="No cierra la incidencia ni cambia el estado técnico.">
                 <Textarea id="ack-comment" rows={2} maxLength={500} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Comentario (opcional)" />
@@ -407,7 +415,8 @@ function IncidentDrawer({ id, onClose, onChanged }: { id: number; onClose: () =>
                 Reconocer
               </Button>
             </div>
-            {i.status === "open" && i.manual_resolvable && (
+            )}
+            {i.status === "open" && i.manual_resolvable && can("incident.close_queue", i.group_id) && (
               <div>
                 <Field label="Cerrar manualmente" htmlFor="res-reason" required hint="Solo para categorías sin evidencia automática (cola local). El motivo queda en el historial.">
                   <Textarea id="res-reason" rows={2} maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Motivo (obligatorio)" />

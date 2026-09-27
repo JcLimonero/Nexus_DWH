@@ -1,44 +1,63 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkAdminToken } from "@/lib/server/auth";
+import { backendFetch, csrfProblem, forwardHeaders } from "@/lib/server/auth";
 import { SESSION_COOKIE, SESSION_MAX_AGE, cookieSecure } from "@/lib/server/config";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Inicio de sesión: valida usuario/contraseña contra el backend
+ * (POST /admin/auth/login) y guarda SOLO el token opaco de sesión en una cookie
+ * httpOnly + SameSite=Strict (+ Secure en producción). El navegador nunca ve el token.
+ */
 export async function POST(req: NextRequest) {
-  let token = "";
+  const bad = csrfProblem(req);
+  if (bad) return NextResponse.json({ detail: bad }, { status: 403 });
+  let username = "";
+  let password = "";
   try {
-    const body = (await req.json()) as { token?: unknown };
-    token = typeof body.token === "string" ? body.token.trim() : "";
+    const body = (await req.json()) as { username?: unknown; password?: unknown };
+    username = typeof body.username === "string" ? body.username.trim() : "";
+    password = typeof body.password === "string" ? body.password : "";
   } catch {
     return NextResponse.json({ detail: "Solicitud no válida." }, { status: 400 });
   }
-  if (!token || token.length > 512) {
-    return NextResponse.json({ detail: "Ingresa el token de administrador." }, { status: 400 });
+  if (!username || !password || username.length > 64 || password.length > 1024) {
+    return NextResponse.json({ detail: "Ingresa usuario y contraseña." }, { status: 400 });
   }
 
-  const result = await checkAdminToken(token, false);
-  if (result === "invalid") {
-    return NextResponse.json({ detail: "Token de administrador no válido." }, { status: 401 });
-  }
-  if (result === "not_configured") {
-    return NextResponse.json(
-      { detail: "El backend no tiene configurado el token de administrador ([admin] token)." },
-      { status: 503 },
-    );
-  }
-  if (result === "unavailable") {
+  let res: Response;
+  try {
+    res = await backendFetch("/admin/auth/login", {
+      method: "POST",
+      headers: { ...forwardHeaders(req), "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+  } catch {
     return NextResponse.json({ detail: "No se pudo contactar al backend DWH." }, { status: 502 });
   }
-
-  const res = NextResponse.json({ status: "ok" });
-  res.cookies.set({
+  const data = (await res.json().catch(() => ({}))) as {
+    token?: string;
+    expires_at?: string;
+    must_change_password?: boolean;
+    user?: unknown;
+    detail?: unknown;
+  };
+  if (!res.ok || !data.token) {
+    const d = data.detail as { message?: string } | string | undefined;
+    const message = typeof d === "string" ? d : d?.message || "No se pudo iniciar sesión.";
+    return NextResponse.json({ detail: message }, { status: res.status === 200 ? 502 : res.status });
+  }
+  const expires = data.expires_at ? Math.floor((Date.parse(data.expires_at) - Date.now()) / 1000) : SESSION_MAX_AGE;
+  const out = NextResponse.json({ status: "ok", must_change_password: Boolean(data.must_change_password), user: data.user });
+  out.cookies.set({
     name: SESSION_COOKIE,
-    value: token,
+    value: data.token,
     httpOnly: true,
     sameSite: "strict",
     secure: cookieSecure(),
     path: "/",
-    maxAge: SESSION_MAX_AGE,
+    maxAge: Math.max(60, Math.min(SESSION_MAX_AGE, expires)),
   });
-  return res;
+  out.headers.set("cache-control", "no-store");
+  return out;
 }

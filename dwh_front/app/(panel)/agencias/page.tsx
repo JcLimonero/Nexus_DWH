@@ -9,10 +9,14 @@ import { Modal } from "@/components/ui/modal";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { TokenField } from "@/components/ui/token";
-import { CompanyOptions, HierarchyFilters, type FilterValue } from "@/components/filters";
+import { CompanyOptions } from "@/components/filters";
 import { useRefData } from "@/components/ref-data";
 import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
+import { useSession } from "@/components/session";
+import { FilterBar, useUrlFilters } from "@/components/scope-filters";
+
+const FILTER_KEYS = ["group_id", "company_id"] as const;
 
 interface FormState {
   company_id: string;
@@ -22,9 +26,11 @@ interface FormState {
 }
 
 export default function AgenciasPage() {
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "" });
-  const { data, loading, error, reload } = useApi<ListResponse<Agency>>(`admin/agencies${qs(filter as unknown as Record<string, string>)}`);
-  const { groups, companies } = useRefData();
+  const [filter, setFilter, clearFilter] = useUrlFilters(FILTER_KEYS);
+  const { data, loading, error, reload } = useApi<ListResponse<Agency>>(`admin/agencies${qs(filter)}`);
+  const { companies: allCompanies } = useRefData();
+  const { can, canAny } = useSession();
+  const companies = allCompanies.filter((c) => can("config.manage", c.group_id));
   const { run } = useActions(reload);
   const toast = useToast();
   const [editing, setEditing] = useState<Agency | null>(null);
@@ -67,13 +73,15 @@ export default function AgenciasPage() {
         title="Agencias"
         description="Sedes de cada empresa. El token de agencia permite un cliente ETL por sede."
         actions={
-          <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={companies.length === 0}>
-            Nueva agencia
-          </Button>
+          canAny("config.manage") ? (
+            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={companies.length === 0}>
+              Nueva agencia
+            </Button>
+          ) : undefined
         }
       />
       <div className="mb-4">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} />
+        <FilterBar values={filter} onChange={setFilter} onClear={clearFilter} fields={[...FILTER_KEYS]} />
       </div>
       <Card>
         <DataState loading={loading} error={error} hasData={Boolean(data)} empty={items.length === 0} onRetry={reload} emptyTitle="No hay agencias" emptyDescription="Ajusta los filtros o crea una agencia.">
@@ -89,7 +97,10 @@ export default function AgenciasPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {items.map((a) => (
+              {items.map((a) => {
+                const canCfg = can("config.manage", a.group_id);
+                const canCred = can("credentials.manage", a.group_id);
+                return (
                 <Tr key={a.id}>
                   <Td className="font-medium text-slate-900">{a.name}</Td>
                   <Td>
@@ -99,8 +110,9 @@ export default function AgenciasPage() {
                   <Td>
                     <TokenField
                       token={a.agency_token}
+                      hidden={a.token_hidden}
                       emptyLabel="Sin token"
-                      onRegenerate={() =>
+                      onRegenerate={!canCred ? undefined : () =>
                         run("token", `admin/agencies/${a.id}/regenerate-token`, {
                           success: a.agency_token ? "Token de agencia regenerado." : "Token de agencia generado.",
                           confirm: a.agency_token
@@ -114,7 +126,7 @@ export default function AgenciasPage() {
                         })
                       }
                       onRevoke={
-                        a.agency_token
+                        a.agency_token && canCred
                           ? () =>
                               run("token", `admin/agencies/${a.id}/token`, {
                                 method: "DELETE",
@@ -129,6 +141,7 @@ export default function AgenciasPage() {
                   <Td>
                     <Switch
                       checked={a.is_enabled}
+                      disabled={!canCfg}
                       hideLabel
                       label={a.is_enabled ? "Deshabilitar agencia" : "Habilitar agencia"}
                       onChange={(v) => run("toggle", `admin/agencies/${a.id}/${v ? "enable" : "disable"}`, { success: v ? "Agencia habilitada." : "Agencia deshabilitada." })}
@@ -136,6 +149,9 @@ export default function AgenciasPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex justify-end gap-0.5">
+                      {!canCfg && <span className="text-xs text-slate-400">Solo lectura</span>}
+                      {canCfg && (
+                      <>
                       <IconButton label="Editar" onClick={() => openEdit(a)}>
                         <Pencil className="h-4 w-4" />
                       </IconButton>
@@ -152,10 +168,13 @@ export default function AgenciasPage() {
                       >
                         <Trash2 className="h-4 w-4" />
                       </IconButton>
+                      </>
+                      )}
                     </div>
                   </Td>
                 </Tr>
-              ))}
+                );
+              })}
             </tbody>
           </Table>
         </DataState>

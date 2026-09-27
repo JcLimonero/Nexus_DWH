@@ -19,13 +19,16 @@ import {
   ListChecks,
   LogOut,
   Menu,
+  ScrollText,
   Store,
+  UserCog,
   Users,
   X,
 } from "lucide-react";
 import { cx } from "@/lib/format";
 import { useIncidentBadge } from "@/components/health";
 import { useStructureBadge } from "@/components/structure";
+import { logout, useSession, type Permission } from "@/components/session";
 
 const NAV = [
   { section: "General", items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }] },
@@ -52,15 +55,31 @@ const NAV = [
       { href: "/actividad", label: "Actividad", icon: Activity },
     ],
   },
+  {
+    section: "Seguridad",
+    items: [
+      { href: "/usuarios", label: "Usuarios", icon: UserCog, perm: "users.manage" as Permission },
+      { href: "/auditoria", label: "Auditoría", icon: ScrollText, perm: "audit.view" as Permission },
+    ],
+  },
 ];
 
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
-  const badge = useIncidentBadge();
-  const structure = useStructureBadge();
+  const { canAny, me } = useSession();
+  const canView = canAny("view");
+  const badge = useIncidentBadge(canView);
+  const structure = useStructureBadge(canView);
+  const groups = NAV.map((g) => ({
+    ...g,
+    items: g.items.filter((it) => {
+      const perm = (it as { perm?: Permission }).perm;
+      return perm ? canAny(perm) : true;
+    }),
+  })).filter((g) => g.items.length > 0 && (me || g.section !== "Seguridad"));
   return (
     <nav className="flex-1 space-y-6 overflow-y-auto px-3 py-4">
-      {NAV.map((group) => (
+      {groups.map((group) => (
         <div key={group.section}>
           <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">{group.section}</p>
           <ul className="space-y-0.5">
@@ -113,11 +132,6 @@ function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
-async function logout() {
-  await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
-  window.location.href = "/login";
-}
-
 function Brand() {
   return (
     <div className="flex items-center gap-2.5">
@@ -132,9 +146,26 @@ function Brand() {
   );
 }
 
+function roleSummary(me: NonNullable<ReturnType<typeof useSession>["me"]>): string {
+  if (me.user.is_superadmin) return me.user.auth_kind === "static_token" ? "Token de emergencia" : "Superadministrador";
+  const scopes = Object.values(me.permissions);
+  if (scopes.some((s) => s === "all")) return "Alcance: todos los grupos";
+  const n = new Set(scopes.flatMap((s) => (Array.isArray(s) ? s : []))).size;
+  return `Alcance: ${n} grupo${n === 1 ? "" : "s"}`;
+}
+
 function LogoutButton() {
+  const { me } = useSession();
   return (
     <div className="border-t border-slate-200 p-3">
+      {me && (
+        <div className="mb-2 px-3" title={me.user.username}>
+          <p className="truncate text-sm font-medium text-slate-800">{me.user.display_name}</p>
+          <p className="truncate text-[11px] text-slate-500">
+            {me.user.username} · {roleSummary(me)}
+          </p>
+        </div>
+      )}
       <button
         onClick={logout}
         className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900"

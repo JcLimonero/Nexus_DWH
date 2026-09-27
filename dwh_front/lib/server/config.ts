@@ -1,16 +1,12 @@
 import "server-only";
 
-/** Nombre de la cookie httpOnly con el token de administrador. */
+/** Nombre de la cookie httpOnly con el token de sesión. */
 export { SESSION_COOKIE } from "@/lib/session";
 
 export function apiBaseUrl(): string {
   const url = (process.env.DWH_API_URL || "").trim().replace(/\/+$/, "");
   if (!url) throw new Error("Falta la variable de entorno DWH_API_URL.");
   return url;
-}
-
-export function monitorToken(): string {
-  return (process.env.DWH_MONITOR_TOKEN || "").trim();
 }
 
 export function cookieSecure(): boolean {
@@ -20,5 +16,5 @@ export function cookieSecure(): boolean {
   return process.env.NODE_ENV === "production";
 }
 
-/** Duración de la sesión (segundos). */
+/** Tope de la cookie (s); el vencimiento real lo decide el backend (absoluto + inactividad). */
 export const SESSION_MAX_AGE = 60 * 60 * 12;

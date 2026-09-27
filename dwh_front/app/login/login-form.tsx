@@ -4,6 +4,7 @@ import { useState, type FormEvent } from "react";
 import { useSearchParams } from "next/navigation";
 import { Database, Eye, EyeOff, LogIn } from "lucide-react";
 import { Button, Input } from "@/components/ui/primitives";
+import { CSRF_HEADER, CSRF_VALUE } from "@/lib/session";
 
 /** Solo permite volver a rutas del mismo origen (evita open redirect). */
 export function safeNext(next: string | null): string {
@@ -21,7 +22,8 @@ export function safeNext(next: string | null): string {
 
 export default function LoginForm() {
   const params = useSearchParams();
-  const [token, setToken] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -33,15 +35,16 @@ export default function LoginForm() {
     try {
       const res = await fetch("/api/auth/login", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token }),
+        headers: { "content-type": "application/json", [CSRF_HEADER]: CSRF_VALUE },
+        body: JSON.stringify({ username, password }),
       });
+      const data = (await res.json().catch(() => ({}))) as { detail?: string; must_change_password?: boolean };
       if (!res.ok) {
-        const data = (await res.json().catch(() => ({}))) as { detail?: string };
         setError(data.detail || "No se pudo iniciar sesión.");
         return;
       }
-      window.location.href = safeNext(params.get("next"));
+      setPassword("");
+      window.location.href = data.must_change_password ? "/cambiar-contrasena" : safeNext(params.get("next"));
     } catch {
       setError("No se pudo contactar al servidor.");
     } finally {
@@ -59,40 +62,58 @@ export default function LoginForm() {
         <p className="text-sm text-slate-500">Panel de administración</p>
       </div>
       <form onSubmit={onSubmit} className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-        <label htmlFor="token" className="mb-1 block text-sm font-medium text-slate-700">
-          Token de administrador
+        <label htmlFor="username" className="mb-1 block text-sm font-medium text-slate-700">
+          Usuario
+        </label>
+        <Input
+          id="username"
+          autoComplete="username"
+          autoCapitalize="none"
+          spellCheck={false}
+          autoFocus
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          maxLength={64}
+        />
+        <label htmlFor="password" className="mb-1 mt-4 block text-sm font-medium text-slate-700">
+          Contraseña
         </label>
         <div className="relative">
           <Input
-            id="token"
+            id="password"
             type={show ? "text" : "password"}
             autoComplete="current-password"
-            autoFocus
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            placeholder="Pega aquí el token"
-            className="pr-10 font-mono"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="pr-10"
+            maxLength={1024}
           />
           <button
             type="button"
             onClick={() => setShow((s) => !s)}
             className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-slate-400 hover:text-slate-600"
-            aria-label={show ? "Ocultar token" : "Mostrar token"}
+            aria-label={show ? "Ocultar contraseña" : "Mostrar contraseña"}
           >
             {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
           </button>
         </div>
-        <p className="mt-1.5 text-xs text-slate-500">
-          Es el valor de <code className="font-mono">[admin] token</code> del backend.
-        </p>
         {error && (
           <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
             {error}
           </div>
         )}
-        <Button type="submit" className="mt-5 w-full" loading={loading} disabled={!token.trim()} icon={<LogIn className="h-4 w-4" />}>
+        <Button
+          type="submit"
+          className="mt-5 w-full"
+          loading={loading}
+          disabled={!username.trim() || !password}
+          icon={<LogIn className="h-4 w-4" />}
+        >
           Entrar
         </Button>
+        <p className="mt-3 text-center text-[11px] text-slate-500">
+          Tras varios intentos fallidos la cuenta se bloquea temporalmente.
+        </p>
       </form>
     </div>
   );

@@ -134,9 +134,10 @@ export function EffectiveStatusBadge({ status }: { status: EffectiveStatus }) {
 }
 
 /** Contador de cambios estructurales pendientes (sondeo cada 30 s). Separado de las incidencias. */
-export function useStructureBadge(intervalMs = 30_000) {
+export function useStructureBadge(enabled = true, intervalMs = 30_000) {
   const [badge, setBadge] = useState<StructureBadge | null>(null);
   useEffect(() => {
+    if (!enabled) return;
     let alive = true;
     const load = async () => {
       try {
@@ -157,7 +158,7 @@ export function useStructureBadge(intervalMs = 30_000) {
       window.removeEventListener("focus", onChange);
       window.removeEventListener("dwh:structure-changed", onChange);
     };
-  }, [intervalMs]);
+  }, [enabled, intervalMs]);
   return badge;
 }
 

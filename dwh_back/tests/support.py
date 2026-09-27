@@ -142,9 +142,15 @@ class Backend:
         ini["database"] = {"host": CFG_PG["host"], "port": str(CFG_PG["port"]), "db": dbname,
                            "user": CFG_PG["user"], "password": CFG_PG["password"]}
         ini["monitor"] = {"token": self.monitor_token}
-        ini["admin"] = {"token": self.admin_token}
+        # Las pruebas existentes usan el token estático (break-glass) → se habilita aquí;
+        # por defecto está deshabilitado (ver tests/test_panel_auth.py).
+        ini["admin"] = {"token": self.admin_token, "allow_static_token": "true"}
         ini["security"] = {"config_secret_key": self.fernet_key}
-        ini["agent"] = {"config_max_age_seconds": "900", "rotation_grace_seconds": "3600"}
+        # Límites de tasa del agente holgados (las pruebas enrolan muchas veces desde 127.0.0.1);
+        # test_panel_auth.py los prueba con valores bajos.
+        ini["agent"] = {"config_max_age_seconds": "900", "rotation_grace_seconds": "3600",
+                        "enroll_rate_per_minute": "10000", "enroll_fail_limit": "10000",
+                        "auth_fail_limit": "10000"}
         for sec, vals in (extra_ini or {}).items():
             ini[sec] = {**(ini[sec] if ini.has_section(sec) else {}), **vals}
         with open(self.ini_path, "w") as fh:

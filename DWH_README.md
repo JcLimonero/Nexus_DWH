@@ -192,6 +192,10 @@ Los **clientes ETL** reciben el valor **ya descifrado** por HTTPS. La seguridad 
 - `health_postgres.py` — salud, incidencias y notificaciones: evaluador periódico, ganchos de incidencias del API del agente, `/admin/health/*`, `/admin/incidents*`, `/admin/notification-*` (sección 18).
 - `inventory_postgres.py` — inventario estructural y cambios de estructura: `/agent/inventory/*`, `/admin/monitored-databases*`, `/admin/structural-changes*`, `/admin/inventory/summary` (sección 19).
 - `redact.py` — saneamiento de textos del backend (errores, detalle de eventos, logs).
+- `panel_auth.py` — usuarios del panel: argon2id, sesiones, permisos por grupo, auditoría (sección 20).
+- `users_postgres.py` — `/admin/auth/*`, `/admin/users*`, `/admin/roles`, `/admin/sessions*`, `/admin/audit`.
+- `manage_users.py` — CLI: primer superadministrador, reinicio de contraseña, desbloqueo, desactivación.
+- `db_pool.py` — pool de conexiones acotado. `ratelimit.py` — límites de tasa en memoria.
 - `schema_postgres.sql` — esquema **base idempotente** de la BD de configuración PostgreSQL.
 - `migrate.py` + `migrations/NNN_*.sql` — migraciones ordenadas (sección 17.8).
 - `tests/` — pruebas automatizadas (pytest) del backend.
@@ -240,9 +244,10 @@ token = TU_MONITOR_TOKEN
 ; config_secret_key = TU_FERNET_KEY_AQUI
 
 [admin]
-; Token del panel/API de administración /admin/*. También: NEXUS_ADMIN_TOKEN.
-; Vacío = /admin/* responde 503.
+; El panel usa usuarios con sesión (sección 20). Token estático de emergencia
+; (x-admin-token, también NEXUS_ADMIN_TOKEN): solo con allow_static_token = true.
 ; token = TU_ADMIN_TOKEN
+; allow_static_token = false
 
 [cors]
 ; Orígenes permitidos (coma). También: NEXUS_CORS_ORIGINS. Vacío (default) = sin CORS.
@@ -275,7 +280,10 @@ Monitor (todos requieren header `x-monitor-token`):
 - `PUT /monitor/events/{id}/ack` — reconocer una alerta puntual.
 - `PUT /monitor/events/ack-all` — reconocer todas las alertas pendientes.
 
-Administración (solo PostgreSQL, header `x-admin-token`; ver `admin_postgres.py`):
+Administración (solo PostgreSQL; **sesión de usuario** `Authorization: Bearer <token>` con permisos por grupo, sección 20; el token estático `x-admin-token` solo si `[admin] allow_static_token = true`; ver `admin_postgres.py`):
+
+- Sesión y usuarios: `POST /admin/auth/login|logout|change-password`, `GET /admin/auth/me`, `/admin/users*`, `/admin/roles`, `/admin/sessions*`, `/admin/audit` (sección 20).
+- Equivalentes de `/monitor/*` para el panel (con alcance): `GET /admin/events`, `PUT /admin/events/{id}/ack`, `PUT /admin/events/ack-all`, `GET /admin/clients`, `GET /admin/activity`.
 
 - `GET /admin/whoami`, `GET /admin/stats` — validación del token y conteos para el dashboard.
 - Grupos: `GET|POST /admin/groups`, `GET|PUT|DELETE /admin/groups/{id}`, `POST /admin/groups/{id}/enable|disable`, `POST /admin/groups/{id}/regenerate-token`, `DELETE /admin/groups/{id}/token`.
@@ -292,7 +300,8 @@ Reglas de la API admin:
 - Las **contraseñas nunca se devuelven** (solo `has_password`). En un `PUT`, contraseña vacía u omitida = se conserva; `clear_password: true` la borra. Host/BD/usuario sí se devuelven descifrados al admin.
 - Los tokens (`group_token`, `company_token`, `agency_token`) se generan en el servidor (`secrets.token_urlsafe(32)`) y se pueden regenerar.
 - Los errores de validación `422` de `/admin/*` no incluyen el valor recibido (para no registrar contraseñas en `activity_log`).
-- `PUT` es parcial (solo los campos enviados). Errores: `401` token admin inválido, `503` admin no configurado, `404` no existe, `409` nombre/token duplicado o registro con dependientes (no se borra en cascada: primero hay que borrar/mover los hijos), `422` validación (p. ej. objeto de otra empresa en una tarea).
+- Host/BD/usuario de origen y DWH y los tokens de enrolamiento solo se devuelven con `credentials.manage` sobre el grupo (si no: `null` + `secrets_hidden`/`token_hidden`).
+- `PUT` es parcial (solo los campos enviados). Errores: `401` sesión inválida/expirada, `403` sin permiso (`permission_required`), `404` no existe **o fuera del alcance de grupos del usuario**, `409` nombre/token duplicado o registro con dependientes (no se borra en cascada: primero hay que borrar/mover los hijos), `422` validación (p. ej. objeto de otra empresa en una tarea).
 
 Salud:
 
@@ -565,6 +574,8 @@ Si el IDE falla con “Maven artifact ... cannot be resolved”, descarga el JAR
 - [ ] Agentes actualizados a v5 y **tokens de enrolamiento borrados** de los `config.ini` tras enrolar; cuando no queden agentes legados, `[agent] legacy_endpoints = false`.
 - [ ] Carpeta `agent_data` del agente con ACL solo para la cuenta del servicio y administradores.
 - [ ] `api_url` del agente con HTTPS y `mode = production` (sin `allow_insecure_http`).
+- [ ] Panel: usuarios nominales con el rol mínimo y alcance por grupo; `[admin] allow_static_token = false`; revisar **Auditoría** periódicamente; `DWH_COOKIE_SECURE=true` detrás de HTTPS.
+- [ ] Panel detrás de un proxy inverso (nginx) que **sobrescriba** `X-Real-IP` con `DWH_CLIENT_IP_HEADER=x-real-ip`, `DWH_PANEL_PROXY_KEY` = `[auth] panel_proxy_key` (aleatoria, distinta por entorno) y `DWH_PUBLIC_ORIGIN` con la URL pública; sin esto no hay límite de login por IP (§20.3).
 
 ---
 
@@ -606,18 +617,25 @@ Panel de administración en **Next.js 14 (App Router) + TypeScript + Tailwind**,
 
 ### 16.2. Seguridad
 
-- Login en `/login` con el **token de administrador** del backend. Una ruta del servidor Next lo valida (`GET /admin/whoami`) y lo guarda en una cookie **httpOnly, SameSite=Strict** (Secure en producción). Cerrar sesión la borra.
-- El navegador **nunca** habla directo con el backend: todo pasa por el proxy `app/api/dwh/[...path]` (solo rutas `/admin/*` y `/monitor/*`), que agrega `x-admin-token` desde la cookie.
-- El **token de monitor** vive solo en el servidor del panel (`DWH_MONITOR_TOKEN`); el proxy lo agrega a `/monitor/*` únicamente tras validar la sesión admin.
-- `middleware.ts` redirige a `/login` si no hay sesión.
+- Login en `/login` con **usuario y contraseña** (sección 20). La ruta del servidor Next `POST /api/auth/login` llama a `POST /admin/auth/login` y guarda **solo el token opaco de sesión** en una cookie **httpOnly, SameSite=Strict** (Secure en producción); nunca la contraseña, y el token no llega al JavaScript del navegador. Si la contraseña debe cambiarse, el panel lleva a `/cambiar-contrasena` y el backend rechaza todo lo demás (403 `password_change_required`). Cerrar sesión revoca la sesión en el backend y borra la cookie.
+- El navegador **nunca** habla directo con el backend: todo pasa por el proxy `app/api/dwh/[...path]` (solo `/admin/*`; `admin/auth/login|logout` bloqueados), que agrega `Authorization: Bearer <sesión>` y la IP real del navegador (`X-Forwarded-For`).
+- **CSRF**: además de SameSite=Strict, toda petición que modifica (login, logout y el proxy) exige la cabecera `x-nexus-csrf: 1`, y se rechaza si `Origin` no es el del panel o `Sec-Fetch-Site` es de otro sitio (403). El origen esperado es `DWH_PUBLIC_ORIGIN` (recomendado en producción, p. ej. `https://panel.midominio.com`); sin él, el `Host` de la petición (nunca `X-Forwarded-Host`, que controla el cliente).
+- IP del usuario hacia el backend: `x-nexus-client-ip` + clave `DWH_PANEL_PROXY_KEY` (sección 20.3); el panel no reenvía `X-Forwarded-For`.
+- El panel ya **no** usa el token de monitor ni el de administrador (`/monitor/*` queda solo para el monitor legado `dwh_api`; el panel usa `/admin/events|clients|activity`).
+- `middleware.ts` redirige a `/login` si no hay cookie; la validez real la decide el backend en cada llamada (401 → vuelve a `/login`).
+- La UI oculta o deshabilita lo que el usuario no puede hacer (Reconocer, Dar por entendido, Reclasificar, Aprobar/Reiniciar línea base, Configurar, credenciales/tokens, Usuarios, Auditoría) según `GET /admin/auth/me`; el backend es la fuente de verdad y un 403 se muestra como "Sin permiso".
 
 ### 16.3. Variables de entorno (`dwh_front/.env.local`, no se versiona)
 
 | Variable | Descripción |
 |----------|-------------|
 | `DWH_API_URL` | URL base del backend (p. ej. `http://127.0.0.1:8000`). |
-| `DWH_MONITOR_TOKEN` | Igual a `[monitor] token` del backend. |
 | `DWH_COOKIE_SECURE` | Opcional (`true`/`false`). Por defecto `true` en producción. |
+| `DWH_PUBLIC_ORIGIN` | Origen público del panel para la verificación CSRF de `Origin` (recomendado). |
+| `DWH_PANEL_PROXY_KEY` | Clave compartida con `[auth] panel_proxy_key` del backend (IP real del usuario). |
+| `DWH_CLIENT_IP_HEADER` / `DWH_TRUSTED_PROXY_HOPS` | De dónde sale la IP del navegador (sección 20.3). Sin ellas: desconocida. |
+
+(`DWH_MONITOR_TOKEN` ya no se usa en el panel.)
 
 Plantilla: `dwh_front/.env.example`.
 
@@ -634,9 +652,13 @@ cd dwh_back
 python3.12 -m venv .venv && .venv/bin/pip install -r requirements_postgres.txt
 .venv/bin/python main_postgres.py --port 8010
 
-# 3) Panel
+# 3) Primer usuario (no hay usuario por defecto)
+.venv/bin/python migrate.py
+.venv/bin/python manage_users.py create-superadmin --username mi_usuario
+
+# 4) Panel
 cd dwh_front
-cp .env.example .env.local      # DWH_API_URL=http://127.0.0.1:8010 y DWH_MONITOR_TOKEN
+cp .env.example .env.local      # DWH_API_URL=http://127.0.0.1:8010
 pnpm install
 pnpm dev                        # http://localhost:3000
 ```
@@ -769,6 +791,7 @@ Hilo independiente con su propia sesión HTTP: cada `heartbeat_seconds` (defecto
   - `006_indices_salud`: índices de expresión/parciales de `task_execution` para el modelo de salud y la retención (sección 18.3.1).
   - `007_inventario_estructural`: `monitored_database` (+ `_link`, `_event`), `inventory_snapshot`, `inventory_object_state`, `inventory_baseline` (+ `_version`), `structural_change` (+ `_event`) y `task_execution.ddl_applied` (sección 19). Solo crea tablas/columnas nuevas.
   - `008_inventario_ajustes`: identidad débil del servidor (`engine_identity_weak`), `allow_engine_duplicate`, estado `out_of_scope` de las alertas y limpieza de `monitored_database_link` al borrar grupo (FK) o empresa (trigger).
+  - `009_usuarios_permisos`: `panel_user`, `panel_permission`, `panel_role`, `panel_role_permission` (roles sembrados), `panel_user_role` (rol por alcance de grupo), `panel_session`, `panel_audit_log` y columnas `*_user_id` junto a los actores de texto (`incident`, `incident_event`, `structural_change`, `structural_change_event`, `monitored_database`, `monitored_database_event`, `inventory_baseline_version`, `client_events.acknowledged_by/_at`, `installation.revoked_by`). Solo crea tablas/columnas; no crea usuarios (sección 20).
 - **Ojo con `001` en BD grandes**: hace `UPDATE` masivos sobre `activity_log` y `client_events` (relleno de ids y recorte de tokens) en una sola transacción: puede tardar y generar mucho WAL/bloqueos si `activity_log` es grande. Recomendado: purgar/archivar `activity_log` antiguo antes, ejecutarla en ventana de mantenimiento y con respaldo.
 - Compatibles con BD existentes (probado sobre una copia de la BD de desarrollo y sobre una BD "legada" creada en las pruebas).
 
@@ -870,7 +893,7 @@ Reglas:
 
 - **Agrupación**: `dedup_key = categoría | instalación | tarea` (`task_delayed` es por tarea, sin instalación). Solo puede haber **una abierta** por clave (índice único parcial; `INSERT … ON CONFLICT DO NOTHING` + reintento, seguro con concurrencia). Una recurrencia suma `occurrences`, actualiza última ocurrencia, último código/mensaje saneado y el contador por código (`details.error_codes`), **sin volver a notificar**. Las condiciones continuas (desconexión, retraso, ejecución prolongada) no suman ocurrencias por ciclo del evaluador. Tras resolverse, una nueva falla abre **otra** incidencia (la anterior queda en el historial).
 - Se guarda primera ocurrencia (`opened_at`), última (`last_seen_at`), contador, primera/última ejecución relacionada, `resolved_at`, motivo, ejecución que la resolvió y `duration_seconds`.
-- **Reconocida ≠ resuelta**: `PUT /admin/incidents/{id}/ack` (comentario opcional) solo llena `acknowledged_at/by/ack_comment`; la incidencia sigue **abierta** y el estado técnico (salud de la tarea/instalación, error actual) se sigue mostrando. Una recurrencia no borra el reconocimiento. `acknowledged_by` es texto (`admin` hasta la fase de usuarios/RBAC).
+- **Reconocida ≠ resuelta**: `PUT /admin/incidents/{id}/ack` (comentario opcional) solo llena `acknowledged_at/by/ack_comment`; la incidencia sigue **abierta** y el estado técnico (salud de la tarea/instalación, error actual) se sigue mostrando. Una recurrencia no borra el reconocimiento. `acknowledged_by` = usuario del panel (+ `acknowledged_by_user_id`); los registros previos a la fase 4 conservan `admin`.
 - **Cierre manual** (`PUT /admin/incidents/{id}/resolve`, motivo obligatorio) solo para `queue_dead_letter` y `queue_overflow`; para las demás responde **409**: se resuelven solas con evidencia.
 - **Eventos fuera de orden**: el orden de la evidencia es el `agent_seq` de **inicio** de la ejecución (el mismo criterio de `task_sync_state`), nunca la hora de llegada. Una falla vieja que llega después de un éxito más nuevo **no** abre incidencia; un éxito viejo que llega después de una falla más nueva **no** la resuelve (queda en el historial como `late_evidence_ignored`).
 - **Cierres administrativos** (motivo explícito, no son recuperación): tarea deshabilitada (o su agencia/empresa/grupo/objeto) → `task_disabled` para todas sus incidencias; tarea borrada → `task_deleted`; instalación revocada → `installation_revoked`; instalación borrada → `installation_deleted`; alcance deshabilitado → `scope_disabled` (desconexión).
@@ -951,7 +974,7 @@ Backend `[health]`: `evaluator_interval_seconds`, `disconnect_after_seconds`, `h
 - Umbrales globales + por tarea; no hay umbrales por instalación ni horarios de mantenimiento/silencio.
 - `/monitor/clients` agrega `last_seen_utc` / `last_execution_utc` (ISO UTC, aditivos) para que el Dashboard muestre la zona; las columnas legadas son `TIMESTAMP` sin zona y se interpretan en la zona de la sesión de la BD.
 - Entrega de notificaciones **al menos una vez** (el receptor debe deduplicar por `X-Nexus-Delivery`). Sin canales configurados, solo hay alertas en el panel.
-- `acknowledged_by`/`resolved_by` = `admin` hasta la fase de usuarios (RBAC); las consultas ya aceptan `group_id` para el aislamiento por grupo de esa fase.
+- `acknowledged_by`/`resolved_by` = usuario del panel (fase 4); los registros anteriores conservan `admin`.
 
 ### 18.8. Pruebas
 
@@ -1041,7 +1064,7 @@ Una alerta **por objeto** (`object_added`, `object_removed`, `object_modified`) 
 
 `POST /admin/structural-changes/{id}/acknowledge {attribution: "client"|"nexus", comment?, ticket_ref?, expected_version, expected_observed_fingerprint}`
 
-- Responsable **obligatorio**: "Modificó cliente" o "Modificó equipo Nexus"; comentario y ticket opcionales; usuario (`admin` hasta la fase de RBAC) y fecha automáticos.
+- Responsable **obligatorio**: "Modificó cliente" o "Modificó equipo Nexus"; comentario y ticket opcionales; usuario del panel (`ack_by` + `ack_by_user_id`) y fecha automáticos.
 - Efectos: sale de pendientes; se conserva el historial y el detalle; se incorpora a la línea base **solo esa diferencia** (alta/actualización/baja de ese objeto); **no** acepta otras pendientes; si el objeto cambia después se genera una alerta nueva.
 - **Concurrencia optimista**: se bloquea la base y la alerta (mismo orden que la recepción de snapshots) y se verifica `row_version`, la huella mostrada y el último estado observado. Si el objeto cambió otra vez → **409** (`not_pending` con `superseded_by_id`, `stale_version` u `object_changed_again`) y la versión nueva queda pendiente.
 - **Reclasificar** (`POST …/reclassify {attribution, reason (obligatorio), ticket_ref?, expected_version}`): solo alertas entendidas; conserva en el historial los valores anteriores, el actor y la fecha; no pisa el reconocimiento original.
@@ -1051,7 +1074,7 @@ Una alerta **por objeto** (`object_added`, `object_removed`, `object_modified`) 
 
 - Por defecto solo viaja y se guarda la **huella**. Con "Guardar SQL de vistas" en la base (`view_definitions_enabled`) el agente envía el texto por TLS y el backend lo guarda **cifrado** (`ENC:` Fernet con `config_secret_key`; sin clave no se guarda). Nunca se registra en logs ni aparece en el detalle general.
 - Al **deshabilitar** "Guardar SQL de vistas" se borra el SQL cifrado ya guardado de esa base (estado observado, línea base y alertas; evento `view_definitions_purged`); quedan las huellas.
-- Verlo: `GET /admin/structural-changes/{id}/definitions`, que requiere el permiso reservado `inventory.view_definitions` (hoy: `[inventory] expose_view_definitions = true`); cada consulta queda en el historial del cambio.
+- Verlo: `GET /admin/structural-changes/{id}/definitions`: **doble llave**, el interruptor global `[inventory] expose_view_definitions = true` **y** el permiso `inventory.view_definitions` sobre los grupos de la base; cada consulta queda en el historial del cambio (con el usuario).
 
 ### 19.10. API
 
@@ -1069,7 +1092,7 @@ Una alerta **por objeto** (`object_added`, `object_removed`, `object_modified`) 
 | `GET /admin/structural-changes/{id}` · `/definitions` | Detalle (anterior vs actual, evidencia, historial, otras alertas del objeto) · SQL (permiso) |
 | `POST /admin/structural-changes/{id}/acknowledge` · `/reclassify` | Dar por entendido · reclasificar |
 
-Permisos reservados para la fase de RBAC: `inventory.configure`, `inventory.approve_baseline`, `inventory.view_definitions`, `structure.acknowledge`, `structure.reclassify` (hoy todos equivalen al token de administrador, salvo `inventory.view_definitions`).
+Permisos (sección 20): `inventory.configure`, `inventory.approve_baseline`, `inventory.view_definitions`, `structure.acknowledge`, `structure.reclassify`. Las respuestas incluyen `allowed_actions` (lo que el usuario puede hacer sobre esa base/cambio, evaluado sobre **todos** sus grupos).
 
 ### 19.11. Panel
 
@@ -1092,7 +1115,7 @@ Backend `[inventory]`: `enabled`, `dwh_auto_monitor`, `default_interval_seconds`
 - El **responsable** del inventario aparece como "vencido" si su agente no está corriendo (no renovó el lease); otra instalación con alcance lo toma en su siguiente ciclo.
 - Evidencia técnica: `add_column` solo se asocia a alertas con esas columnas agregadas, `create_table` solo a objetos nuevos y `constraint_ddl` solo a restricciones agregadas/modificadas; el agente marca `constraint_ddl` únicamente si el DDL del catálogo cambió las restricciones (re-ejecutarlo sin cambios no es evidencia). La marca no dice **cuál** restricción cambió: se asocia a cualquier restricción agregada/modificada de esa tabla.
 - La estructura recibida se filtra con lista blanca de claves (columnas, restricciones, índices, huella de definición, partición); lo desconocido se descarta.
-- `ack_by`/`reclassified_by` = `admin` hasta la fase de usuarios (RBAC).
+- `ack_by`/`reclassified_by`/`baseline_approved_by` = usuario del panel (fase 4); los registros anteriores conservan `admin`. El nombre por defecto de un DWH (`DWH <grupo> (…)`) se genera con el grupo que lo registró y puede verse desde otro grupo vinculado (el campo `group_name` sí se oculta).
 
 ### 19.14. Pruebas
 
@@ -1103,3 +1126,119 @@ cd dwh_client && .venv/bin/python -m pytest tests/test_inventory_integration.py 
 
 - `test_inventory.py`: propuesta sin alertas y aprobación (409 con snapshot viejo, aprobación parcial); alta/modificación/eliminación de tablas y vistas con detalle granular y filtros; "Dar por entendido" con ambas opciones, historial, incorporación de solo esa diferencia, otra pendiente intacta y alerta nueva al volver a cambiar; cambio concurrente (409 y la versión nueva sigue pendiente) y carrera real ack/snapshot con invariantes; pérdida de permisos, conexión o servidor sin eliminaciones falsas y reversión; reclasificación con motivo; lease único, relevo y 403/409; misma base física con otro host sin duplicados; el ack no resuelve incidencias de carga; SQL de vistas cifrado y protegido; origen opcional y motor no soportado; evidencia sin atribución (antes y después de la detección); reinicio de línea base. Regresiones: cambio de host a la misma base (conserva línea base/historial), fusionar/deshacer duplicado, eliminaciones solo en esquemas verificados y snapshot vacío sospechoso, snapshot viejo ignorado, gzip con límite anti zip-bomb (413/400/415), identidad débil→fuerte compatible, colisión de identidad débil entre clientes sin duplicar ni fusionar (y nunca fusión entre grupos), bomba JSON/gzip sin credencial (401 sin leer el cuerpo, RSS < 150 MB, 429 por concurrencia, tope de contenedores), `captured_at` futuro → 422, `snapshot_id` ajeno → 409, lista blanca de estructura y evidencia específica, `out_of_scope`, borrado del SQL de vistas, contador = resumen, limpieza de vínculos.
 - `test_inventory_integration.py` (base `nexus_inv_it` y rol de solo lectura en el contenedor DWH): dos agentes del mismo DWH → un solo inventario; crear/modificar/eliminar tablas, vistas y vista materializada reales; normalización sin falsos positivos; `REVOKE USAGE` → parcial sin eliminaciones; `NOLOGIN` → no verificable; sesión de solo lectura (incluso como superusuario); relevo del lease; `ensure_columns_exist` del ETL → evidencia con `execution_id` y sin atribución; sin SQL de vistas ni secretos en logs/BD. Además: particiones agrupadas (una alerta en la raíz), DDL de restricción sin cambios no es evidencia, backoff del runner y `PAYLOAD_TOO_LARGE` ante 413.
+
+---
+
+## 20. Usuarios, roles, permisos por grupo y auditoría (PostgreSQL)
+
+Módulos `dwh_back/panel_auth.py`, `users_postgres.py`, `manage_users.py`, `db_pool.py`, `ratelimit.py`; migración `009_usuarios_permisos`; páginas **Usuarios** y **Auditoría** del panel. Sustituye el acceso con un único token de administrador.
+
+### 20.1. Usuarios y contraseñas
+
+- `panel_user`: usuario (minúsculas, único sin distinguir mayúsculas), nombre visible, correo opcional, activo, superadministrador, `must_change_password`, intentos fallidos, bloqueo, último acceso, auditoría de alta.
+- **Hash argon2id** (`argon2-cffi`, parámetros RFC 9106 perfil *low memory*: 64 MiB, t=3, p=4; ≈ 40 ms). Elegido frente a `hashlib.scrypt` por ser el estándar recomendado (OWASP) y re-hashear solo si cambian los parámetros. Nunca se guarda ni registra la contraseña.
+- Política: mínimo `[auth] password_min_length` (12), máximo 256, no puede contener el usuario, no puede ser una contraseña común/predecible (lista corta + caracteres repetidos), distinta de la actual. Sin reglas de composición (NIST 800-63B).
+- **No hay usuario ni contraseña por defecto.** Primer superadministrador (en el servidor del backend, con el mismo `config.ini`):
+
+  ```
+  python migrate.py
+  python manage_users.py create-superadmin --username jlimon          # pide la contraseña 2 veces
+  NEXUS_NEW_USER_PASSWORD=... python manage_users.py create-superadmin --username jlimon --password-env NEXUS_NEW_USER_PASSWORD
+  python manage_users.py list | reset-password --username X | unlock --username X | deactivate --username X | revoke-sessions --username X
+  ```
+
+  Por defecto obliga a cambiar la contraseña en el primer inicio (`--no-force-change` lo evita). Cada acción queda en `panel_audit_log` con actor `cli`.
+
+### 20.2. Sesiones
+
+- `POST /admin/auth/login {username, password}` → token **opaco** de 256 bits (`secrets.token_urlsafe(32)`) + perfil + permisos efectivos. En BD solo `sha256(token)` (`panel_session.token_hash`).
+- Vencimiento **absoluto** `[auth] session_absolute_seconds` (12 h) y por **inactividad** `session_idle_seconds` (30 min; cada petición renueva `last_seen_at`). Se revoca al cerrar sesión, al cambiar/reiniciar la contraseña (las demás sesiones), al desactivar el usuario o desde **Usuarios → Sesiones activas**.
+- `GET /admin/auth/me` (perfil, permisos por grupo y grupos visibles), `POST /admin/auth/logout`, `POST /admin/auth/change-password {current_password, new_password}`.
+- Con `must_change_password` todo lo demás responde **403** `password_change_required` (solo `me`, `logout` y `change-password`).
+- Credenciales: `Authorization: Bearer <token>` (o `x-session-token`).
+
+### 20.3. Protección contra fuerza bruta
+
+- **Por usuario (BD)**: tras `max_failed_attempts` (5) fallos, bloqueo de `lockout_base_seconds × 2^(fallos − 5)` (30 s, 60 s, 120 s…, tope `lockout_max_seconds` = 1 h). Durante el bloqueo ni la contraseña correcta entra (429 `account_locked`). Un inicio correcto reinicia el contador; **Usuarios → Desbloquear** o `manage_users.py unlock`.
+- **Usuarios inexistentes**: mismo bloqueo en memoria (el 429 no revela si el usuario existe) y la contraseña se verifica contra un hash argon2id de referencia (tiempo de respuesta similar; misma respuesta 401 `invalid_credentials`).
+- **Por IP**: `ip_max_failures` (30) fallos (de cualquier usuario: cubre el "rociado" de contraseñas) en `ip_window_seconds` (15 min) → 429, **solo si la IP del usuario es conocida y no compartida**. Con IP desconocida, loopback o la de un proxy de confianza (el panel sin clave), **no** hay límite por IP y queda solo el bloqueo por usuario: los fallos de un atacante nunca bloquean a todos los usuarios.
+- **Cómo se conoce la IP** (despliegue): `X-Forwarded-For` **nunca** se usa en el backend (uvicorn arranca con `proxy_headers = false`; `[server] proxy_headers`/`forwarded_allow_ips` solo si hay un proxy inverso de confianza delante del backend). El servidor del panel envía `x-nexus-client-ip` + `x-nexus-proxy-key`; el backend lo acepta solo si la petición viene de `[auth] trusted_proxies` **y** la clave coincide con `[auth] panel_proxy_key` (= `DWH_PANEL_PROXY_KEY` del panel; también `NEXUS_PANEL_PROXY_KEY`). El panel obtiene la IP del navegador solo de fuentes de confianza: `DWH_CLIENT_IP_HEADER` (p. ej. `x-real-ip` que su nginx **sobrescribe** con `$remote_addr`) o `DWH_TRUSTED_PROXY_HOPS = N` (N proxies que **agregan** a `X-Forwarded-For`: se toma el N-ésimo desde el final), nunca el primer valor de `X-Forwarded-For`. Sin configurar (defecto) la IP es desconocida: Next como servidor propio no expone la IP del socket cuando el cliente ya manda `X-Forwarded-For`. Recomendado en producción: nginx con HTTPS delante del panel, `proxy_set_header X-Real-IP $remote_addr;`, `DWH_CLIENT_IP_HEADER=x-real-ip` y la clave compartida.
+- Límites en memoria: por proceso (con varias réplicas, el límite es por réplica); el bloqueo por usuario es en BD (compartido).
+
+### 20.4. Permisos, roles y alcance por grupo
+
+Permisos (`panel_permission`):
+
+| Permiso | Qué permite |
+|---|---|
+| `view` | Consultar todo lo del alcance (salud, cargas, incidencias, ejecuciones, estructura, configuración **sin secretos**) |
+| `incident.acknowledge` | Reconocer incidencias y eventos legados (uno o todos) |
+| `incident.close_queue` | Cerrar a mano (con motivo) incidencias de cola local |
+| `structure.acknowledge` | "Dar por entendido" (atribuir responsable) |
+| `structure.reclassify` | Reclasificar un cambio ya entendido |
+| `inventory.approve_baseline` | Aprobar / reiniciar la línea base |
+| `inventory.configure` | Alta de origen monitoreado, alcance/frecuencia/SQL de vistas, inventariar ahora, liberar responsable, resolver duplicado |
+| `inventory.view_definitions` | Ver el SQL de vistas (además del interruptor `[inventory] expose_view_definitions`) |
+| `credentials.manage` | Ver y cambiar host/base/usuario/contraseña de origen y DWH, ver/regenerar/revocar tokens de enrolamiento, rotar/revocar instalaciones, canales de notificación (URL/secreto) |
+| `config.manage` | Grupos (alta/baja solo con alcance global), empresas, agencias, catálogo, tareas (incl. umbrales de salud y reinicio de watermark); `POST /admin/health/evaluate` requiere alcance global |
+| `audit.view` | Consultar `panel_audit_log` (por alcance) |
+| `users.manage` | Usuarios, roles y sesiones — **solo alcance global** |
+
+Roles sembrados (`panel_role`): `lectura` (view) · `operador` (view + incident.acknowledge + incident.close_queue) · `atribucion_estructura` (view + structure.acknowledge + structure.reclassify) · `aprobador_inventario` (view + inventory.approve_baseline + inventory.configure) · `definiciones_vistas` (view + inventory.view_definitions) · `admin_credenciales` (view + credentials.manage) · `admin_config` (view + config.manage) · `auditor` (view + audit.view) · `admin_usuarios` (view + users.manage + audit.view; solo global). El **superadministrador** tiene todo en todos los grupos.
+
+**Alcance**: cada asignación `panel_user_role` es un rol en *todos los grupos* (`group_id` NULL) o en *un grupo*. Ej.: operador en el grupo A y lectura en el B. `users.manage` asignado a un grupo se rechaza (422). **Solo un superadministrador** crea, edita, desactiva, desbloquea, reinicia la contraseña, cambia los roles o cierra las sesiones de **otro superadministrador** (403 `superadmin_required`). Nadie se desactiva ni se quita el superadministrador a sí mismo; siempre queda al menos uno activo. Un administrador de usuarios que no es superadministrador **no puede cambiar sus propios roles** (403 `self_roles`, auditado como `users.set_roles_self_denied`): debe hacerlo otro administrador. Aun así `users.manage` puede dar roles a otras cuentas: trátelo como privilegiado.
+
+### 20.5. Aislamiento entre grupos (backend)
+
+- Toda ruta `/admin/*` declara su permiso con `Depends(auth.perm(...))` (o `public`/`authenticated` para la sesión). `tests/test_panel_auth.py` recorre `app.routes` y **falla si una ruta `/admin` nueva no declara permiso**.
+- **Listas**: se filtran por los grupos donde el usuario tiene `view` (grupo → empresa → agencia → tarea/objeto; instalación, ejecución, estado de sincronización, incidencia, evento legado, actividad HTTP y auditoría por su `group_id`; canales por su grupo; bases monitoreadas por su grupo **o** un grupo vinculado). Registros sin grupo (canal "todos los grupos", actividad anónima, inicios de sesión) solo con alcance global.
+- **Detalle y acciones**: se resuelve el grupo del recurso; si el usuario no lo ve → **404** (igual que inexistente); si lo ve pero le falta el permiso → **403** `permission_required` (con `permission`).
+- **Recursos compartidos**: un DWH compartido por varios grupos se ve si alguno está en el alcance, pero modificarlo (y dar por entendido / reclasificar sus cambios, aprobar su línea base) exige el permiso en **todos** sus grupos (el efecto es compartido). El grupo "dueño" fuera del alcance no se nombra (`owner_hidden`). Las respuestas de inventario traen `allowed_actions`.
+- **Agregados** (dashboard, `/admin/stats`, `/admin/health/summary`, contadores del menú, `/admin/inventory/summary`, `/admin/structural-changes/badge`, `/admin/incidents/badge`) se calculan solo sobre los grupos permitidos. "Reconocer todos" (eventos) solo toca los grupos donde se puede reconocer.
+- Secretos: sin `credentials.manage` sobre el grupo, host/base/usuario llegan `null` (`secrets_hidden`) y los tokens `null` (`token_hidden`), también los **prefijos** de token de `/admin/clients` (`token_preview`) y `/admin/activity` (`token`); las contraseñas nunca se devuelven.
+- Nombres de otros grupos: el nombre por defecto de un DWH es neutro (`DWH <base> · <huella>`); si el grupo dueño está fuera del alcance, el nombre (también el heredado de versiones previas) se reemplaza por `Base monitoreada #id (compartida)`, y la instalación responsable del inventario o de un snapshot de otro grupo aparece como "(instalación de otro grupo)".
+- Filtro `?group_id=` de un grupo fuera del alcance (enlace compartido): el panel avisa "Grupo fuera de su alcance" y quita el filtro.
+- Un DWH compartido por varias agencias sigue siendo **un** inventario (sin cambios de la fase 3).
+
+### 20.6. Token estático (break-glass) y `/monitor/*`
+
+- `x-admin-token` (`[admin] token` / `NEXUS_ADMIN_TOKEN`) **solo** se acepta con `[admin] allow_static_token = true` (defecto **false**; si no, 401 `static_token_disabled`). Equivale a superadministrador con actor `token-admin`; el backend lo avisa al arrancar y **cada uso (también lecturas)** queda en `panel_audit_log` (`auth_kind = static_token`). Úselo solo para emergencias o pruebas automatizadas; en producción déjelo en false.
+- `/monitor/*` sigue con su propio `x-monitor-token` para el monitor legado (`dwh_api`), sin cambios de contrato. El panel ya no lo usa: `/admin/events`, `/admin/events/{id}/ack`, `/admin/events/ack-all`, `/admin/clients`, `/admin/activity` son los equivalentes con sesión, permisos y alcance.
+
+### 20.7. Auditoría
+
+`panel_audit_log`: fecha, actor (id + nombre), tipo de autenticación, acción, recurso, grupo, código HTTP, detalles saneados (nunca cuerpos, contraseñas ni tokens) e IP. Se registra: inicio/cierre de sesión, intentos fallidos/bloqueados, cambios de contraseña, administración de usuarios/roles/sesiones, **toda mutación `/admin/*`** (acción = método + ruta, incluidas las rechazadas 403/404) y todo uso del token estático. `GET /admin/audit` (`audit.view`, filtros grupo/actor/acción/resultado/fechas). Los actores reales quedan además en `acknowledged_by(_user_id)`, `resolved_by(_user_id)`, `ack_by(_user_id)`, `reclassified_by(_user_id)`, `baseline_approved_by(_user_id)`, eventos de historial (`actor_user_id`), `client_events.acknowledged_by` e `installation.revoked_by`.
+
+### 20.8. Panel
+
+- **Filtros comunes** (componente `FilterBar`, guardados en la URL para compartir/recargar): grupo, empresa, agencia, base monitoreada, tarea, estado y rango de fechas, según aplique: Salud (grupo/empresa/agencia/tarea/estado de tarea; conectividad aparte; sin fechas: es estado actual), Ejecuciones (todos + etapa/instalación), Incidencias (todos + categoría/severidad; pestañas por estado), Estructura (pendientes e historial: grupo/empresa/agencia/base/fechas + tipo/responsable/estado/esquema/objeto; bases: grupo/empresa/agencia), Eventos (grupo/empresa/agencia/tarea/tipo/fechas), Actividad (grupo/empresa/agencia/estado HTTP/fechas + tipo de cliente), Instalaciones (grupo/empresa/agencia/estado), Empresas/Agencias/Catálogo/Tareas (jerarquía), Auditoría (grupo/resultado/fechas + actor/acción). Las opciones solo incluyen grupos del alcance.
+- Acciones visibles solo con permiso (los formularios se abren en solo lectura para ver SQL/DDL sin poder guardar).
+- **Usuarios** (`users.manage`): alta con contraseña temporal generada, datos, activar/desactivar, superadministrador (solo superadmin), roles por alcance, reinicio de contraseña (obliga a cambiarla), desbloqueo, sesiones activas con cierre, tabla de roles/permisos.
+- **Auditoría** (`audit.view`).
+- El menú muestra el usuario y su alcance; los contadores solo cuentan sus grupos.
+
+### 20.9. Pool de conexiones
+
+`get_connection()` presta conexiones de un pool acotado (`db_pool.BoundedPool` sobre `ThreadedConnectionPool`): `[database] pool_min` (5: conexiones ociosas que se **conservan y reutilizan**; psycopg2 cierra al devolverlas las que excedan `minconn`, por eso no puede ser 0), `pool_max` (20: tope simultáneo; las que pasan de `pool_min` se abren bajo demanda y se cierran al devolverse), `pool_timeout_seconds` (10; agotado → 503), `connect_timeout_seconds` (5), `application_name` (`nexus_dwh_back`). Verificable en `pg_stat_activity`: los mismos PID atienden las peticiones y la última consulta de una conexión libre es `DISCARD ALL`. `conn.close()` devuelve la conexión tras `ROLLBACK` + `DISCARD ALL` (ningún estado de sesión ni advisory lock pasa de un préstamo a otro); las rotas se descartan. La pre-autenticación de `/agent/*` y la auditoría usan el mismo pool. Dimensione `pool_max` ≤ `max_connections` de PostgreSQL entre todas las réplicas.
+
+### 20.10. Límites de tasa del API del agente
+
+`POST /agent/enroll`: `[agent] enroll_rate_per_minute` (20) intentos por IP y minuto; `enroll_fail_limit` (10) fallos por IP **y** por prefijo (8 caracteres) del token en `enroll_fail_window_seconds` (900) → 429 + `Retry-After` antes de tocar la BD. Credenciales de instalación inválidas: `auth_fail_limit` (30) por IP en `auth_fail_window_seconds` (300) → 429 (también en la pre-autenticación de cuerpos grandes y del inventario). En memoria, por proceso; detrás de un proxy inverso configure uvicorn con `--proxy-headers`/`--forwarded-allow-ips` para ver la IP real.
+
+### 20.11. Variables nuevas
+
+Backend: `[admin] allow_static_token`; `[auth] session_absolute_seconds`, `session_idle_seconds`, `max_failed_attempts`, `lockout_base_seconds`, `lockout_max_seconds`, `ip_max_failures`, `ip_window_seconds`, `password_min_length`, `trusted_proxies`, `panel_proxy_key` (o `NEXUS_PANEL_PROXY_KEY`); `[server] proxy_headers`, `forwarded_allow_ips`; `[database] pool_min`, `pool_max`, `pool_timeout_seconds`, `connect_timeout_seconds`, `application_name`; `[agent] enroll_rate_per_minute`, `enroll_fail_limit`, `enroll_fail_window_seconds`, `auth_fail_limit`, `auth_fail_window_seconds`. Dependencia nueva: `argon2-cffi`. Panel: se elimina `DWH_MONITOR_TOKEN`; nuevas `DWH_PUBLIC_ORIGIN`, `DWH_PANEL_PROXY_KEY`, `DWH_CLIENT_IP_HEADER`, `DWH_TRUSTED_PROXY_HOPS`. Plantilla: `dwh_back/config_postgres.ini.example`.
+
+### 20.12. Pruebas
+
+```
+cd dwh_back && .venv/bin/python -m pytest tests/test_panel_auth.py -q
+```
+
+`test_panel_auth.py` (BD propia y tres backends: normal, con límites bajos y pool de 5, y con límite por IP): inicio de sesión correcto/fallido con respuesta genérica; token de sesión solo como hash y contraseña en argon2id (ni en logs, `activity_log` ni auditoría); bloqueo por usuario con backoff exponencial (2 s → 4 s) y usuario inexistente con las mismas reglas; límite por IP; tiempo similar usuario existente/inexistente; vencimiento por inactividad y absoluto; logout revoca; política de contraseñas y cambio (cierra las demás sesiones); `must_change_password` bloquea el resto; token estático deshabilitado por defecto y auditado cuando se habilita; CLI de superadministrador; **todas las rutas `/admin` declaran permiso** (introspección de `app.routes`); matriz de permisos (acción representativa de cada permiso, 200/403/409); secretos y tokens solo con `credentials.manage`; aislamiento A/B en ~20 listas, agregados y contadores, 404 en detalles y mutaciones fuera del alcance (incluido DWH compartido que exige el permiso en todos sus grupos) sin cambios en B; auditoría por alcance; administración de usuarios (roles globales, superadmin, desactivar/reiniciar/sesiones); límites de enrolamiento y de credenciales inválidas; **100 peticiones concurrentes con pool de 5** sin errores ni más de 5 conexiones; DWH compartido que no nombra al grupo dueño fuera del alcance. Regresiones (validación): límite por IP solo con la IP enviada por el panel con clave, `X-Forwarded-For` rotado o clave incorrecta ignorados y sin bloqueo global; IP de sesión solo con clave; administrador de usuarios no superadmin no toca superadmins (6 acciones) ni sus propios roles; contador de sesiones sin las inactivas; prefijos de token ocultos sin credenciales; nombre de DWH neutro y nombres de otros grupos/instalaciones ocultos; el pool **reutiliza** las mismas conexiones (PID estables) y deja `DISCARD ALL`.
+
+Panel (servidor Next): script de prueba de CSRF y proxy (cabecera obligatoria, Origin/Sec-Fetch-Site ajenos → 403, cookie httpOnly/SameSite=Strict, token nunca en el cuerpo, `/monitor/*` y `admin/auth/login` no reenviados, logout revoca en el backend).
+
+### 20.13. Pendiente / fuera de alcance
+
+SSO y MFA (TOTP) — futuros; límites de tasa distribuidos (hoy en memoria por proceso); los nombres por defecto de bases monitoreadas incluyen el grupo que las registró.

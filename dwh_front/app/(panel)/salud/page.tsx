@@ -9,8 +9,9 @@ import { fmtAgo, fmtDateTz, fmtNumber, fmtSeconds, tzLabel } from "@/lib/format"
 import { Badge, Button, Card, PageHeader, Select } from "@/components/ui/primitives";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
-import { HierarchyFilters, type FilterValue } from "@/components/filters";
-import { useRefData } from "@/components/ref-data";
+import { FilterBar, useUrlFilters } from "@/components/scope-filters";
+
+const FILTER_KEYS = ["group_id", "company_id", "agency_id", "task_id", "status"] as const;
 import { CATEGORY_LABEL, CONNECTIVITY, TASK_STATE, WM_KIND_SHORT, fmtSecs, useAutoRefresh } from "@/components/health";
 
 const EXEC_STATUS: Record<string, { label: string; tone: "green" | "red" | "amber" | "blue" }> = {
@@ -33,15 +34,14 @@ function When({ value, empty = "nunca" }: { value: string | null; empty?: string
 const SOURCE_LABEL: Record<string, string> = { configured: "configurada", history: "p90 historial", default: "por defecto" };
 
 export default function SaludPage() {
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "", agency_id: "" });
-  const [state, setState] = useState("");
+  const [filter, setFilter, clearFilter] = useUrlFilters(FILTER_KEYS);
+  const state = filter.status;
   const [conn, setConn] = useState("");
-  const { groups, companies, agencies } = useRefData({ agencies: true });
   const scope = { group_id: filter.group_id, company_id: filter.company_id, agency_id: filter.agency_id };
   const insts = useApi<{ items: InstallationHealth[]; disconnect_after_seconds: number }>(
     `admin/health/installations${qs({ group_id: filter.group_id, company_id: filter.company_id, agency_id: filter.agency_id, connectivity: conn })}`,
   );
-  const tasks = useApi<{ items: TaskHealth[] }>(`admin/health/tasks${qs({ ...scope, state })}`);
+  const tasks = useApi<{ items: TaskHealth[] }>(`admin/health/tasks${qs({ ...scope, task_id: filter.task_id, state })}`);
   const reloadInsts = insts.reload;
   const reloadTasks = tasks.reload;
   const reloadAll = useCallback(() => {
@@ -65,8 +65,15 @@ export default function SaludPage() {
         }
       />
 
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} agencies={agencies} />
+      <div className="mb-4">
+        <FilterBar
+          values={filter}
+          onChange={setFilter}
+          onClear={clearFilter}
+          fields={[...FILTER_KEYS]}
+          statusLabel="Estado de tarea"
+          statusOptions={Object.entries(TASK_STATE).map(([k, v]) => ({ value: k, label: v.label }))}
+        />
       </div>
 
       <p className="mb-3 flex items-start gap-2 text-sm text-slate-500">
@@ -165,14 +172,6 @@ export default function SaludPage() {
       {/* ── Tareas ────────────────────────────────────────────────────── */}
       <div className="mb-3 mt-8 flex flex-wrap items-center gap-3">
         <h2 className="text-base font-semibold text-slate-900">Tareas</h2>
-        <Select aria-label="Estado de la tarea" className="w-full sm:w-48" value={state} onChange={(e) => setState(e.target.value)}>
-          <option value="">Todos los estados</option>
-          {Object.entries(TASK_STATE).map(([k, v]) => (
-            <option key={k} value={k}>
-              {v.label}
-            </option>
-          ))}
-        </Select>
         {tasks.data && <span className="text-xs text-slate-500 sm:ml-auto">{fmtNumber(tItems.length)} tarea(s)</span>}
       </div>
       <Card>

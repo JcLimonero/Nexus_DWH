@@ -30,7 +30,6 @@ exposición del SQL de vistas además requiere [inventory] expose_view_definitio
 """
 
 import hashlib
-import hmac
 import json
 import logging
 import time
@@ -43,7 +42,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import psycopg2
 import psycopg2.extras
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 from typing_extensions import Annotated, Literal
@@ -468,20 +467,24 @@ class InventoryEngine:
     # ── Historial ───────────────────────────────────────────────────────────
     @staticmethod
     def _mdb_event(cur: Any, mdb_id: int, event_type: str, *, actor: str = "system", message: Optional[str] = None,
-                   data: Optional[Dict[str, Any]] = None) -> None:
+                   data: Optional[Dict[str, Any]] = None, actor_user_id: Optional[int] = None) -> None:
         cur.execute(
-            """INSERT INTO monitored_database_event (monitored_database_id, event_type, actor, message, data)
-               VALUES (%s, %s, %s, %s, %s)""",
-            (mdb_id, event_type, actor[:100], (message or None) and message[:1000], json.dumps(data or {}, default=str)),
+            """INSERT INTO monitored_database_event (monitored_database_id, event_type, actor, message, data,
+                                                    actor_user_id)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (mdb_id, event_type, actor[:100], (message or None) and message[:1000], json.dumps(data or {}, default=str),
+             actor_user_id),
         )
 
     @staticmethod
     def _change_event(cur: Any, change_id: int, event_type: str, *, actor: str = "system",
-                      message: Optional[str] = None, data: Optional[Dict[str, Any]] = None) -> None:
+                      message: Optional[str] = None, data: Optional[Dict[str, Any]] = None,
+                      actor_user_id: Optional[int] = None) -> None:
         cur.execute(
-            """INSERT INTO structural_change_event (change_id, event_type, actor, message, data)
-               VALUES (%s, %s, %s, %s, %s)""",
-            (change_id, event_type, actor[:100], (message or None) and message[:1000], json.dumps(data or {}, default=str)),
+            """INSERT INTO structural_change_event (change_id, event_type, actor, message, data, actor_user_id)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (change_id, event_type, actor[:100], (message or None) and message[:1000], json.dumps(data or {}, default=str),
+             actor_user_id),
         )
 
     # ── Candidatos (bases que una instalación puede alcanzar) ───────────────
@@ -516,7 +519,7 @@ class InventoryEngine:
             if key:
                 dbname = self.decrypt(g.get("warehouse_database") or "")
                 out.append({"kind": "dwh", "engine": "postgresql", "identity_key": key, "group_id": g["id"],
-                            "company_id": None, "display_name": f"DWH {g['name']} ({dbname})"[:255]})
+                            "company_id": None, "display_name": f"DWH {dbname} · {key[:6]}"[:255]})
         companies = self._company_ids_in_scope(cur, ctx)
         if companies:
             cur.execute(
@@ -1219,7 +1222,8 @@ class InventoryEngine:
                                        data={"execution_id": str(ex["execution_id"]), "action": item.get("action")})
 
     # ── Línea base ──────────────────────────────────────────────────────────
-    def approve_baseline(self, mdb_id: int, body: ApproveBody, actor: str = "admin") -> Dict[str, Any]:
+    def approve_baseline(self, mdb_id: int, body: ApproveBody, actor: str = "admin",
+                         actor_user_id: Optional[int] = None) -> Dict[str, Any]:
         with self.tx() as cur:
             cur.execute("SELECT * FROM monitored_database WHERE id = %s FOR UPDATE", (mdb_id,))
             m = cur.fetchone()
@@ -1263,11 +1267,16 @@ class InventoryEngine:
                      for r in rows], page_size=1000)
             cur.execute(
                 """UPDATE monitored_database SET state = 'monitoring', baseline_version = %s,
-                          baseline_approved_at = NOW(), baseline_approved_by = %s, updated_at = NOW()
-                   WHERE id = %s""", (version, actor, mdb_id))
+                          baseline_approved_at = NOW(), baseline_approved_by = %s,
+                          baseline_approved_by_user_id = %s, updated_at = NOW()
+                   WHERE id = %s""", (version, actor, actor_user_id, mdb_id))
+            cur.execute("""UPDATE inventory_baseline_version SET actor_user_id = %s
+                           WHERE monitored_database_id = %s AND baseline_version = %s""",
+                        (actor_user_id, mdb_id, version))
             self._mdb_event(cur, mdb_id, "baseline_approved", actor=actor, message=body.comment,
                             data={"snapshot_id": body.expected_snapshot_id, "approved_objects": len(rows),
-                                  "not_approved": len(observed) - len(rows), "baseline_version": version})
+                                  "not_approved": len(observed) - len(rows), "baseline_version": version},
+                            actor_user_id=actor_user_id)
             # Lo NO aprobado queda como alerta (objeto nuevo) para revisarlo con "Dar por entendido".
             cur.execute("SELECT schemas_verified FROM inventory_snapshot WHERE id = %s",
                         (body.expected_snapshot_id,))
@@ -1280,7 +1289,8 @@ class InventoryEngine:
         return {"status": "ok", "baseline_version": version, "approved_objects": len(rows),
                 "pending_changes": stats["detected"]}
 
-    def reset_baseline(self, mdb_id: int, reason: str, actor: str = "admin") -> Dict[str, Any]:
+    def reset_baseline(self, mdb_id: int, reason: str, actor: str = "admin",
+                       actor_user_id: Optional[int] = None) -> Dict[str, Any]:
         with self.tx() as cur:
             cur.execute("SELECT * FROM monitored_database WHERE id = %s FOR UPDATE", (mdb_id,))
             m = cur.fetchone()
@@ -1294,7 +1304,7 @@ class InventoryEngine:
             closed = [r["id"] for r in cur.fetchall()]
             for cid in closed:
                 self._change_event(cur, cid, "baseline_reset", actor=actor,
-                                   message=f"Línea base reiniciada: {reason}")
+                                   message=f"Línea base reiniciada: {reason}", actor_user_id=actor_user_id)
             cur.execute(
                 """INSERT INTO inventory_baseline_version (monitored_database_id, baseline_version, schema_name,
                        object_name, object_type, action, fingerprint, structure, definition_hash, actor, comment)
@@ -1302,19 +1312,25 @@ class InventoryEngine:
                           structure, definition_hash, %s, %s
                    FROM inventory_baseline WHERE monitored_database_id = %s""",
                 (version, actor, reason[:500], mdb_id))
+            cur.execute("""UPDATE inventory_baseline_version SET actor_user_id = %s
+                           WHERE monitored_database_id = %s AND baseline_version = %s""",
+                        (actor_user_id, mdb_id, version))
             cur.execute("DELETE FROM inventory_baseline WHERE monitored_database_id = %s", (mdb_id,))
             # Se espera un inventario NUEVO (la identidad del servidor se vuelve a fijar con él).
             cur.execute(
                 """UPDATE monitored_database SET state = 'awaiting_first_snapshot', baseline_version = %s,
                           engine_identity = NULL, engine_identity_strength = NULL, baseline_approved_at = NULL,
-                          baseline_approved_by = NULL, scan_requested_at = NOW(), updated_at = NOW()
+                          baseline_approved_by = NULL, baseline_approved_by_user_id = NULL,
+                          scan_requested_at = NOW(), updated_at = NOW()
                    WHERE id = %s""", (version, mdb_id))
             self._mdb_event(cur, mdb_id, "baseline_reset", actor=actor, message=reason,
-                            data={"pending_closed": len(closed), "baseline_version": version})
+                            data={"pending_closed": len(closed), "baseline_version": version},
+                            actor_user_id=actor_user_id)
         return {"status": "ok", "pending_closed": len(closed), "state": "awaiting_first_snapshot"}
 
     # ── Dar por entendido / reclasificar ────────────────────────────────────
-    def acknowledge(self, change_id: int, body: AcknowledgeBody, actor: str = "admin") -> Dict[str, Any]:
+    def acknowledge(self, change_id: int, body: AcknowledgeBody, actor: str = "admin",
+                    actor_user_id: Optional[int] = None) -> Dict[str, Any]:
         with self.tx() as cur:
             cur.execute("SELECT monitored_database_id FROM structural_change WHERE id = %s", (change_id,))
             r = cur.fetchone()
@@ -1374,14 +1390,17 @@ class InventoryEngine:
                        comment)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (m["id"], version, *key, action, fp, structure, dh, change_id, actor, body.comment))
+            cur.execute("""UPDATE inventory_baseline_version SET actor_user_id = %s
+                           WHERE monitored_database_id = %s AND baseline_version = %s""",
+                        (actor_user_id, m["id"], version))
             cur.execute("UPDATE monitored_database SET baseline_version = %s, updated_at = NOW() WHERE id = %s",
                         (version, m["id"]))
             cur.execute(
                 """UPDATE structural_change SET status = 'acknowledged', status_changed_at = NOW(), attribution = %s,
-                          ack_by = %s, ack_at = NOW(), ack_comment = %s, ticket_ref = %s,
+                          ack_by = %s, ack_by_user_id = %s, ack_at = NOW(), ack_comment = %s, ticket_ref = %s,
                           row_version = row_version + 1, updated_at = NOW()
                    WHERE id = %s RETURNING row_version""",
-                (body.attribution, actor, (body.comment or "").strip() or None,
+                (body.attribution, actor, actor_user_id, (body.comment or "").strip() or None,
                  (body.ticket_ref or "").strip() or None, change_id))
             new_version = cur.fetchone()["row_version"]
             self._change_event(cur, change_id, "acknowledged", actor=actor,
@@ -1389,10 +1408,11 @@ class InventoryEngine:
                                + (f": {body.comment.strip()}" if body.comment and body.comment.strip() else ""),
                                data={"attribution": body.attribution, "ticket_ref": body.ticket_ref,
                                      "observed_fingerprint": c["observed_fingerprint"].strip(),
-                                     "baseline_version": version})
+                                     "baseline_version": version}, actor_user_id=actor_user_id)
         return {"status": "ok", "change_id": change_id, "row_version": new_version, "baseline_version": version}
 
-    def reclassify(self, change_id: int, body: ReclassifyBody, actor: str = "admin") -> Dict[str, Any]:
+    def reclassify(self, change_id: int, body: ReclassifyBody, actor: str = "admin",
+                   actor_user_id: Optional[int] = None) -> Dict[str, Any]:
         with self.tx() as cur:
             cur.execute("SELECT * FROM structural_change WHERE id = %s FOR UPDATE", (change_id,))
             c = cur.fetchone()
@@ -1411,13 +1431,15 @@ class InventoryEngine:
                         "reclassified_by": c["reclassified_by"], "reclassified_at": iso(c["reclassified_at"])}
             cur.execute(
                 """UPDATE structural_change SET attribution = %s, ticket_ref = %s, reclassified_at = NOW(),
-                          reclassified_by = %s, row_version = row_version + 1, updated_at = NOW()
-                   WHERE id = %s RETURNING row_version""", (body.attribution, new_ticket, actor, change_id))
+                          reclassified_by = %s, reclassified_by_user_id = %s,
+                          row_version = row_version + 1, updated_at = NOW()
+                   WHERE id = %s RETURNING row_version""",
+                (body.attribution, new_ticket, actor, actor_user_id, change_id))
             new_version = cur.fetchone()["row_version"]
             self._change_event(cur, change_id, "reclassified", actor=actor, message=body.reason.strip(),
                                data={"previous": previous,
                                      "new": {"attribution": body.attribution, "ticket_ref": new_ticket},
-                                     "reason": body.reason.strip()})
+                                     "reason": body.reason.strip()}, actor_user_id=actor_user_id)
         return {"status": "ok", "change_id": change_id, "row_version": new_version}
 
     # ── Retención ───────────────────────────────────────────────────────────
@@ -1458,22 +1480,32 @@ def register_agent_inventory_routes(agent: APIRouter, authenticate: Callable[...
 # ─────────────────────────────────────────────────────────────────────────────
 # Administración
 # ─────────────────────────────────────────────────────────────────────────────
-def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) -> APIRouter:
-    configured = (admin_token or "").strip()
+def create_inventory_admin_router(*, engine: InventoryEngine, auth: Any) -> APIRouter:
+    """
+    Permisos: view (consultas, por alcance), inventory.configure, inventory.approve_baseline,
+    structure.acknowledge, structure.reclassify, inventory.view_definitions. Una base monitoreada
+    pertenece a su grupo y a los grupos vinculados (DWH compartido): se VE si alguno está en el
+    alcance y se MODIFICA solo con el permiso en TODOS ellos (el efecto es compartido).
+    """
+    from panel_auth import AuthContext, group_of, groups_of_change, groups_of_mdb, mdb_scope_sql
 
-    def require_admin(x_admin_token: Optional[str] = Header(None, alias="x-admin-token")) -> None:
-        if not configured:
-            raise HTTPException(status_code=503, detail="Admin no configurado.")
-        provided = (x_admin_token or "").encode("utf-8")
-        if not provided or not hmac.compare_digest(provided, configured.encode("utf-8")):
-            raise HTTPException(status_code=401, detail="Token de administrador no válido.")
+    VIEW = auth.perm("view")
+    CONFIGURE = auth.perm("inventory.configure")
+    APPROVE = auth.perm("inventory.approve_baseline")
+    ACK = auth.perm("structure.acknowledge")
+    RECLASS = auth.perm("structure.reclassify")
+    DEFS = auth.perm("inventory.view_definitions")
 
-    router = APIRouter(prefix="/admin", tags=["inventory"], dependencies=[Depends(require_admin)])
-    ACTOR = "admin"   # hasta la fase de usuarios (RBAC)
+    router = APIRouter(prefix="/admin", tags=["inventory"])
+
+    def check_mdb(cur: Any, ctx: AuthContext, mdb_id: int, perm: str = "view") -> List[Optional[int]]:
+        gs = groups_of_mdb(cur, mdb_id)
+        ctx.check(perm, gs, "Base monitoreada")
+        return gs
 
     MDB_SELECT = f"""
         SELECT md.*, g.name AS group_name, c.name AS company_name,
-               i.name AS lease_installation_name,
+               i.name AS lease_installation_name, i.group_id AS lease_installation_group_id,
                (md.lease_until IS NOT NULL AND md.lease_until > NOW()) AS lease_active,
                (md.last_attempt_at IS NOT NULL AND
                 md.last_attempt_at < NOW() - make_interval(secs => {engine.stale_seconds_sql()})) AS stale,
@@ -1507,8 +1539,40 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
             return "unverifiable"
         return r["verification_status"]
 
-    def mdb_out(r: Dict[str, Any]) -> Dict[str, Any]:
+    def hide_owner(d: Dict[str, Any], ctx: AuthContext) -> None:
+        """DWH compartido visible por un vínculo: el grupo "dueño" fuera del alcance no se nombra."""
+        if d.get("group_id") is not None and not ctx.can("view", d["group_id"]):
+            d["group_id"], d["group_name"], d["company_name"] = None, None, None
+            d["owner_hidden"] = True
+            # Nombres heredados que podrían incluir el grupo dueño (versiones previas a la fase 4).
+            for k in ("display_name", "database_name"):
+                if k in d:
+                    d[k] = f"Base monitoreada #{d.get('monitored_database_id') or d.get('id')} (compartida)"
+        # Instalación responsable de otro grupo: no se nombra.
+        if "lease_installation_group_id" in d:
+            lg = d.pop("lease_installation_group_id")
+            if d.get("lease_installation_name") and not ctx.can("view", lg):
+                d["lease_installation_name"] = "(instalación de otro grupo)"
+
+    def allowed_actions(ctx: AuthContext, groups: List[Optional[int]]) -> Dict[str, bool]:
+        """Qué puede hacer el usuario sobre el recurso (todas las acciones exigen TODOS sus grupos)."""
+        gl = groups or [None]
+        return {k: all(ctx.can(p, g) for g in gl) for k, p in (
+            ("configure", "inventory.configure"), ("approve_baseline", "inventory.approve_baseline"),
+            ("acknowledge", "structure.acknowledge"), ("reclassify", "structure.reclassify"),
+            ("view_definitions", "inventory.view_definitions"))}
+
+    def mdb_out(r: Dict[str, Any], ctx: Optional[AuthContext] = None) -> Dict[str, Any]:
         d = dict(r)
+        if ctx is None:
+            d.pop("lease_installation_group_id", None)
+        if ctx is not None:
+            groups = [g for g in [r.get("group_id")] + [lk.get("group_id") for lk in (r.get("links") or [])]
+                      if g is not None]
+            d["allowed_actions"] = allowed_actions(ctx, list(dict.fromkeys(groups)))
+            # Vínculos con grupos fuera del alcance: no se revelan sus nombres.
+            d["links"] = [lk for lk in (d.get("links") or []) if ctx.can("view", lk.get("group_id"))]
+            hide_owner(d, ctx)
         d["identity_key"] = (d.get("identity_key") or "").strip()[:12]
         d["engine_identity"] = ((d.get("engine_identity") or "").strip()[:12]) or None
         d["engine_identity_weak"] = ((d.get("engine_identity_weak") or "").strip()[:12]) or None
@@ -1523,16 +1587,17 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
         return d
 
     def scope_filter(alias: str, group_id: Optional[int], company_id: Optional[int],
-                     agency_id: Optional[int], cur: Any) -> Tuple[List[str], List[Any]]:
-        """Filtro por grupo/empresa/agencia sobre monitored_database (alias)."""
-        where: List[str] = []
-        params: List[Any] = []
+                     agency_id: Optional[int], cur: Any, ctx: AuthContext) -> Tuple[List[str], List[Any]]:
+        """Filtro por grupo/empresa/agencia sobre monitored_database (alias) + alcance del usuario."""
+        sql0, p0 = mdb_scope_sql(ctx, alias)
+        where: List[str] = [sql0]
+        params: List[Any] = list(p0)
         if agency_id:
             cur.execute("SELECT a.company_id, c.group_id FROM agency a JOIN company c ON c.id = a.company_id "
                         "WHERE a.id = %s", (agency_id,))
             a = cur.fetchone()
             if not a:
-                return ["FALSE"], []
+                return ["FALSE"], []  # noqa: E501
             company_id = company_id or a["company_id"]
             group_id = group_id or a["group_id"]
         if company_id:
@@ -1554,11 +1619,11 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
 
     # ── Resumen / contador ──────────────────────────────────────────────────
     @router.get("/inventory/summary")
-    def inventory_summary(group_id: Optional[int] = Query(None)) -> dict:
+    def inventory_summary(group_id: Optional[int] = Query(None), ctx: AuthContext = Depends(VIEW)) -> dict:
         with engine.tx() as cur:
-            where, params = scope_filter("md", group_id, None, None, cur)
+            where, params = scope_filter("md", group_id, None, None, cur, ctx)
             cur.execute(MDB_SELECT + (" WHERE " + " AND ".join(where) if where else ""), params)
-            rows = [mdb_out(r) for r in cur.fetchall()]
+            rows = [mdb_out(r, ctx) for r in cur.fetchall()]
         by_status: Dict[str, int] = {}
         for r in rows:
             by_status[r["effective_status"]] = by_status.get(r["effective_status"], 0) + 1
@@ -1573,34 +1638,38 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
         }
 
     @router.get("/structural-changes/badge")
-    def changes_badge() -> dict:
+    def changes_badge(ctx: AuthContext = Depends(VIEW)) -> dict:
+        scope, sp = mdb_scope_sql(ctx, "md")
         with engine.tx() as cur:
             # Mismos criterios que /admin/inventory/summary (sin bases deshabilitadas ni duplicadas).
-            cur.execute("""SELECT COUNT(*) AS n FROM structural_change sc
-                           JOIN monitored_database md ON md.id = sc.monitored_database_id
-                           WHERE sc.status = 'pending' AND md.enabled AND md.duplicate_of_id IS NULL""")
+            cur.execute(f"""SELECT COUNT(*) AS n FROM structural_change sc
+                            JOIN monitored_database md ON md.id = sc.monitored_database_id
+                            WHERE sc.status = 'pending' AND md.enabled AND md.duplicate_of_id IS NULL AND {scope}""",
+                        sp)
             n = cur.fetchone()["n"]
             cur.execute(f"""SELECT COUNT(*) AS n FROM monitored_database md
-                            WHERE md.enabled AND md.duplicate_of_id IS NULL
+                            WHERE md.enabled AND md.duplicate_of_id IS NULL AND {scope}
                               AND (md.verification_status = 'unverifiable' OR (md.last_attempt_at IS NOT NULL AND
-                                   md.last_attempt_at < NOW() - make_interval(secs => {engine.stale_seconds_sql()})))""")
+                                   md.last_attempt_at < NOW() - make_interval(secs => {engine.stale_seconds_sql()})))""",
+                        sp)
             u = cur.fetchone()["n"]
-            cur.execute("SELECT COUNT(*) AS n FROM monitored_database WHERE state = 'baseline_pending' "
-                        "AND duplicate_of_id IS NULL AND enabled")
+            cur.execute(f"SELECT COUNT(*) AS n FROM monitored_database md WHERE md.state = 'baseline_pending' "
+                        f"AND md.duplicate_of_id IS NULL AND md.enabled AND {scope}", sp)
             b = cur.fetchone()["n"]
         return {"pending_changes": n, "unverifiable_databases": u, "awaiting_baseline": b}
 
     # ── Bases monitoreadas ──────────────────────────────────────────────────
     @router.get("/monitored-databases")
     def list_mdb(group_id: Optional[int] = Query(None), company_id: Optional[int] = Query(None),
-                 kind: Optional[str] = Query(None)) -> dict:
+                 agency_id: Optional[int] = Query(None), kind: Optional[str] = Query(None),
+                 ctx: AuthContext = Depends(VIEW)) -> dict:
         with engine.tx() as cur:
-            where, params = scope_filter("md", group_id, company_id, None, cur)
+            where, params = scope_filter("md", group_id, company_id, agency_id, cur, ctx)
             if kind in ("dwh", "source"):
                 where.append("md.kind = %s")
                 params.append(kind)
             cur.execute(MDB_SELECT + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY md.id", params)
-            return {"items": [mdb_out(r) for r in cur.fetchall()]}
+            return {"items": [mdb_out(r, ctx) for r in cur.fetchall()]}
 
     def get_mdb_or_404(cur: Any, mdb_id: int) -> Dict[str, Any]:
         cur.execute(MDB_SELECT + " WHERE md.id = %s", (mdb_id,))
@@ -1610,10 +1679,13 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
         return r
 
     @router.get("/monitored-databases/{mdb_id}")
-    def get_mdb(mdb_id: int) -> dict:
+    def get_mdb(mdb_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
         with engine.tx() as cur:
-            m = mdb_out(get_mdb_or_404(cur, mdb_id))
-            cur.execute("""SELECT s.id, s.installation_id, i.name AS installation_name, s.captured_at, s.received_at,
+            check_mdb(cur, ctx, mdb_id)
+            raw = get_mdb_or_404(cur, mdb_id)
+            m = mdb_out(raw, ctx)
+            cur.execute("""SELECT s.id, s.installation_id, i.name AS installation_name, i.group_id AS _inst_group,
+                                  s.captured_at, s.received_at,
                                   s.status, s.reason_code, s.object_count, s.schemas_verified, s.schemas_unverifiable,
                                   s.agent_version, s.server_version, s.processing
                            FROM inventory_snapshot s LEFT JOIN installation i ON i.id = s.installation_id
@@ -1621,6 +1693,8 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
             snaps = []
             for s in cur.fetchall():
                 s = dict(s)
+                if not ctx.can("view", s.pop("_inst_group", None)) and s.get("installation_name"):
+                    s["installation_name"], s["installation_id"] = "(instalación de otro grupo)", None
                 s["installation_id"] = str(s["installation_id"]) if s["installation_id"] else None
                 s["captured_at"], s["received_at"] = iso(s["captured_at"]), iso(s["received_at"])
                 snaps.append(s)
@@ -1629,24 +1703,26 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
             events = [dict(e, created_at=iso(e["created_at"])) for e in cur.fetchall()]
             # ¿La configuración vigente sigue apuntando a esta base?
             current = False
-            if m["kind"] == "dwh" and m["group_id"]:
+            if raw["kind"] == "dwh" and raw["group_id"]:
                 cur.execute("SELECT warehouse_host, warehouse_port, warehouse_database FROM client_group WHERE id = %s",
-                            (m["group_id"],))
+                            (raw["group_id"],))
                 g = cur.fetchone()
                 current = bool(g) and engine.dwh_identity(g) == get_mdb_or_404(cur, mdb_id)["identity_key"].strip()
-            elif m["kind"] == "source" and m["company_id"]:
-                cur.execute("SELECT * FROM company WHERE id = %s", (m["company_id"],))
+            elif raw["kind"] == "source" and raw["company_id"]:
+                cur.execute("SELECT * FROM company WHERE id = %s", (raw["company_id"],))
                 c = cur.fetchone()
                 current = bool(c) and engine.source_identity(c) == get_mdb_or_404(cur, mdb_id)["identity_key"].strip()
         m.update(snapshots=snaps, events=events, config_current=current)
         return m
 
     @router.post("/monitored-databases", status_code=201)
-    def create_mdb(body: MonitoredCreate) -> dict:
+    def create_mdb(body: MonitoredCreate, ctx: AuthContext = Depends(CONFIGURE)) -> dict:
         with engine.tx() as cur:
             if body.kind == "dwh":
                 if not body.group_id:
                     raise http_error(422, "group_required", "Indique group_id para el DWH.")
+                gid_chk = group_of(cur, "group", body.group_id, "Grupo")
+                ctx.check("inventory.configure", gid_chk, "Grupo")
                 cur.execute("SELECT id, name, warehouse_host, warehouse_port, warehouse_database FROM client_group "
                             "WHERE id = %s", (body.group_id,))
                 g = cur.fetchone()
@@ -1656,11 +1732,14 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
                 if not key:
                     raise http_error(422, "no_warehouse", "El grupo no tiene DWH configurado.")
                 engine_name, group_id, company_id = "postgresql", g["id"], None
-                name = body.display_name or f"DWH {g['name']} ({engine.decrypt(g['warehouse_database'] or '')})"
+                # Nombre neutro (sin el grupo): un DWH puede quedar compartido por varios grupos.
+                name = body.display_name or f"DWH {engine.decrypt(g['warehouse_database'] or '')} · {key[:6]}"
                 enabled = True if body.enabled is None else body.enabled
             else:
                 if not body.company_id:
                     raise http_error(422, "company_required", "Indique company_id para monitorear su origen (DMS).")
+                gid_chk = group_of(cur, "company", body.company_id, "Empresa")
+                ctx.check("inventory.configure", gid_chk, "Empresa")
                 cur.execute("SELECT * FROM company WHERE id = %s", (body.company_id,))
                 c = cur.fetchone()
                 if not c:
@@ -1683,22 +1762,24 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
                 (body.kind, engine_name, key, name[:255], group_id, company_id, enabled,
                  body.scan_interval_seconds or engine.s.default_interval_seconds,
                  _clean_patterns(body.schema_include) or [], _clean_patterns(body.schema_exclude) or [],
-                 body.view_definitions_enabled, ACTOR))
+                 body.view_definitions_enabled, ctx.actor))
             new_id = cur.fetchone()["id"]
             cur.execute("INSERT INTO monitored_database_link (monitored_database_id, group_id, company_id) "
                         "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (new_id, group_id, company_id or 0))
-            engine._mdb_event(cur, new_id, "created", actor=ACTOR,
+            engine._mdb_event(cur, new_id, "created", actor=ctx.actor, actor_user_id=ctx.user_id,
                               data={"kind": body.kind, "enabled": enabled, "engine": engine_name})
-            out = mdb_out(get_mdb_or_404(cur, new_id))
+            out = mdb_out(get_mdb_or_404(cur, new_id), ctx)
         if body.kind == "source" and engine_name not in SUPPORTED_ENGINES:
             out["warning"] = (f"El agente aún no inventaría orígenes {engine_name}: se reportará "
                               "'No se pudo verificar la estructura' (ENGINE_UNSUPPORTED).")
         return out
 
     @router.put("/monitored-databases/{mdb_id}")
-    def update_mdb(mdb_id: int, body: MonitoredUpdate) -> dict:
+    def update_mdb(mdb_id: int, body: MonitoredUpdate, ctx: AuthContext = Depends(CONFIGURE)) -> dict:
         changes = body.model_dump(exclude_unset=True)
+        ACTOR = ctx.actor
         with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id, "inventory.configure")
             cur.execute("SELECT * FROM monitored_database WHERE id = %s FOR UPDATE", (mdb_id,))
             m = cur.fetchone()
             if not m:
@@ -1718,7 +1799,7 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
                 cur.execute(f"UPDATE monitored_database SET {', '.join(sets)}, updated_at = NOW() WHERE id = %s",
                             (*params, mdb_id))
             if audit:
-                engine._mdb_event(cur, mdb_id, "config_changed", actor=ACTOR, data=audit)
+                engine._mdb_event(cur, mdb_id, "config_changed", actor=ACTOR, data=audit, actor_user_id=ctx.user_id)
             if "view_definitions_enabled" in audit and not changes.get("view_definitions_enabled"):
                 # Al deshabilitarlo se borra el SQL cifrado ya guardado (quedan solo las huellas).
                 n = 0
@@ -1730,33 +1811,40 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
                                 f"WHERE monitored_database_id = %s AND ({cond})", (mdb_id,))
                     n += cur.rowcount
                 engine._mdb_event(cur, mdb_id, "view_definitions_purged", actor=ACTOR,
-                                  message="Se borró el SQL cifrado de vistas guardado.", data={"rows": n})
+                                  message="Se borró el SQL cifrado de vistas guardado.", data={"rows": n},
+                                  actor_user_id=ctx.user_id)
             if "schema_include" in audit or "schema_exclude" in audit:
                 cur.execute("SELECT * FROM monitored_database WHERE id = %s", (mdb_id,))
                 engine.close_out_of_scope(cur, cur.fetchone(), actor=ACTOR)
-            return mdb_out(get_mdb_or_404(cur, mdb_id))
+            return mdb_out(get_mdb_or_404(cur, mdb_id), ctx)
 
     @router.post("/monitored-databases/{mdb_id}/scan")
-    def request_scan(mdb_id: int) -> dict:
+    def request_scan(mdb_id: int, ctx: AuthContext = Depends(CONFIGURE)) -> dict:
         with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id, "inventory.configure")
             cur.execute("UPDATE monitored_database SET scan_requested_at = NOW() WHERE id = %s RETURNING id", (mdb_id,))
             if not cur.fetchone():
                 raise http_error(404, "not_found", "Base monitoreada inexistente.")
-            engine._mdb_event(cur, mdb_id, "scan_requested", actor=ACTOR)
+            engine._mdb_event(cur, mdb_id, "scan_requested", actor=ctx.actor, actor_user_id=ctx.user_id)
         return {"status": "ok"}
 
     @router.post("/monitored-databases/{mdb_id}/resolve-duplicate")
-    def resolve_duplicate(mdb_id: int, body: ResolveDuplicateBody) -> dict:
+    def resolve_duplicate(mdb_id: int, body: ResolveDuplicateBody, ctx: AuthContext = Depends(CONFIGURE)) -> dict:
         """
         merge: el registro ORIGINAL (línea base + historial) adopta la configuración de este
                duplicado (p. ej. se cambió el nombre del host del DWH) y el duplicado desaparece.
         undo:  la detección fue errónea: se quita la marca y no se vuelve a marcar sola.
         """
+        ACTOR = ctx.actor
         with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id, "inventory.configure")
             cur.execute("SELECT * FROM monitored_database WHERE id = %s FOR UPDATE", (mdb_id,))
             m = cur.fetchone()
             if not m:
                 raise http_error(404, "not_found", "Base monitoreada inexistente.")
+            if m["duplicate_of_id"]:
+                # La fusión/deshacer afecta también a la original: permiso sobre sus grupos.
+                check_mdb(cur, ctx, m["duplicate_of_id"], "inventory.configure")
             if not m["duplicate_of_id"]:
                 raise http_error(409, "not_duplicate", "La base no está marcada como duplicada.")
             if body.action == "undo":
@@ -1787,8 +1875,10 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
             return {"status": "ok", "id": new["id"], "merged_from": mdb_id}
 
     @router.post("/monitored-databases/{mdb_id}/release-lease")
-    def release_lease(mdb_id: int) -> dict:
+    def release_lease(mdb_id: int, ctx: AuthContext = Depends(CONFIGURE)) -> dict:
+        ACTOR = ctx.actor
         with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id, "inventory.configure")
             cur.execute("""UPDATE monitored_database SET lease_installation_id = NULL, lease_until = NULL
                            WHERE id = %s RETURNING id""", (mdb_id,))
             if not cur.fetchone():
@@ -1798,12 +1888,14 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
 
     @router.get("/monitored-databases/{mdb_id}/baseline")
     def get_baseline(mdb_id: int, view: str = Query("auto"), schema: Optional[str] = Query(None),
-                     search: Optional[str] = Query(None, max_length=128), limit: int = Query(1000, ge=1, le=20000)) -> dict:
+                     search: Optional[str] = Query(None, max_length=128), limit: int = Query(1000, ge=1, le=20000),
+                     ctx: AuthContext = Depends(VIEW)) -> dict:
         """
         view=approved → línea base aprobada; view=proposal → último inventario observado (propuesta);
         auto → propuesta si está pendiente de aprobación, si no la aprobada.
         """
         with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id)
             m = get_mdb_or_404(cur, mdb_id)
             if view == "auto":
                 view = "proposal" if m["state"] != "monitoring" else "approved"
@@ -1856,16 +1948,21 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
                 "baseline_version": m["baseline_version"]}
 
     @router.post("/monitored-databases/{mdb_id}/baseline/approve")
-    def approve(mdb_id: int, body: ApproveBody) -> dict:
-        return engine.approve_baseline(mdb_id, body, actor=ACTOR)
+    def approve(mdb_id: int, body: ApproveBody, ctx: AuthContext = Depends(APPROVE)) -> dict:
+        with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id, "inventory.approve_baseline")
+        return engine.approve_baseline(mdb_id, body, actor=ctx.actor, actor_user_id=ctx.user_id)
 
     @router.post("/monitored-databases/{mdb_id}/baseline/reset")
-    def reset(mdb_id: int, body: ReasonBody) -> dict:
-        return engine.reset_baseline(mdb_id, body.reason.strip(), actor=ACTOR)
+    def reset(mdb_id: int, body: ReasonBody, ctx: AuthContext = Depends(APPROVE)) -> dict:
+        with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id, "inventory.approve_baseline")
+        return engine.reset_baseline(mdb_id, body.reason.strip(), actor=ctx.actor, actor_user_id=ctx.user_id)
 
     @router.get("/monitored-databases/{mdb_id}/baseline/history")
-    def baseline_history(mdb_id: int, limit: int = Query(200, ge=1, le=2000)) -> dict:
+    def baseline_history(mdb_id: int, limit: int = Query(200, ge=1, le=2000), ctx: AuthContext = Depends(VIEW)) -> dict:
         with engine.tx() as cur:
+            check_mdb(cur, ctx, mdb_id)
             cur.execute("""SELECT id, baseline_version, schema_name, object_name, object_type, action, fingerprint,
                                   change_id, actor, comment, created_at
                            FROM inventory_baseline_version WHERE monitored_database_id = %s
@@ -1881,15 +1978,22 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
                sc.superseded_by_id, sc.attribution, sc.ack_by, sc.ack_at, sc.ack_comment, sc.ticket_ref,
                sc.reclassified_at, sc.reclassified_by, sc.row_version, sc.evidence, sc.baseline_version,
                md.kind AS database_kind, md.display_name AS database_name, md.group_id, g.name AS group_name,
-               md.company_id, c.name AS company_name
+               md.company_id, c.name AS company_name,
+               ARRAY(SELECT DISTINCT l.group_id FROM monitored_database_link l
+                      WHERE l.monitored_database_id = md.id) AS _linked_groups
         FROM structural_change sc
         JOIN monitored_database md ON md.id = sc.monitored_database_id
         LEFT JOIN client_group g ON g.id = md.group_id
         LEFT JOIN company c ON c.id = md.company_id
     """
 
-    def change_out(r: Dict[str, Any]) -> Dict[str, Any]:
+    def change_out(r: Dict[str, Any], ctx: Optional[AuthContext] = None) -> Dict[str, Any]:
         d = dict(r)
+        linked = d.pop("_linked_groups", None) or []
+        if ctx is not None:
+            groups = list(dict.fromkeys([g for g in [r.get("group_id"), *linked] if g is not None]))
+            d["allowed_actions"] = allowed_actions(ctx, groups)
+            hide_owner(d, ctx)
         for k in ("first_detected_at", "last_observed_at", "status_changed_at", "ack_at", "reclassified_at"):
             d[k] = iso(d.get(k))
         d["baseline_fingerprint"] = (d.get("baseline_fingerprint") or "").strip() or None
@@ -1906,10 +2010,10 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
         schema: Optional[str] = Query(None, max_length=128), object: Optional[str] = Query(None, max_length=128),
         change_type: Optional[str] = Query(None, max_length=40), attribution: Optional[str] = Query(None),
         since: Optional[datetime] = Query(None), until: Optional[datetime] = Query(None),
-        limit: int = Query(300, ge=1, le=2000),
+        limit: int = Query(300, ge=1, le=2000), ctx: AuthContext = Depends(VIEW),
     ) -> dict:
         with engine.tx() as cur:
-            where, params = scope_filter("md", group_id, company_id, agency_id, cur)
+            where, params = scope_filter("md", group_id, company_id, agency_id, cur, ctx)
             if view == "pending":
                 where.append("sc.status = 'pending'")
             elif view == "history":
@@ -1943,16 +2047,18 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
             sql = CHANGE_SELECT + (" WHERE " + " AND ".join(where) if where else "") + \
                 " ORDER BY sc.first_detected_at DESC, sc.id DESC LIMIT %s"
             cur.execute(sql, (*params, limit))
-            return {"items": [change_out(r) for r in cur.fetchall()], "labels": CHANGE_TYPE_LABELS}
+            return {"items": [change_out(r, ctx) for r in cur.fetchall()], "labels": CHANGE_TYPE_LABELS}
 
     @router.get("/structural-changes/{change_id}")
-    def get_change(change_id: int) -> dict:
+    def get_change(change_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
         with engine.tx() as cur:
+            _, change_groups = groups_of_change(cur, change_id)
+            ctx.check("view", change_groups, "Cambio estructural")
             cur.execute(CHANGE_SELECT + " WHERE sc.id = %s", (change_id,))
             r = cur.fetchone()
             if not r:
                 raise http_error(404, "not_found", "Cambio estructural inexistente.")
-            d = change_out(r)
+            d = change_out(r, ctx)
             cur.execute("""SELECT diffs, previous_structure, current_structure, previous_definition_hash,
                                   current_definition_hash, (previous_definition_enc IS NOT NULL) AS has_prev_def,
                                   (current_definition_enc IS NOT NULL) AS has_cur_def
@@ -1963,7 +2069,8 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
                      previous_definition_hash=(x["previous_definition_hash"] or "").strip() or None,
                      current_definition_hash=(x["current_definition_hash"] or "").strip() or None,
                      definitions_stored=bool(x["has_prev_def"] or x["has_cur_def"]),
-                     definitions_viewable=engine.s.expose_view_definitions)
+                     definitions_viewable=engine.s.expose_view_definitions
+                     and all(ctx.can("inventory.view_definitions", g) for g in change_groups))
             cur.execute("""SELECT id, event_type, actor, message, data, created_at FROM structural_change_event
                            WHERE change_id = %s ORDER BY id""", (change_id,))
             d["events"] = [dict(e, created_at=iso(e["created_at"])) for e in cur.fetchall()]
@@ -1983,20 +2090,23 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
         return d
 
     @router.get("/structural-changes/{change_id}/definitions")
-    def get_definitions(change_id: int) -> JSONResponse:
-        # Stand-in del permiso inventory.view_definitions hasta la fase de RBAC.
+    def get_definitions(change_id: int, ctx: AuthContext = Depends(DEFS)) -> JSONResponse:
+        # Doble llave: el interruptor global [inventory] expose_view_definitions (por defecto false)
+        # Y el permiso inventory.view_definitions sobre los grupos de la base.
         if not engine.s.expose_view_definitions:
             raise http_error(403, "permission_required",
                              "Ver el SQL de vistas requiere el permiso inventory.view_definitions "
                              "([inventory] expose_view_definitions = true).",
                              permission="inventory.view_definitions")
         with engine.tx() as cur:
+            _, change_groups = groups_of_change(cur, change_id)
+            ctx.check("inventory.view_definitions", change_groups, "Cambio estructural")
             cur.execute("""SELECT previous_definition_enc, current_definition_enc FROM structural_change
                            WHERE id = %s""", (change_id,))
             r = cur.fetchone()
             if not r:
                 raise http_error(404, "not_found", "Cambio estructural inexistente.")
-            engine._change_event(cur, change_id, "definitions_viewed", actor=ACTOR,
+            engine._change_event(cur, change_id, "definitions_viewed", actor=ctx.actor, actor_user_id=ctx.user_id,
                                  message="Se consultó el SQL de la definición (acceso sensible).")
         return JSONResponse(
             {"previous": engine.decrypt_definition(r["previous_definition_enc"]),
@@ -2004,11 +2114,17 @@ def create_inventory_admin_router(*, engine: InventoryEngine, admin_token: str) 
             headers={"Cache-Control": "no-store"})
 
     @router.post("/structural-changes/{change_id}/acknowledge")
-    def acknowledge(change_id: int, body: AcknowledgeBody) -> dict:
-        return engine.acknowledge(change_id, body, actor=ACTOR)
+    def acknowledge(change_id: int, body: AcknowledgeBody, ctx: AuthContext = Depends(ACK)) -> dict:
+        with engine.tx() as cur:
+            _, gs = groups_of_change(cur, change_id)
+            ctx.check("structure.acknowledge", gs, "Cambio estructural")
+        return engine.acknowledge(change_id, body, actor=ctx.actor, actor_user_id=ctx.user_id)
 
     @router.post("/structural-changes/{change_id}/reclassify")
-    def reclassify(change_id: int, body: ReclassifyBody) -> dict:
-        return engine.reclassify(change_id, body, actor=ACTOR)
+    def reclassify(change_id: int, body: ReclassifyBody, ctx: AuthContext = Depends(RECLASS)) -> dict:
+        with engine.tx() as cur:
+            _, gs = groups_of_change(cur, change_id)
+            ctx.check("structure.reclassify", gs, "Cambio estructural")
+        return engine.reclassify(change_id, body, actor=ctx.actor, actor_user_id=ctx.user_id)
 
     return router

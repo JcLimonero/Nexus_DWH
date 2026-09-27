@@ -9,9 +9,17 @@ interface SecretInfo {
   has_password: boolean;
   encrypted_fields: string[];
   decrypt_errors: string[];
+  /** true = sin credentials.manage: host/base/usuario llegan en null */
+  secrets_hidden?: boolean;
 }
 
-export interface Group extends Timestamps, SecretInfo {
+/** Tokens de enrolamiento: solo con credentials.manage sobre el grupo. */
+interface TokenInfo {
+  has_token?: boolean;
+  token_hidden?: boolean;
+}
+
+export interface Group extends Timestamps, SecretInfo, TokenInfo {
   id: number;
   name: string;
   group_token: string | null;
@@ -23,12 +31,12 @@ export interface Group extends Timestamps, SecretInfo {
   company_count: number;
 }
 
-export interface Company extends Timestamps, SecretInfo {
+export interface Company extends Timestamps, SecretInfo, TokenInfo {
   id: number;
   group_id: number;
   group_name: string;
   name: string;
-  company_token: string;
+  company_token: string | null;
   source_type: SourceType;
   source_host: string | null;
   source_port: number;
@@ -43,7 +51,7 @@ export interface Company extends Timestamps, SecretInfo {
   object_count: number;
 }
 
-export interface Agency extends Timestamps {
+export interface Agency extends Timestamps, TokenInfo {
   id: number;
   company_id: number;
   company_name: string;
@@ -113,7 +121,8 @@ export interface Stats {
 export interface MonitorClient {
   grupo: string;
   razon_social: string;
-  token_preview: string;
+  /** null sin credentials.manage sobre el grupo */
+  token_preview: string | null;
   rs_enabled: boolean;
   grupo_enabled: boolean;
   last_seen: string | null;
@@ -125,6 +134,8 @@ export interface MonitorClient {
   exec_errors_pending: number;
   exec_errors_1h: number;
   last_execution: string | null;
+  group_id?: number;
+  company_id?: number;
   /** ISO UTC con zona (aditivo; backend fase 2). */
   last_seen_utc?: string | null;
   last_execution_utc?: string | null;
@@ -141,6 +152,11 @@ export interface ClientEvent {
   detail: string | null;
   rows_loaded: number;
   acknowledged: boolean;
+  group_id?: number | null;
+  company_id?: number | null;
+  agency_id?: number | null;
+  acknowledged_by?: string | null;
+  acknowledged_at?: string | null;
 }
 
 export interface ActivityItem {
@@ -148,13 +164,81 @@ export interface ActivityItem {
   timestamp: string;
   grupo: string;
   razon_social: string;
-  token: string;
+  /** prefijo del token legado; null sin credentials.manage */
+  token: string | null;
   method: string;
   endpoint: string;
   status_code: number;
   response_ms: number;
   error_detail: string | null;
   client_ip: string;
+  auth_kind?: string;
+  group_id?: number | null;
+}
+
+export interface PanelUserRole {
+  role: string;
+  role_name: string;
+  group_id: number | null;
+  group_name: string | null;
+}
+
+export interface PanelUser {
+  id: number;
+  username: string;
+  display_name: string;
+  email: string | null;
+  is_active: boolean;
+  is_superadmin: boolean;
+  must_change_password: boolean;
+  failed_attempts: number;
+  locked: boolean;
+  locked_until: string | null;
+  last_login_at: string | null;
+  password_changed_at: string | null;
+  created_at: string;
+  created_by: string;
+  roles: PanelUserRole[];
+  active_sessions: number;
+}
+
+export interface PanelRole {
+  code: string;
+  name: string;
+  description: string;
+  permissions: string[];
+  global_only: boolean;
+}
+
+export interface PanelSession {
+  id: number;
+  user_id: number;
+  username: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  ip: string | null;
+  user_agent: string | null;
+  revoked_at: string | null;
+  revoked_reason: string | null;
+  current: boolean;
+  is_superadmin?: boolean;
+}
+
+export interface AuditEntry {
+  id: number;
+  at: string;
+  actor_user_id: number | null;
+  actor_name: string;
+  auth_kind: string;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  group_id: number | null;
+  group_name: string | null;
+  status_code: number | null;
+  details: Record<string, unknown>;
+  ip: string | null;
 }
 
 export interface ListResponse<T> {
@@ -381,6 +465,15 @@ export interface HealthSummary {
   disconnect_after_seconds: number;
 }
 
+/** Acciones permitidas al usuario sobre un recurso de inventario (calculadas en el backend). */
+export interface AllowedActions {
+  configure: boolean;
+  approve_baseline: boolean;
+  acknowledge: boolean;
+  reclassify: boolean;
+  view_definitions: boolean;
+}
+
 export interface Incident {
   id: number;
   category: IncidentCategory;
@@ -518,6 +611,7 @@ export interface MonitoredLink {
 }
 
 export interface MonitoredDatabase {
+  allowed_actions?: AllowedActions;
   id: number;
   kind: MonitoredKind;
   engine: string;
@@ -652,6 +746,7 @@ export interface Evidence {
 }
 
 export interface StructuralChange {
+  allowed_actions?: AllowedActions;
   id: number;
   monitored_database_id: number;
   schema_name: string;

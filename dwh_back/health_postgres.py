@@ -64,7 +64,7 @@ from urllib.parse import urlsplit
 import psycopg2
 import psycopg2.extras
 import requests
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from redact import redact_text
@@ -408,12 +408,12 @@ class IncidentEngine:
     # ── Primitivas de incidencias ───────────────────────────────────────────
     def _event(self, cur: Any, incident_id: int, event_type: str, *, actor: str = "system",
                message: Optional[str] = None, execution_id: Optional[str] = None,
-               data: Optional[Dict[str, Any]] = None) -> None:
+               data: Optional[Dict[str, Any]] = None, actor_user_id: Optional[int] = None) -> None:
         cur.execute(
-            """INSERT INTO incident_event (incident_id, event_type, actor, message, execution_id, data)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
+            """INSERT INTO incident_event (incident_id, event_type, actor, message, execution_id, data, actor_user_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
             (incident_id, event_type, actor[:100], (message or None) and message[:1000], execution_id,
-             json.dumps(data or {}, default=str)),
+             json.dumps(data or {}, default=str), actor_user_id),
         )
 
     def _open_row(self, cur: Any, category: str, installation_id: Optional[str],
@@ -497,22 +497,23 @@ class IncidentEngine:
 
     def resolve(self, cur: Any, incident: Dict[str, Any], reason: str, *, actor: str = "system",
                 comment: Optional[str] = None, execution_id: Optional[str] = None,
-                evidence_seq: Optional[int] = None) -> Optional[Dict[str, Any]]:
+                evidence_seq: Optional[int] = None, actor_user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         cur.execute(
             """UPDATE incident SET status = 'resolved', resolved_at = NOW(), resolution_reason = %s,
-                      resolution_comment = %s, resolved_by = %s, resolved_execution_id = %s,
+                      resolution_comment = %s, resolved_by = %s, resolved_by_user_id = %s, resolved_execution_id = %s,
                       resolved_evidence_seq = %s,
                       duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (NOW() - opened_at)))::bigint,
                       updated_at = NOW()
                WHERE id = %s AND status = 'open' RETURNING *""",
-            (reason, (comment or None) and comment[:500], actor[:100], execution_id, evidence_seq, incident["id"]),
+            (reason, (comment or None) and comment[:500], actor[:100], actor_user_id, execution_id, evidence_seq,
+             incident["id"]),
         )
         row = cur.fetchone()
         if not row:
             return None
         self._event(cur, row["id"], "resolved", actor=actor,
                     message=RESOLUTION_LABELS.get(reason, reason) + (f": {comment}" if comment else ""),
-                    execution_id=execution_id, data={"reason": reason})
+                    execution_id=execution_id, data={"reason": reason}, actor_user_id=actor_user_id)
         self._enqueue(cur, row, "resolved")
         log.info("Incidencia resuelta #%s %s (%s)", row["id"], row["category"], reason)
         return row
@@ -636,8 +637,12 @@ class IncidentEngine:
 
     # ── Modelo de salud ─────────────────────────────────────────────────────
     def task_health(self, cur: Any, *, task_id: Optional[int] = None, group_id: Optional[int] = None,
-                    company_id: Optional[int] = None, agency_id: Optional[int] = None) -> List[Dict[str, Any]]:
+                    company_id: Optional[int] = None, agency_id: Optional[int] = None,
+                    group_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
         conds, params = [], []
+        if group_ids is not None:   # alcance del usuario del panel (None = todos)
+            conds.append("c.group_id = ANY(%s)")
+            params.append(list(group_ids))
         for col, val in (("t.id", task_id), ("c.group_id", group_id), ("a.company_id", company_id),
                          ("t.agency_id", agency_id)):
             if val is not None:
@@ -821,8 +826,12 @@ class IncidentEngine:
 
     def installation_health(self, cur: Any, *, installation_id: Optional[str] = None,
                             group_id: Optional[int] = None, company_id: Optional[int] = None,
-                            agency_id: Optional[int] = None) -> List[Dict[str, Any]]:
+                            agency_id: Optional[int] = None,
+                            group_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
         conds, params = [], []
+        if group_ids is not None:   # alcance del usuario del panel (None = todos)
+            conds.append("i.group_id = ANY(%s)")
+            params.append(list(group_ids))
         if installation_id:
             conds.append("i.id = %s")
             params.append(installation_id)
@@ -1495,17 +1504,18 @@ class ChannelUpdate(ChannelBase):
     verify_tls: Optional[bool] = None
 
 
-def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRouter:
-    configured = (admin_token or "").strip()
+def create_health_router(*, engine: IncidentEngine, auth: Any) -> APIRouter:
+    """Permisos: view (consultas, por alcance de grupo), incident.acknowledge, incident.close_queue,
+    credentials.manage (canales: URL/secreto), config.manage global (evaluar ahora)."""
+    from panel_auth import AuthContext, err
 
-    def require_admin(x_admin_token: Optional[str] = Header(None, alias="x-admin-token")) -> None:
-        if not configured:
-            raise HTTPException(status_code=503, detail="Admin no configurado.")
-        provided = (x_admin_token or "").encode("utf-8")
-        if not provided or not hmac.compare_digest(provided, configured.encode("utf-8")):
-            raise HTTPException(status_code=401, detail="Token de administrador no válido.")
+    VIEW = auth.perm("view")
+    ACK = auth.perm("incident.acknowledge")
+    CLOSE = auth.perm("incident.close_queue")
+    CREDS = auth.perm("credentials.manage")
+    CONFIG_GLOBAL = auth.perm("config.manage", global_only=True)
 
-    router = APIRouter(prefix="/admin", tags=["health"], dependencies=[Depends(require_admin)])
+    router = APIRouter(prefix="/admin", tags=["health"])
 
     @contextmanager
     def tx() -> Iterator[Any]:
@@ -1520,12 +1530,12 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
 
     # ── Salud ───────────────────────────────────────────────────────────────
     @router.get("/health/settings")
-    def health_settings() -> dict:
+    def health_settings(ctx: AuthContext = Depends(VIEW)) -> dict:
         return {"health": asdict(engine.s),
                 "notifications": {k: v for k, v in asdict(engine.n).items()}}
 
     @router.post("/health/evaluate")
-    def health_evaluate() -> dict:
+    def health_evaluate(ctx: AuthContext = Depends(CONFIG_GLOBAL)) -> dict:
         try:
             return engine.evaluate()
         except psycopg2.OperationalError:
@@ -1534,12 +1544,13 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
     @router.get("/health/tasks")
     def health_tasks(group_id: Optional[int] = Query(None), company_id: Optional[int] = Query(None),
                      agency_id: Optional[int] = Query(None), task_id: Optional[int] = Query(None),
-                     state: Optional[str] = Query(None)) -> dict:
+                     state: Optional[str] = Query(None), ctx: AuthContext = Depends(VIEW)) -> dict:
         with tx() as cur:
             rows = engine.task_health(cur, task_id=task_id, group_id=group_id, company_id=company_id,
-                                      agency_id=agency_id)
-            cur.execute("""SELECT task_id, id, category, severity, acknowledged_at IS NOT NULL AS acknowledged
-                           FROM incident WHERE status = 'open' AND task_id IS NOT NULL""")
+                                      agency_id=agency_id, group_ids=ctx.groups())
+            scope, sp = ctx.scope_sql("group_id")
+            cur.execute(f"""SELECT task_id, id, category, severity, acknowledged_at IS NOT NULL AS acknowledged
+                            FROM incident WHERE status = 'open' AND task_id IS NOT NULL AND {scope}""", sp)
             incs: Dict[int, List[Dict[str, Any]]] = {}
             for r in cur.fetchall():
                 incs.setdefault(r["task_id"], []).append({"id": r["id"], "category": r["category"],
@@ -1556,19 +1567,23 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
 
     @router.get("/health/installations")
     def health_installations(group_id: Optional[int] = Query(None), company_id: Optional[int] = Query(None),
-                             agency_id: Optional[int] = Query(None), connectivity: Optional[str] = Query(None)) -> dict:
+                             agency_id: Optional[int] = Query(None), connectivity: Optional[str] = Query(None),
+                             ctx: AuthContext = Depends(VIEW)) -> dict:
         with tx() as cur:
-            rows = engine.installation_health(cur, group_id=group_id, company_id=company_id, agency_id=agency_id)
+            rows = engine.installation_health(cur, group_id=group_id, company_id=company_id, agency_id=agency_id,
+                                              group_ids=ctx.groups())
         if connectivity:
             rows = [r for r in rows if r["connectivity"] == connectivity]
         return {"items": rows, "disconnect_after_seconds": engine.s.disconnect_after_seconds}
 
     @router.get("/health/summary")
-    def health_summary(group_id: Optional[int] = Query(None)) -> dict:
+    def health_summary(group_id: Optional[int] = Query(None), ctx: AuthContext = Depends(VIEW)) -> dict:
+        # Agregados SOLO sobre los grupos del alcance del usuario.
         with tx() as cur:
-            insts = engine.installation_health(cur, group_id=group_id)
-            tasks = engine.task_health(cur, group_id=group_id)
-            conds, params = ["status = 'open'"], []
+            insts = engine.installation_health(cur, group_id=group_id, group_ids=ctx.groups())
+            tasks = engine.task_health(cur, group_id=group_id, group_ids=ctx.groups())
+            scope, params = ctx.scope_sql("group_id")
+            conds = ["status = 'open'", scope]
             if group_id is not None:
                 conds.append("group_id = %s")
                 params.append(group_id)
@@ -1576,8 +1591,8 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
                             WHERE {' AND '.join(conds)} GROUP BY 1, 2""", tuple(params))
             inc_rows = cur.fetchall()
             cur.execute(f"""SELECT COUNT(*) AS n FROM incident WHERE status = 'resolved'
-                            AND resolved_at >= NOW() - INTERVAL '24 hours'
-                            {'AND group_id = %s' if group_id is not None else ''}""", tuple(params))
+                            AND resolved_at >= NOW() - INTERVAL '24 hours' AND {' AND '.join(conds[1:])}""",
+                        tuple(params))
             resolved_24h = int(cur.fetchone()["n"])
         conn_counts: Dict[str, int] = {}
         for i in insts:
@@ -1630,9 +1645,10 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
         company_id: Optional[int] = Query(None), agency_id: Optional[int] = Query(None),
         task_id: Optional[int] = Query(None), installation_id: Optional[uuid.UUID] = Query(None),
         since: Optional[datetime] = Query(None), until: Optional[datetime] = Query(None),
-        limit: int = Query(200, ge=1, le=1000),
+        limit: int = Query(200, ge=1, le=1000), ctx: AuthContext = Depends(VIEW),
     ) -> dict:
-        conds, params = [], []
+        scope, params = ctx.scope_sql("x.group_id")
+        conds = [scope]
         if view == "active":
             conds.append("x.status = 'open' AND x.acknowledged_at IS NULL")
         elif view == "acknowledged":
@@ -1680,27 +1696,29 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
         return {"total": len(rows), "items": [inc_out(r) for r in rows]}
 
     @router.get("/incidents/badge")
-    def incidents_badge() -> dict:
+    def incidents_badge(ctx: AuthContext = Depends(VIEW)) -> dict:
+        scope, sp = ctx.scope_sql("group_id")
         with tx() as cur:
             cur.execute(
-                """SELECT COUNT(*) FILTER (WHERE acknowledged_at IS NULL) AS open_unacknowledged,
+                f"""SELECT COUNT(*) FILTER (WHERE acknowledged_at IS NULL) AS open_unacknowledged,
                           COUNT(*) AS open_total,
                           COUNT(*) FILTER (WHERE acknowledged_at IS NULL AND severity IN ('critical','error')) AS serious_unacknowledged
-                   FROM incident WHERE status = 'open'""")
+                   FROM incident WHERE status = 'open' AND {scope}""", sp)
             r = cur.fetchone()
         return {k: int(v or 0) for k, v in r.items()}
 
-    def get_incident_or_404(cur: Any, incident_id: int) -> Dict[str, Any]:
+    def get_incident_or_404(cur: Any, incident_id: int, ctx: AuthContext, perm: str = "view") -> Dict[str, Any]:
         cur.execute(INC_SELECT + " WHERE x.id = %s", (incident_id,))
         r = cur.fetchone()
         if not r:
             raise HTTPException(status_code=404, detail="Incidencia no encontrada.")
+        ctx.check(perm, r["group_id"], "Incidencia")
         return r
 
     @router.get("/incidents/{incident_id}")
-    def get_incident(incident_id: int) -> dict:
+    def get_incident(incident_id: int, ctx: AuthContext = Depends(VIEW)) -> dict:
         with tx() as cur:
-            r = get_incident_or_404(cur, incident_id)
+            r = get_incident_or_404(cur, incident_id, ctx)
             cur.execute("""SELECT id, event_type, actor, message, execution_id, data, created_at
                            FROM incident_event WHERE incident_id = %s ORDER BY id""", (incident_id,))
             events = [dict(e, created_at=iso(e["created_at"]),
@@ -1750,24 +1768,27 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
         return out
 
     @router.put("/incidents/{incident_id}/ack")
-    def ack_incident(incident_id: int, body: Optional[AckBody] = None) -> dict:
+    def ack_incident(incident_id: int, body: Optional[AckBody] = None, ctx: AuthContext = Depends(ACK)) -> dict:
         """Reconocer = alguien lo revisó. NUNCA cambia el estado técnico (abierta sigue abierta)."""
         comment = (body.comment if body else None) or None
         with tx() as cur:
-            get_incident_or_404(cur, incident_id)
-            cur.execute("""UPDATE incident SET acknowledged_at = NOW(), acknowledged_by = %s, ack_comment = %s,
-                                  updated_at = NOW() WHERE id = %s""", ("admin", comment, incident_id))
-            engine._event(cur, incident_id, "acknowledged", actor="admin", message=comment)
-            r = get_incident_or_404(cur, incident_id)
+            get_incident_or_404(cur, incident_id, ctx, "incident.acknowledge")
+            cur.execute("""UPDATE incident SET acknowledged_at = NOW(), acknowledged_by = %s,
+                                  acknowledged_by_user_id = %s, ack_comment = %s,
+                                  updated_at = NOW() WHERE id = %s""", (ctx.actor, ctx.user_id, comment, incident_id))
+            engine._event(cur, incident_id, "acknowledged", actor=ctx.actor, message=comment,
+                          actor_user_id=ctx.user_id)
+            r = get_incident_or_404(cur, incident_id, ctx)
         return inc_out(r)
 
     @router.put("/incidents/{incident_id}/resolve")
-    def resolve_incident(incident_id: int, body: ManualResolveBody) -> dict:
+    def resolve_incident(incident_id: int, body: ManualResolveBody, ctx: AuthContext = Depends(CLOSE)) -> dict:
         with tx() as cur:
             cur.execute("SELECT * FROM incident WHERE id = %s FOR UPDATE", (incident_id,))
             r = cur.fetchone()
             if not r:
                 raise HTTPException(status_code=404, detail="Incidencia no encontrada.")
+            ctx.check("incident.close_queue", r["group_id"], "Incidencia")
             if r["status"] != "open":
                 raise HTTPException(status_code=409, detail="La incidencia ya está resuelta.")
             if r["category"] not in MANUAL_RESOLVABLE:
@@ -1776,8 +1797,8 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
                     detail="Esta incidencia se resuelve sola cuando hay evidencia de recuperación "
                            "(latido, carga confirmada, fin de la ejecución…). Puede reconocerla, "
                            "pero no cerrarla manualmente.")
-            engine.resolve(cur, r, "manual", actor="admin", comment=body.reason)
-            r = get_incident_or_404(cur, incident_id)
+            engine.resolve(cur, r, "manual", actor=ctx.actor, comment=body.reason, actor_user_id=ctx.user_id)
+            r = get_incident_or_404(cur, incident_id, ctx)
         return inc_out(r)
 
     # ── Canales de notificación ─────────────────────────────────────────────
@@ -1805,12 +1826,26 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
         FROM notification_channel ch LEFT JOIN client_group g ON g.id = ch.group_id
     """
 
-    def get_channel_or_404(cur: Any, channel_id: int) -> Dict[str, Any]:
+    def get_channel_or_404(cur: Any, channel_id: int, ctx: AuthContext, perm: str = "view") -> Dict[str, Any]:
         cur.execute(CH_SELECT + " WHERE ch.id = %s", (channel_id,))
         r = cur.fetchone()
         if not r:
             raise HTTPException(status_code=404, detail="Canal no encontrado.")
+        # Canal global (group_id NULL): solo alcance global.
+        ctx.check(perm, r["group_id"], "Canal")
         return r
+
+    def require_channel_scope(ctx: AuthContext, group_id: Optional[int]) -> None:
+        if group_id is None:
+            if not ctx.has_global("credentials.manage"):
+                raise err(403, "global_scope_required",
+                          "Un canal para todos los grupos requiere credentials.manage con alcance global.",
+                          permission="credentials.manage")
+        else:
+            cur_ok = ctx.can("view", group_id)
+            if not cur_ok:
+                raise HTTPException(status_code=404, detail="Grupo no encontrado.")
+            ctx.check("credentials.manage", group_id, "Grupo")
 
     def check_url(kind: str, url: Optional[str]) -> Optional[str]:
         if kind != "webhook":
@@ -1821,14 +1856,17 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
             raise HTTPException(status_code=422, detail=f"url: {exc}")
 
     @router.get("/notification-channels")
-    def list_channels() -> dict:
+    def list_channels(ctx: AuthContext = Depends(VIEW)) -> dict:
+        scope, sp = ctx.scope_sql("ch.group_id")
         with tx() as cur:
-            cur.execute(CH_SELECT + " ORDER BY ch.name")
+            cur.execute(CH_SELECT + f" WHERE {scope} ORDER BY ch.name", sp)
             return {"items": [ch_out(r) for r in cur.fetchall()], "allow_http": engine.n.allow_http,
                     "categories": [{"value": c, "label": CATEGORY_DEFAULTS[c]["label"]} for c in CATEGORIES]}
 
     @router.post("/notification-channels", status_code=201)
-    def create_channel(body: ChannelCreate) -> dict:
+    def create_channel(body: ChannelCreate, ctx: AuthContext = Depends(CREDS)) -> dict:
+        require_channel_scope(ctx, body.group_id)
+        ctx.audit_group = body.group_id
         url = check_url(body.kind, body.url)
         with tx() as cur:
             try:
@@ -1848,13 +1886,15 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
             except psycopg2.errors.ForeignKeyViolation:
                 raise HTTPException(status_code=404, detail="Grupo no encontrado.")
             new_id = cur.fetchone()["id"]
-            return ch_out(get_channel_or_404(cur, new_id))
+            return ch_out(get_channel_or_404(cur, new_id, ctx))
 
     @router.put("/notification-channels/{channel_id}")
-    def update_channel(channel_id: int, body: ChannelUpdate) -> dict:
+    def update_channel(channel_id: int, body: ChannelUpdate, ctx: AuthContext = Depends(CREDS)) -> dict:
         data = body.model_dump(exclude_unset=True)
         with tx() as cur:
-            cur_row = get_channel_or_404(cur, channel_id)
+            cur_row = get_channel_or_404(cur, channel_id, ctx, "credentials.manage")
+            if "group_id" in data and data["group_id"] is not None and (data["group_id"] or None) != cur_row["group_id"]:
+                require_channel_scope(ctx, data["group_id"] or None)
             sets: Dict[str, Any] = {}
             for k in ("name", "is_enabled", "min_severity", "categories", "notify_on_open", "notify_on_resolve",
                       "reminder_interval_minutes", "timeout_seconds", "verify_tls"):
@@ -1878,20 +1918,21 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
                     raise HTTPException(status_code=409, detail="Ya existe un canal con ese nombre.")
                 except psycopg2.errors.ForeignKeyViolation:
                     raise HTTPException(status_code=404, detail="Grupo no encontrado.")
-            return ch_out(get_channel_or_404(cur, channel_id))
+            return ch_out(get_channel_or_404(cur, channel_id, ctx))
 
     @router.delete("/notification-channels/{channel_id}")
-    def delete_channel(channel_id: int) -> dict:
+    def delete_channel(channel_id: int, ctx: AuthContext = Depends(CREDS)) -> dict:
         with tx() as cur:
+            get_channel_or_404(cur, channel_id, ctx, "credentials.manage")
             cur.execute("DELETE FROM notification_channel WHERE id = %s", (channel_id,))
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Canal no encontrado.")
         return {"status": "ok", "deleted": channel_id}
 
     @router.post("/notification-channels/{channel_id}/test")
-    def test_channel(channel_id: int) -> dict:
+    def test_channel(channel_id: int, ctx: AuthContext = Depends(CREDS)) -> dict:
         with tx() as cur:
-            get_channel_or_404(cur, channel_id)
+            get_channel_or_404(cur, channel_id, ctx, "credentials.manage")
         res = engine.send_test(channel_id)
         return {"status": res["status"], "attempts": res["attempts"], "error": res["last_error"],
                 "http_status": res["last_status_code"]}
@@ -1899,8 +1940,9 @@ def create_health_router(*, engine: IncidentEngine, admin_token: str) -> APIRout
     @router.get("/notification-deliveries")
     def list_deliveries(channel_id: Optional[int] = Query(None), incident_id: Optional[int] = Query(None),
                         status: Optional[str] = Query(None, pattern="^(pending|sending|delivered|failed|skipped)$"),
-                        limit: int = Query(100, ge=1, le=1000)) -> dict:
-        conds, params = [], []
+                        limit: int = Query(100, ge=1, le=1000), ctx: AuthContext = Depends(VIEW)) -> dict:
+        scope, params = ctx.scope_sql("COALESCE(x.group_id, ch.group_id)")
+        conds = [scope]
         for col, val in (("o.channel_id", channel_id), ("o.incident_id", incident_id), ("o.status", status)):
             if val is not None:
                 conds.append(f"{col} = %s")

@@ -1,17 +1,21 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Eye, Pencil, Plus, Trash2 } from "lucide-react";
 import { qs, useApi } from "@/lib/api";
 import type { CatalogObject, ListResponse } from "@/lib/types";
 import { Badge, Button, Card, Field, IconButton, Input, PageHeader, Select, Switch, Textarea } from "@/components/ui/primitives";
 import { Modal } from "@/components/ui/modal";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
-import { CompanyOptions, HierarchyFilters, type FilterValue } from "@/components/filters";
+import { CompanyOptions } from "@/components/filters";
 import { useRefData } from "@/components/ref-data";
 import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
+import { useSession } from "@/components/session";
+import { FilterBar, useUrlFilters } from "@/components/scope-filters";
+
+const FILTER_KEYS = ["group_id", "company_id"] as const;
 
 interface FormState {
   company_id: string;
@@ -40,9 +44,11 @@ const EMPTY: FormState = {
 };
 
 export default function CatalogoPage() {
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "" });
-  const { data, loading, error, reload } = useApi<ListResponse<CatalogObject>>(`admin/objects${qs(filter as unknown as Record<string, string>)}`);
-  const { groups, companies } = useRefData();
+  const [filter, setFilter, clearFilter] = useUrlFilters(FILTER_KEYS);
+  const { data, loading, error, reload } = useApi<ListResponse<CatalogObject>>(`admin/objects${qs(filter)}`);
+  const { companies: allCompanies } = useRefData();
+  const { can, canAny } = useSession();
+  const companies = allCompanies.filter((c) => can("config.manage", c.group_id));
   const { run } = useActions(reload);
   const toast = useToast();
   const [editing, setEditing] = useState<CatalogObject | null>(null);
@@ -50,6 +56,7 @@ export default function CatalogoPage() {
   const [form, setForm] = useState<FormState>(EMPTY);
   const [saving, setSaving] = useState(false);
   const items = data?.items ?? [];
+  const readOnly = Boolean(editing && !can("config.manage", editing.group_id));
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -106,13 +113,15 @@ export default function CatalogoPage() {
         title="Catálogo de objetos"
         description="Plantillas de tablas destino en el DWH (DDL, claves de upsert) por empresa."
         actions={
-          <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={companies.length === 0}>
-            Nuevo objeto
-          </Button>
+          canAny("config.manage") ? (
+            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={companies.length === 0}>
+              Nuevo objeto
+            </Button>
+          ) : undefined
         }
       />
       <div className="mb-4">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} />
+        <FilterBar values={filter} onChange={setFilter} onClear={clearFilter} fields={[...FILTER_KEYS]} />
       </div>
       <Card>
         <DataState loading={loading} error={error} hasData={Boolean(data)} empty={items.length === 0} onRetry={reload} emptyTitle="No hay objetos en el catálogo">
@@ -129,7 +138,9 @@ export default function CatalogoPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {items.map((o) => (
+              {items.map((o) => {
+                const canCfg = can("config.manage", o.group_id);
+                return (
                 <Tr key={o.id}>
                   <Td>
                     <p className="font-medium text-slate-900">{o.name}</p>
@@ -154,6 +165,7 @@ export default function CatalogoPage() {
                   <Td>
                     <Switch
                       checked={o.is_enabled}
+                      disabled={!canCfg}
                       hideLabel
                       label={o.is_enabled ? "Deshabilitar objeto" : "Habilitar objeto"}
                       onChange={(v) => run("toggle", `admin/objects/${o.id}/${v ? "enable" : "disable"}`, { success: v ? "Objeto habilitado." : "Objeto deshabilitado." })}
@@ -161,9 +173,10 @@ export default function CatalogoPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex justify-end gap-0.5">
-                      <IconButton label="Editar" onClick={() => openEdit(o)}>
-                        <Pencil className="h-4 w-4" />
+                      <IconButton label={canCfg ? "Editar" : "Ver (solo lectura)"} onClick={() => openEdit(o)}>
+                        {canCfg ? <Pencil className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                       </IconButton>
+                      {canCfg && (
                       <IconButton
                         label="Eliminar"
                         tone="danger"
@@ -177,10 +190,12 @@ export default function CatalogoPage() {
                       >
                         <Trash2 className="h-4 w-4" />
                       </IconButton>
+                      )}
                     </div>
                   </Td>
                 </Tr>
-              ))}
+                );
+              })}
             </tbody>
           </Table>
         </DataState>
@@ -196,18 +211,24 @@ export default function CatalogoPage() {
             <Button variant="secondary" onClick={() => setOpen(false)}>
               Cancelar
             </Button>
-            <Button type="submit" form="object-form" loading={saving}>
-              {editing ? "Guardar cambios" : "Crear objeto"}
-            </Button>
+            {!readOnly && (
+              <Button type="submit" form="object-form" loading={saving}>
+                {editing ? "Guardar cambios" : "Crear objeto"}
+              </Button>
+            )}
           </>
         }
       >
-        <form id="object-form" onSubmit={onSubmit} className="grid gap-4 sm:grid-cols-6">
+        <form id="object-form" onSubmit={onSubmit}>
+          <fieldset disabled={readOnly} className="grid gap-4 sm:grid-cols-6">
           <Field label="Empresa" required className="sm:col-span-3" htmlFor="o-company" hint={editing && editing.task_count > 0 ? "No se puede cambiar mientras tenga tareas." : undefined}>
             <Select id="o-company" required value={form.company_id} onChange={(e) => set("company_id", e.target.value)} disabled={Boolean(editing && editing.task_count > 0)}>
               <option value="" disabled>
                 Selecciona…
               </option>
+              {editing && !companies.some((c) => c.id === editing.company_id) && (
+                <option value={editing.company_id}>{editing.company_name}</option>
+              )}
               <CompanyOptions companies={companies} />
             </Select>
           </Field>
@@ -236,8 +257,9 @@ export default function CatalogoPage() {
             <Textarea id="o-static" mono rows={2} value={form.static_columns} onChange={(e) => set("static_columns", e.target.value)} />
           </Field>
           <div className="sm:col-span-6">
-            <Switch checked={form.is_enabled} onChange={(v) => set("is_enabled", v)} label="Objeto habilitado" description="Si se deshabilita, sus tareas no se entregan a los clientes." />
+            <Switch checked={form.is_enabled} disabled={readOnly} onChange={(v) => set("is_enabled", v)} label="Objeto habilitado" description="Si se deshabilita, sus tareas no se entregan a los clientes." />
           </div>
+          </fieldset>
         </form>
       </Modal>
     </>

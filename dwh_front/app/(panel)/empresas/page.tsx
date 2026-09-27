@@ -13,6 +13,10 @@ import { TokenField } from "@/components/ui/token";
 import { PasswordInput, SecretNotice } from "@/components/password-input";
 import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
+import { useSession } from "@/components/session";
+import { FilterBar, useUrlFilters } from "@/components/scope-filters";
+
+const FILTER_KEYS = ["group_id"] as const;
 
 interface FormState {
   group_id: string;
@@ -49,17 +53,24 @@ const EMPTY: FormState = {
 const SECRET_TEXT_FIELDS = ["source_host", "source_database", "source_username", "source_dsn"] as const;
 
 export default function EmpresasPage() {
-  const [groupFilter, setGroupFilter] = useState("");
+  const [f, setF, clearF] = useUrlFilters(FILTER_KEYS);
+  const groupFilter = f.group_id;
   const { data, loading, error, reload } = useApi<ListResponse<Company>>(`admin/companies${qs({ group_id: groupFilter })}`);
   const groups = useApi<ListResponse<Group>>("admin/groups");
   const { run } = useActions(reload);
   const toast = useToast();
+  const { can, canAny } = useSession();
   const [editing, setEditing] = useState<Company | null>(null);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [saving, setSaving] = useState(false);
   const items = data?.items ?? [];
-  const groupList = groups.data?.items ?? [];
+  // Solo los grupos donde puede crear/mover empresas (config.manage).
+  const groupList = (groups.data?.items ?? []).filter((g) => can("config.manage", g.id));
+  const canCreate = canAny("config.manage") && groupList.length > 0;
+  const formGroup = form.group_id ? Number(form.group_id) : null;
+  const formCfg = editing ? can("config.manage", editing.group_id) : true;
+  const formCred = editing ? can("credentials.manage", editing.group_id) : can("credentials.manage", formGroup);
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -104,22 +115,28 @@ export default function EmpresasPage() {
     if (!Number.isInteger(port) || port < 1 || port > 65535) return toast.error("El puerto debe estar entre 1 y 65535.");
     if (!Number.isInteger(refresh) || refresh < 5 || refresh > 86400) return toast.error("El refresco debe estar entre 5 y 86400 segundos.");
 
-    const body: Record<string, unknown> = {
-      group_id: Number(form.group_id),
-      name: form.name.trim(),
-      source_type: form.source_type,
-      source_port: port,
-      refresh_seconds: refresh,
-      verbose_logging: form.verbose_logging,
-      is_enabled: form.is_enabled,
-    };
-    const undecryptable = editing?.decrypt_errors ?? [];
-    SECRET_TEXT_FIELDS.forEach((k) => {
-      if (undecryptable.includes(k) && !form[k]) return;
-      body[k] = form[k].trim();
-    });
-    if (form.source_password) body.source_password = form.source_password;
-    if (editing && form.clear_password && !form.source_password) body.clear_password = true;
+    const body: Record<string, unknown> = {};
+    if (formCfg) {
+      Object.assign(body, {
+        name: form.name.trim(),
+        refresh_seconds: refresh,
+        verbose_logging: form.verbose_logging,
+        is_enabled: form.is_enabled,
+      });
+      if (!editing || Number(form.group_id) !== editing.group_id) body.group_id = Number(form.group_id);
+    }
+    if (formCred) {
+      body.source_type = form.source_type;
+      body.source_port = port;
+      const undecryptable = editing?.decrypt_errors ?? [];
+      SECRET_TEXT_FIELDS.forEach((k) => {
+        if (undecryptable.includes(k) && !form[k]) return;
+        if (!editing && !form[k].trim()) return;
+        body[k] = form[k].trim();
+      });
+      if (form.source_password) body.source_password = form.source_password;
+      if (editing && form.clear_password && !form.source_password) body.clear_password = true;
+    }
 
     setSaving(true);
     const res = await run<Company>("save", editing ? `admin/companies/${editing.id}` : "admin/companies", {
@@ -139,21 +156,16 @@ export default function EmpresasPage() {
         title="Empresas"
         description="Razones sociales: conexión a la BD de origen (DMS) y token del cliente ETL."
         actions={
-          <>
-            <Select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)} className="w-48" aria-label="Filtrar por grupo">
-              <option value="">Todos los grupos</option>
-              {groupList.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </Select>
-            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate} disabled={groupList.length === 0} title={groupList.length === 0 ? "Crea primero un grupo" : undefined}>
+          canCreate ? (
+            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate}>
               Nueva empresa
             </Button>
-          </>
+          ) : undefined
         }
       />
+      <div className="mb-4">
+        <FilterBar values={f} onChange={setF} onClear={clearF} fields={[...FILTER_KEYS]} />
+      </div>
       <Card>
         <DataState
           loading={loading}
@@ -176,7 +188,10 @@ export default function EmpresasPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {items.map((c) => (
+              {items.map((c) => {
+                const canCfg = can("config.manage", c.group_id);
+                const canCred = can("credentials.manage", c.group_id);
+                return (
                 <Tr key={c.id}>
                   <Td>
                     <p className="font-medium text-slate-900">{c.name}</p>
@@ -187,17 +202,26 @@ export default function EmpresasPage() {
                   </Td>
                   <Td>
                     <Badge tone="blue">{SOURCE_TYPE_LABELS[c.source_type] ?? c.source_type}</Badge>
-                    <p className="mt-1 font-mono text-xs">
-                      {c.source_dsn ? `DSN=${c.source_dsn}` : `${c.source_host || "—"}:${c.source_port}`}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      {c.source_database || "—"} · {c.source_username || "—"} {c.has_password ? "" : "· sin contraseña"}
-                    </p>
+                    {c.secrets_hidden ? (
+                      <p className="mt-1 text-xs italic text-slate-400" title="Requiere el permiso «Administrar credenciales» sobre el grupo">
+                        Conexión oculta (credenciales)
+                      </p>
+                    ) : (
+                      <>
+                        <p className="mt-1 font-mono text-xs">
+                          {c.source_dsn ? `DSN=${c.source_dsn}` : `${c.source_host || "—"}:${c.source_port}`}
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          {c.source_database || "—"} · {c.source_username || "—"} {c.has_password ? "" : "· sin contraseña"}
+                        </p>
+                      </>
+                    )}
                   </Td>
                   <Td>
                     <TokenField
                       token={c.company_token}
-                      onRegenerate={() =>
+                      hidden={c.token_hidden}
+                      onRegenerate={!canCred ? undefined : () =>
                         run("token", `admin/companies/${c.id}/regenerate-token`, {
                           success: "Token de empresa regenerado.",
                           confirm: {
@@ -216,6 +240,7 @@ export default function EmpresasPage() {
                   <Td>
                     <Switch
                       checked={c.is_enabled}
+                      disabled={!canCfg}
                       hideLabel
                       label={c.is_enabled ? "Deshabilitar empresa" : "Habilitar empresa"}
                       onChange={(v) => run("toggle", `admin/companies/${c.id}/${v ? "enable" : "disable"}`, { success: v ? "Empresa habilitada." : "Empresa deshabilitada." })}
@@ -223,9 +248,13 @@ export default function EmpresasPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex justify-end gap-0.5">
-                      <IconButton label="Editar" onClick={() => openEdit(c)}>
-                        <Pencil className="h-4 w-4" />
-                      </IconButton>
+                      {(canCfg || canCred) && (
+                        <IconButton label="Editar" onClick={() => openEdit(c)}>
+                          <Pencil className="h-4 w-4" />
+                        </IconButton>
+                      )}
+                      {!canCfg && !canCred && <span className="text-xs text-slate-400">Solo lectura</span>}
+                      {canCfg && (
                       <IconButton
                         label="Eliminar"
                         tone="danger"
@@ -239,10 +268,12 @@ export default function EmpresasPage() {
                       >
                         <Trash2 className="h-4 w-4" />
                       </IconButton>
+                      )}
                     </div>
                   </Td>
                 </Tr>
-              ))}
+                );
+              })}
             </tbody>
           </Table>
         </DataState>
@@ -267,10 +298,13 @@ export default function EmpresasPage() {
       >
         <form id="company-form" onSubmit={onSubmit} className="grid gap-4 sm:grid-cols-6">
           <Field label="Grupo" required className="sm:col-span-3" htmlFor="c-group">
-            <Select id="c-group" required value={form.group_id} onChange={(e) => set("group_id", e.target.value)}>
+            <Select id="c-group" required disabled={!formCfg} value={form.group_id} onChange={(e) => set("group_id", e.target.value)}>
               <option value="" disabled>
                 Selecciona…
               </option>
+              {editing && !groupList.some((g) => g.id === editing.group_id) && (
+                <option value={editing.group_id}>{editing.group_name}</option>
+              )}
               {groupList.map((g) => (
                 <option key={g.id} value={g.id}>
                   {g.name}
@@ -279,12 +313,16 @@ export default function EmpresasPage() {
             </Select>
           </Field>
           <Field label="Nombre" required className="sm:col-span-3" htmlFor="c-name">
-            <Input id="c-name" required maxLength={255} value={form.name} onChange={(e) => set("name", e.target.value)} />
+            <Input id="c-name" required maxLength={255} disabled={!formCfg} value={form.name} onChange={(e) => set("name", e.target.value)} />
           </Field>
 
           <div className="sm:col-span-6">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Base de datos de origen</h3>
+            {!formCred && (
+              <p className="mt-1 text-xs text-slate-500">Sin permiso «Administrar credenciales» en este grupo: la conexión no se muestra ni se puede cambiar.</p>
+            )}
           </div>
+          <fieldset disabled={!formCred} className="contents">
           <Field label="Tipo" className="sm:col-span-2" htmlFor="c-type">
             <Select id="c-type" value={form.source_type} onChange={(e) => changeType(e.target.value as SourceType)}>
               {Object.entries(SOURCE_TYPE_LABELS).map(([k, v]) => (
@@ -316,9 +354,11 @@ export default function EmpresasPage() {
           )}
           {editing?.has_password && (
             <div className="sm:col-span-6">
-              <Switch checked={form.clear_password} onChange={(v) => set("clear_password", v)} label="Borrar la contraseña guardada" />
+              <Switch checked={form.clear_password} disabled={!formCred} onChange={(v) => set("clear_password", v)} label="Borrar la contraseña guardada" />
             </div>
           )}
+          </fieldset>
+          <fieldset disabled={!formCfg} className="contents">
 
           <div className="sm:col-span-6">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Cliente ETL</h3>
@@ -327,9 +367,10 @@ export default function EmpresasPage() {
             <Input id="c-refresh" inputMode="numeric" value={form.refresh_seconds} onChange={(e) => set("refresh_seconds", e.target.value)} />
           </Field>
           <div className="flex flex-col justify-end gap-3 sm:col-span-4">
-            <Switch checked={form.verbose_logging} onChange={(v) => set("verbose_logging", v)} label="Log detallado (verbose)" />
-            <Switch checked={form.is_enabled} onChange={(v) => set("is_enabled", v)} label="Empresa habilitada" />
+            <Switch checked={form.verbose_logging} disabled={!formCfg} onChange={(v) => set("verbose_logging", v)} label="Log detallado (verbose)" />
+            <Switch checked={form.is_enabled} disabled={!formCfg} onChange={(v) => set("is_enabled", v)} label="Empresa habilitada" />
           </div>
+          </fieldset>
           {editing && (
             <div className="sm:col-span-6">
               <SecretNotice encrypted={editing.encrypted_fields} errors={editing.decrypt_errors} />

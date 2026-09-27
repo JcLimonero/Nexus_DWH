@@ -9,8 +9,9 @@ import { Badge, Button, Card, Input, PageHeader, Select } from "@/components/ui/
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ExpandableText } from "@/components/expandable";
-import { HierarchyFilters, type FilterValue } from "@/components/filters";
-import { useRefData } from "@/components/ref-data";
+import { FilterBar, dateRange, useUrlFilters } from "@/components/scope-filters";
+
+const FILTER_KEYS = ["group_id", "company_id", "agency_id", "task_id", "status", "since", "until"] as const;
 
 const STATUS: Record<string, { label: string; tone: "green" | "red" | "amber" | "blue" }> = {
   success: { label: "OK", tone: "green" },
@@ -41,31 +42,22 @@ const WM_KIND_SHORT: Record<string, string> = {
   legacy_last_run: "legado",
 };
 
-/** yyyy-mm-dd (fecha local del navegador) → ISO UTC del inicio de ese día en la zona del navegador. */
-function dayStartIso(day: string): string | undefined {
-  if (!day) return undefined;
-  const d = new Date(`${day}T00:00:00`);
-  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
-}
-
 export default function EjecucionesPage() {
-  const [filter, setFilter] = useState<FilterValue>({ group_id: "", company_id: "", agency_id: "" });
-  const [status, setStatus] = useState("");
+  const [f, setF, clearF] = useUrlFilters(FILTER_KEYS);
   const [stage, setStage] = useState("");
   const [installation, setInstallation] = useState("");
-  const [taskId, setTaskId] = useState("");
-  const [since, setSince] = useState("");
   const [limit, setLimit] = useState("200");
-  const { groups, companies, agencies } = useRefData({ agencies: true });
   const installs = useApi<ListResponse<Installation>>("admin/installations");
   const { data, loading, error, reload } = useApi<{ total: number; items: Execution[] }>(
     `admin/executions${qs({
-      ...filter,
-      status,
+      group_id: f.group_id,
+      company_id: f.company_id,
+      agency_id: f.agency_id,
+      task_id: f.task_id,
+      status: f.status,
       failure_stage: stage,
       installation_id: installation,
-      task_id: /^\d+$/.test(taskId) ? taskId : "",
-      since: dayStartIso(since),
+      ...dateRange(f.since, f.until),
       limit,
     })}`,
   );
@@ -84,16 +76,14 @@ export default function EjecucionesPage() {
         }
       />
       <div className="mb-4 space-y-3">
-        <HierarchyFilters value={filter} onChange={setFilter} groups={groups} companies={companies} agencies={agencies} />
+        <FilterBar
+          values={f}
+          onChange={setF}
+          onClear={clearF}
+          fields={[...FILTER_KEYS]}
+          statusOptions={Object.entries(STATUS).map(([k, v]) => ({ value: k, label: v.label }))}
+        />
         <div className="flex flex-wrap items-center gap-2">
-          <Select aria-label="Estado" className="w-full sm:w-40" value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">Todos los estados</option>
-            {Object.entries(STATUS).map(([k, v]) => (
-              <option key={k} value={k}>
-                {v.label}
-              </option>
-            ))}
-          </Select>
           <Select aria-label="Etapa" className="w-full sm:w-44" value={stage} onChange={(e) => setStage(e.target.value)}>
             <option value="">Todas las etapas</option>
             {Object.entries(STAGE_LABEL).map(([k, v]) => (
@@ -110,8 +100,6 @@ export default function EjecucionesPage() {
               </option>
             ))}
           </Select>
-          <Input aria-label="Tarea #" placeholder="Tarea #" className="w-full sm:w-28" value={taskId} onChange={(e) => setTaskId(e.target.value)} />
-          <Input aria-label="Desde" type="date" className="w-full sm:w-44" value={since} onChange={(e) => setSince(e.target.value)} />
           <Select aria-label="Límite" className="w-full sm:w-36" value={limit} onChange={(e) => setLimit(e.target.value)}>
             {["50", "200", "500", "1000", "2000"].map((l) => (
               <option key={l} value={l}>

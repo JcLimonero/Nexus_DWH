@@ -12,6 +12,7 @@ import { TokenField } from "@/components/ui/token";
 import { PasswordInput, SecretNotice } from "@/components/password-input";
 import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
+import { useSession } from "@/components/session";
 
 interface FormState {
   name: string;
@@ -39,11 +40,16 @@ export default function GruposPage() {
   const { data, loading, error, reload } = useApi<ListResponse<Group>>("admin/groups");
   const { run } = useActions(reload);
   const toast = useToast();
+  const { can, canGlobal } = useSession();
+  const canCreate = canGlobal("config.manage");
   const [editing, setEditing] = useState<Group | null>(null);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [saving, setSaving] = useState(false);
   const items = data?.items ?? [];
+  // En el formulario: configuración (nombre/activo) y credenciales del DWH van por permisos distintos.
+  const formCfg = editing ? can("config.manage", editing.id) : canCreate;
+  const formCred = editing ? can("credentials.manage", editing.id) : canGlobal("credentials.manage");
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -74,15 +80,23 @@ export default function GruposPage() {
       toast.error("El puerto debe ser un número entre 1 y 65535.");
       return;
     }
-    const body: Record<string, unknown> = { name: form.name.trim(), warehouse_port: port, is_enabled: form.is_enabled };
-    const undecryptable = editing?.decrypt_errors ?? [];
-    (["warehouse_host", "warehouse_database", "warehouse_username"] as const).forEach((k) => {
-      // Si no se pudo descifrar y el campo quedó vacío, se conserva el valor actual.
-      if (undecryptable.includes(k) && !form[k]) return;
-      body[k] = form[k].trim();
-    });
-    if (form.warehouse_password) body.warehouse_password = form.warehouse_password;
-    if (editing && form.clear_password && !form.warehouse_password) body.clear_password = true;
+    const body: Record<string, unknown> = {};
+    if (formCfg) {
+      body.name = form.name.trim();
+      body.is_enabled = form.is_enabled;
+    }
+    if (formCred) {
+      body.warehouse_port = port;
+      const undecryptable = editing?.decrypt_errors ?? [];
+      (["warehouse_host", "warehouse_database", "warehouse_username"] as const).forEach((k) => {
+        // Si no se pudo descifrar y el campo quedó vacío, se conserva el valor actual.
+        if (undecryptable.includes(k) && !form[k]) return;
+        body[k] = form[k].trim();
+      });
+      if (form.warehouse_password) body.warehouse_password = form.warehouse_password;
+      if (editing && form.clear_password && !form.warehouse_password) body.clear_password = true;
+    }
+    if (!editing) body.name = form.name.trim();
 
     setSaving(true);
     const res = await run<Group>("save", editing ? `admin/groups/${editing.id}` : "admin/groups", {
@@ -100,9 +114,11 @@ export default function GruposPage() {
         title="Grupos"
         description="Grupos de empresas y su conexión al Data Warehouse."
         actions={
-          <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate}>
-            Nuevo grupo
-          </Button>
+          canCreate ? (
+            <Button icon={<Plus className="h-4 w-4" />} onClick={openCreate}>
+              Nuevo grupo
+            </Button>
+          ) : undefined
         }
       />
       <Card>
@@ -114,7 +130,7 @@ export default function GruposPage() {
           onRetry={reload}
           emptyTitle="No hay grupos"
           emptyDescription="Crea el primer grupo para empezar a configurar empresas."
-          emptyAction={<Button size="sm" onClick={openCreate}>Nuevo grupo</Button>}
+          emptyAction={canCreate ? <Button size="sm" onClick={openCreate}>Nuevo grupo</Button> : undefined}
         >
           <Table>
             <thead>
@@ -128,21 +144,33 @@ export default function GruposPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {items.map((g) => (
+              {items.map((g) => {
+                const canCfg = can("config.manage", g.id);
+                const canCred = can("credentials.manage", g.id);
+                return (
                 <Tr key={g.id}>
                   <Td className="font-medium text-slate-900">{g.name}</Td>
                   <Td>
-                    <p className="font-mono text-xs">
-                      {g.warehouse_host || "—"}:{g.warehouse_port}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      {g.warehouse_database || "—"} · {g.warehouse_username || "—"} {g.has_password ? "" : "· sin contraseña"}
-                    </p>
+                    {g.secrets_hidden ? (
+                      <p className="text-xs italic text-slate-400" title="Requiere el permiso «Administrar credenciales» sobre el grupo">
+                        Conexión oculta (credenciales)
+                      </p>
+                    ) : (
+                      <>
+                        <p className="font-mono text-xs">
+                          {g.warehouse_host || "—"}:{g.warehouse_port}
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          {g.warehouse_database || "—"} · {g.warehouse_username || "—"} {g.has_password ? "" : "· sin contraseña"}
+                        </p>
+                      </>
+                    )}
                   </Td>
                   <Td>
                     <TokenField
                       token={g.group_token}
-                      onRegenerate={() =>
+                      hidden={g.token_hidden}
+                      onRegenerate={!canCred ? undefined : () =>
                         run("token", `admin/groups/${g.id}/regenerate-token`, {
                           success: "Token de grupo regenerado.",
                           confirm: g.group_token
@@ -156,7 +184,7 @@ export default function GruposPage() {
                         })
                       }
                       onRevoke={
-                        g.group_token
+                        g.group_token && canCred
                           ? () =>
                               run("token", `admin/groups/${g.id}/token`, {
                                 method: "DELETE",
@@ -171,6 +199,7 @@ export default function GruposPage() {
                   <Td>
                     <Switch
                       checked={g.is_enabled}
+                      disabled={!canCfg}
                       hideLabel
                       label={g.is_enabled ? "Deshabilitar grupo" : "Habilitar grupo"}
                       onChange={(v) => run("toggle", `admin/groups/${g.id}/${v ? "enable" : "disable"}`, { success: v ? "Grupo habilitado." : "Grupo deshabilitado." })}
@@ -178,9 +207,12 @@ export default function GruposPage() {
                   </Td>
                   <Td className="text-right">
                     <div className="flex justify-end gap-0.5">
-                      <IconButton label="Editar" onClick={() => openEdit(g)}>
-                        <Pencil className="h-4 w-4" />
-                      </IconButton>
+                      {(canCfg || canCred) && (
+                        <IconButton label="Editar" onClick={() => openEdit(g)}>
+                          <Pencil className="h-4 w-4" />
+                        </IconButton>
+                      )}
+                      {canCreate && (
                       <IconButton
                         label="Eliminar"
                         tone="danger"
@@ -194,10 +226,13 @@ export default function GruposPage() {
                       >
                         <Trash2 className="h-4 w-4" />
                       </IconButton>
+                      )}
+                      {!canCfg && !canCred && <span className="text-xs text-slate-400">Solo lectura</span>}
                     </div>
                   </Td>
                 </Tr>
-              ))}
+                );
+              })}
             </tbody>
           </Table>
         </DataState>
@@ -221,11 +256,15 @@ export default function GruposPage() {
       >
         <form id="group-form" onSubmit={onSubmit} className="grid gap-4 sm:grid-cols-6">
           <Field label="Nombre" required className="sm:col-span-6" htmlFor="g-name">
-            <Input id="g-name" required maxLength={255} value={form.name} onChange={(e) => set("name", e.target.value)} />
+            <Input id="g-name" required maxLength={255} disabled={!formCfg} value={form.name} onChange={(e) => set("name", e.target.value)} />
           </Field>
           <div className="sm:col-span-6">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Data Warehouse (PostgreSQL)</h3>
+            {!formCred && (
+              <p className="mt-1 text-xs text-slate-500">Sin permiso «Administrar credenciales»: la conexión no se muestra ni se puede cambiar.</p>
+            )}
           </div>
+          <fieldset disabled={!formCred} className="contents">
           <Field label="Host" className="sm:col-span-4" htmlFor="g-host">
             <Input id="g-host" value={form.warehouse_host} onChange={(e) => set("warehouse_host", e.target.value)} placeholder="dwh.midominio.com" />
           </Field>
@@ -248,11 +287,12 @@ export default function GruposPage() {
           </Field>
           {editing?.has_password && (
             <div className="sm:col-span-6">
-              <Switch checked={form.clear_password} onChange={(v) => set("clear_password", v)} label="Borrar la contraseña guardada" />
+              <Switch checked={form.clear_password} disabled={!formCred} onChange={(v) => set("clear_password", v)} label="Borrar la contraseña guardada" />
             </div>
           )}
+          </fieldset>
           <div className="sm:col-span-6">
-            <Switch checked={form.is_enabled} onChange={(v) => set("is_enabled", v)} label="Grupo habilitado" description="Si se deshabilita, ningún cliente del grupo recibe configuración." />
+            <Switch checked={form.is_enabled} disabled={!formCfg} onChange={(v) => set("is_enabled", v)} label="Grupo habilitado" description="Si se deshabilita, ningún cliente del grupo recibe configuración." />
           </div>
           {editing && (
             <div className="sm:col-span-6">

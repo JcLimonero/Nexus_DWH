@@ -54,8 +54,8 @@ function clientHealth(c: MonitorClient): { tone: "green" | "red" | "amber" | "sl
 
 export default function DashboardPage() {
   const stats = useApi<Stats>("admin/stats");
-  const clients = useApi<{ clients: MonitorClient[] }>("monitor/clients");
-  const errors = useApi<{ items: ClientEvent[] }>("monitor/events?event_type=error&only_unacknowledged=true&limit=8");
+  const clients = useApi<{ clients: MonitorClient[] }>("admin/clients");
+  const errors = useApi<{ items: ClientEvent[] }>("admin/events?event_type=error&only_unacknowledged=true&limit=8");
   const health = useApi<HealthSummary>("admin/health/summary");
   const topIncidents = useApi<{ items: Incident[] }>("admin/incidents?view=open&limit=6");
   const inventory = useApi<InventorySummary>("admin/inventory/summary");

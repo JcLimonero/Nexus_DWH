@@ -336,7 +336,7 @@ def test_dar_por_entendido_cliente_y_nexus_solo_esa_diferencia_e_historial(ienv,
     assert base1[("public", "ventas", "table")]["fingerprint"] == base0[("public", "ventas", "table")]["fingerprint"]
     # 2) historial y detalle se conservan
     det = b.admin("GET", f"/admin/structural-changes/{c_cli['id']}", expect=200)
-    assert det["status"] == "acknowledged" and det["attribution"] == "client" and det["ack_by"] == "admin"
+    assert det["status"] == "acknowledged" and det["attribution"] == "client" and det["ack_by"] == "token-admin"
     assert det["ack_at"] and det["ticket_ref"] == "TCK-101" and det["ack_comment"].startswith("El cliente")
     assert [e["event_type"] for e in det["events"]] == ["detected", "acknowledged"]
     assert det["previous_structure"] and det["current_structure"] and det["diffs"]
@@ -491,11 +491,11 @@ def test_reclasificar_requiere_motivo_y_conserva_valores_previos(ienv, db):
              "ticket_ref": "NX-77", "expected_version": c["row_version"]}, expect=200)
     det = b.admin("GET", f"/admin/structural-changes/{c['id']}", expect=200)
     assert det["attribution"] == "nexus" and det["ticket_ref"] == "NX-77"
-    assert det["reclassified_by"] == "admin" and det["reclassified_at"]
-    assert det["ack_by"] == "admin" and det["ack_comment"] == "lo pidió el cliente"   # el ack original no se pisa
+    assert det["reclassified_by"] == "token-admin" and det["reclassified_at"]
+    assert det["ack_by"] == "token-admin" and det["ack_comment"] == "lo pidió el cliente"   # el ack original no se pisa
     ev = [e for e in det["events"] if e["event_type"] == "reclassified"][0]
     assert ev["data"]["previous"]["attribution"] == "client" and ev["data"]["previous"]["ticket_ref"] == "T-1"
-    assert ev["data"]["new"]["attribution"] == "nexus" and ev["actor"] == "admin"
+    assert ev["data"]["new"]["attribution"] == "nexus" and ev["actor"] == "token-admin"
     assert ev["data"]["reason"].startswith("Fue una migración")
     # Versión vieja → 409.
     r = requests.post(b.url + f"/admin/structural-changes/{c['id']}/reclassify",
@@ -815,7 +815,7 @@ def test_resolver_duplicado_fusionar_y_deshacer(ienv, db):
     assert q(db, "SELECT identity_key FROM monitored_database WHERE id = %s", (g["mdb"],))[0][0] == gn["key"]
     assert len(baseline_items(b, g)) == 5
     ev = b.admin("GET", f"/admin/monitored-databases/{g['mdb']}", expect=200)["events"]
-    assert any(e["event_type"] == "identity_rebound" and e["actor"] == "admin" for e in ev)
+    assert any(e["event_type"] == "identity_rebound" and e["actor"] == "token-admin" for e in ev)
     # Deshacer: una detección errónea deja de marcarse sola.
     e = new_dwh(ienv, db_name="dwh_dup")
     dwh_target(b, e)
