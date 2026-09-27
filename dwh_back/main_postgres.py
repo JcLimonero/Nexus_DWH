@@ -38,6 +38,7 @@ import os
 import sys
 import time
 import traceback
+from datetime import timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
@@ -1272,7 +1273,10 @@ def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
                 COALESCE(al.http_errors_1h, 0),
                 COALESCE(ce.executions_total, 0), COALESCE(ce.exec_errors_total, 0),
                 COALESCE(ce.exec_errors_pending, 0), COALESCE(ce.exec_errors_1h, 0),
-                ce.last_execution
+                ce.last_execution,
+                -- Mismas horas como timestamptz (UTC): las columnas legadas son TIMESTAMP
+                -- sin zona en la zona de la sesión de la BD.
+                al.last_seen::timestamptz, ce.last_execution::timestamptz
             FROM company c
             JOIN client_group g ON g.id = c.group_id
             LEFT JOIN (
@@ -1321,6 +1325,9 @@ def get_clients_status(x_monitor_token: str = Header(...)) -> dict:
             "exec_errors_pending": int(r[11] or 0),
             "exec_errors_1h":     int(r[12] or 0),
             "last_execution":     r[13].isoformat() if r[13] else None,
+            # Aditivos (compatibles): ISO UTC con zona, para mostrar la hora con zona explícita.
+            "last_seen_utc":      r[14].astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if r[14] else None,
+            "last_execution_utc": r[15].astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if r[15] else None,
         }
         for r in rows
     ]
@@ -1435,6 +1442,24 @@ async def _validation_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": errors})
 
 
+# Salud, incidencias y notificaciones (sección 18 de DWH_README.md)
+from health_postgres import (  # noqa: E402
+    HealthSettings, IncidentEngine, NotificationSettings, create_health_router,
+)
+
+HEALTH_ENGINE = IncidentEngine(
+    get_connection=get_connection,
+    settings=HealthSettings.from_ini(_ini),
+    notif=NotificationSettings.from_ini(_ini),
+    get_secret_cipher=get_secret_cipher,
+    decrypt_config_secret=decrypt_config_secret,
+)
+
+
+def _on_watermark_reset(cur: Any, task_id: int) -> None:
+    HEALTH_ENGINE.on_watermark_reset(cur, task_id)
+
+
 app.include_router(
     create_admin_router(
         get_connection=get_connection,
@@ -1443,8 +1468,10 @@ app.include_router(
         admin_token=ADMIN_TOKEN,
         group_token_column_exists=group_token_column_exists,
         agency_token_column_exists=agency_token_column_exists,
+        on_watermark_reset=_on_watermark_reset,
     )
 )
+app.include_router(create_health_router(engine=HEALTH_ENGINE, admin_token=ADMIN_TOKEN))
 
 _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers(
     get_connection=get_connection,
@@ -1456,10 +1483,23 @@ _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers
     heartbeat_retention_days=AGENT_HEARTBEAT_RETENTION_DAYS,
     download_log_retention_days=AGENT_DOWNLOAD_LOG_RETENTION_DAYS,
     future_tolerance_hours=AGENT_FUTURE_TOLERANCE_HOURS,
+    health=HEALTH_ENGINE,
 )
 app.include_router(_agent_router)
 app.include_router(_agent_admin_router)
 app.include_router(_agent_monitor_router)
+
+
+@app.on_event("startup")
+def _start_health_threads() -> None:
+    # Evaluador de salud y notificador en hilos del proceso (advisory lock en BD:
+    # varias réplicas no evalúan a la vez; el outbox se reclama con SKIP LOCKED).
+    HEALTH_ENGINE.start()
+
+
+@app.on_event("shutdown")
+def _stop_health_threads() -> None:
+    HEALTH_ENGINE.stop()
 
 
 def check_migrations() -> None:

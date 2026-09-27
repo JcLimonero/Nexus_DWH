@@ -6,6 +6,9 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   Activity,
   Bell,
+  BellRing,
+  HeartPulse,
+  Siren,
   Boxes,
   History,
   MonitorSmartphone,
@@ -20,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { cx } from "@/lib/format";
+import { useIncidentBadge } from "@/components/health";
 
 const NAV = [
   { section: "General", items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }] },
@@ -36,6 +40,9 @@ const NAV = [
   {
     section: "Monitoreo",
     items: [
+      { href: "/salud", label: "Salud", icon: HeartPulse },
+      { href: "/incidencias", label: "Incidencias", icon: Siren },
+      { href: "/notificaciones", label: "Notificaciones", icon: BellRing },
       { href: "/instalaciones", label: "Instalaciones", icon: MonitorSmartphone },
       { href: "/ejecuciones", label: "Ejecuciones", icon: History },
       { href: "/eventos", label: "Eventos", icon: Bell },
@@ -46,6 +53,7 @@ const NAV = [
 
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
+  const badge = useIncidentBadge();
   return (
     <nav className="flex-1 space-y-6 overflow-y-auto px-3 py-4">
       {NAV.map((group) => (
@@ -66,6 +74,18 @@ function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
                   >
                     <Icon className={cx("h-4 w-4", active ? "text-brand-600" : "text-slate-400")} />
                     {label}
+                    {href === "/incidencias" && badge && badge.open_unacknowledged > 0 && (
+                      <span
+                        className={cx(
+                          "ml-auto inline-flex min-w-[1.25rem] items-center justify-center rounded-full px-1.5 text-[11px] font-semibold",
+                          badge.serious_unacknowledged > 0 ? "bg-red-600 text-white" : "bg-amber-100 text-amber-800",
+                        )}
+                        title={`${badge.open_unacknowledged} incidencia(s) abierta(s) sin reconocer`}
+                        aria-label={`${badge.open_unacknowledged} incidencias abiertas sin reconocer`}
+                      >
+                        {badge.open_unacknowledged}
+                      </span>
+                    )}
                   </Link>
                 </li>
               );

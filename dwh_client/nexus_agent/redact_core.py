@@ -13,7 +13,8 @@ todas las expresiones usan cuantificadores acotados sobre clases negadas (sin
 ``.*?`` abiertos) y el SQL se detecta con búsquedas lineales (str.find).
 
 Qué quita (enfoque conservador; ver DWH_README §17.7):
-  * TODOS los literales entre comillas simples ('...') y los literales entre
+  * TODOS los literales entre comillas simples ('...'; un apóstrofo dentro de
+    una palabra, como en "Can't", no abre literal) y los literales entre
     comillas dobles ("...") salvo cuando van tras una palabra de identificador
     (relation/column/table/constraint/index/schema/type/function/sequence/view):
     así se conservan nombres de tablas/columnas y se ocultan valores, usuarios,
@@ -57,7 +58,16 @@ _RE_IPV6_PAREN = re.compile(r"\((?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\)")
 _RE_PORT = re.compile(r"(?i)\bport\s{1,5}\d{1,6}\b")
 _IDENT_WORDS = r"relation|column|table|constraint|index|schema|type|function|sequence|view|trigger|operator|extension"
 _RE_DQ = re.compile(rf'(?i)(\b(?:{_IDENT_WORDS})\s{{1,5}})?"([^"\n]{{0,500}})"')
-_RE_SQ = re.compile(r"'[^'\n]{0,500}'")
+# Literal entre comillas simples. Solo una contracción inglesa ("Can't", "it's",
+# "we're", "I'll"…: letra + ' + t/s/d/m/re/ve/ll + fin de palabra) NO abre literal;
+# cualquier otra comilla sí, incluidos los prefijos de literal N'…', E'…', X'….
+# Dentro de un literal se admite el apóstrofo ('d'Artagnan'): el valor queda oculto.
+_RE_SQ = re.compile(
+    r"(?!(?<=[^\W\d_])'(?i:[tsdm]|re|ve|ll)\b)'(?:[^'\n]|(?<=[^\W\d_])'(?=[^\W\d_])){0,500}'")
+# Segunda pasada: una comilla de apóstrofo ("O'Brien", "users'") puede desplazar el
+# emparejamiento y dejar el valor siguiente fuera de un literal ('***'secreto').
+# Se oculta lo que quede pegado a un literal ya oculto y cerrado por otra comilla.
+_RE_SQ_TAIL = re.compile(r"'\*\*\*'(?![\s.,;:)])[^'\n]{1,500}'(?!(?i:[tsdm]|re|ve|ll)\b)")
 _RE_WS = re.compile(r"[ \t]{2,}")
 _RE_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){1,8}")
 _RE_LONG_DIGITS = re.compile(
@@ -140,6 +150,7 @@ def redact_text(text: Optional[str], secrets: Optional[Iterable[str]] = None, ma
     s = _RE_EMAIL.sub("***@***", s)
     s = _RE_DQ.sub(_dq, s)
     s = _RE_SQ.sub("'***'", s)
+    s = _RE_SQ_TAIL.sub("'***'***'", s)
     s = _RE_VALUE_LIST.sub(lambda m: f"{m.group(1)} (***)", s)
     s = _RE_PAREN_LIST.sub(_paren_list, s)
     s = _RE_BRACKET.sub(_bracket, s)

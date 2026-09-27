@@ -196,3 +196,37 @@ def test_redact_correos_digitos_corchetes_y_codigos_utiles():
         t = time.perf_counter()
         redact_text(bad)
         assert time.perf_counter() - t < 0.5
+
+
+def test_redact_apostrofos_en_texto_no_se_confunden_con_literales():
+    out = redact_text("[unixODBC][Driver Manager]Can't open lib 'ODBC Driver 17 for SQL Server' : file not found (0)")
+    assert "Can't open lib '***'" in out and "ODBC Driver 17 for SQL Server'" not in out
+    assert redact_text("It doesn't exist and can't connect") == "It doesn't exist and can't connect"
+    assert redact_text("Login failed for user 'sa'.") == "Login failed for user '***'."
+    assert "Artagnan" not in redact_text("user 'd'Artagnan' failed")
+    assert "secreto" not in redact_text("the users' table 'secreto'")
+    assert redact_text("Duplicate entry 'x@y.com' for key 'k'") == "Duplicate entry '***' for key '***'"
+
+
+def test_redact_prefijos_de_literal_y_apostrofos():
+    """N'…'/E'…'/X'…' (formato de SQL Server/Postgres) se ocultan; las contracciones no abren
+    literal y un apóstrofo que desplaza el emparejamiento no deja escapar el valor siguiente."""
+    fugas = {
+        "converting the nvarchar value N'SECRETO123' to data type int": "SECRETO123",
+        "Login failed for user N'sa_secreto'.": "sa_secreto",
+        "x E'SECRETO_E' y": "SECRETO_E",
+        "X'DEADBEEF01' z": "DEADBEEF01",
+        "value'SECRETO_V' w": "SECRETO_V",
+        "O'Brien='SECRETO_O'": "SECRETO_O",
+        "O'Brien = 'SECRETO valor' x": "SECRETO",
+        "users' table 'SECRETO_U'": "SECRETO_U",
+    }
+    for texto, secreto in fugas.items():
+        assert secreto not in redact_text(texto), texto
+    assert redact_text("Can't open lib 'ODBC Driver 17'") == "Can't open lib '***'"
+    assert redact_text("Invalid column name 'foo'. Can't find 'bar'") == \
+        "Invalid column name '***'. Can't find '***'"
+    t0 = time.time()
+    for s in ["'" * 16000, "a'" * 8000, "'***'" * 3000, "O'B='" * 3000, "Can't " * 3000]:
+        redact_text(s)
+    assert time.time() - t0 < 1.0

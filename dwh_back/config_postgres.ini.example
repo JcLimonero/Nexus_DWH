@@ -51,3 +51,49 @@ password = TU_PASSWORD_AQUI
 ; max_body_bytes = 1048576
 ; agent_max_body_bytes = 262144
 ; enroll_max_body_bytes = 16384
+
+[health]
+; Salud e incidencias (sección 18 de DWH_README.md). Todo se calcula con la
+; hora de la BD de configuración (NOW()), nunca con el reloj de los agentes.
+; Cada cuánto corre el evaluador (s). 0 = apagado (solo POST /admin/health/evaluate).
+; evaluator_interval_seconds = 30
+; Sin contacto (latido o cualquier llamada) durante este tiempo = desconectada.
+; disconnect_after_seconds = 300
+; Latido esperado del agente (s); una ejecución recién iniciada cuenta como
+; "en curso" durante 2× este valor aunque el latido aún no la liste.
+; heartbeat_expected_seconds = 60
+; Duración esperada por defecto de una tarea (s) si no está configurada en la
+; tarea y no hay >= 3 ejecuciones exitosas (se usa el p90 de las últimas N).
+; default_expected_duration_seconds = 300
+; expected_duration_history = 20
+; Tolerancia de retraso por defecto = max(delay_min_grace_seconds, schedule × delay_tolerance_factor).
+; delay_tolerance_factor = 0.5
+; delay_min_grace_seconds = 300
+; Ejecución prolongada si dura más de max(esperada × factor, esperada + tolerancia).
+; running_long_factor = 3.0
+; Tras arrancar el backend no se abren desconexiones durante este tiempo (s)
+; (si el caído era Nexus, los agentes necesitan un latido). -1 = disconnect_after_seconds.
+; startup_grace_seconds = -1
+; Retención del historial (días; 0 = sin purga). Nunca se borran la última ejecución ni la
+; última carga exitosa de cada tarea, ni las referenciadas por incidencias abiertas.
+; execution_retention_days = 180
+; De incidencias resueltas hace más de N días se borran los eventos secundarios.
+; incident_event_retention_days = 365
+
+[notifications]
+; Entrega de notificaciones externas (webhook/log) con reintentos.
+; Cada cuánto revisa el outbox (s). 0 = apagado.
+; worker_interval_seconds = 10
+; Intentos máximos por entrega y backoff exponencial (s).
+; max_attempts = 8
+; backoff_base_seconds = 30
+; backoff_max_seconds = 3600
+; Permitir webhooks http:// (solo desarrollo/pruebas locales). Por defecto solo https://.
+; allow_http = false
+; Anti-SSRF: rechaza destinos que resuelven a IPs privadas, loopback, link-local
+; (169.254/16, fe80::/10), CGNAT, multicast o reservadas (al guardar y en cada envío).
+; block_private_ips = true
+; Una entrega "enviando" más vieja que esto se reintenta (proceso caído a mitad del envío).
+; sending_stale_seconds = 300
+; Días que se conserva el registro de entregas terminadas (el historial de incidencias no se purga).
+; retention_days = 30

@@ -189,6 +189,7 @@ Los **clientes ETL** reciben el valor **ya descifrado** por HTTPS. La seguridad 
 - `main_postgres.py` — Servidor (**PostgreSQL**). Además expone `/agency-configs`, `/group-configs`.
 - `admin_postgres.py` — API de administración `/admin/*` (CRUD de la configuración; la monta `main_postgres.py`).
 - `agent_postgres.py` — API del agente por instalación `/agent/*`, `/admin/installations|executions|sync-state|legacy-clients` y `/monitor/installations` (sección 17).
+- `health_postgres.py` — salud, incidencias y notificaciones: evaluador periódico, ganchos de incidencias del API del agente, `/admin/health/*`, `/admin/incidents*`, `/admin/notification-*` (sección 18).
 - `redact.py` — saneamiento de textos del backend (errores, detalle de eventos, logs).
 - `schema_postgres.sql` — esquema **base idempotente** de la BD de configuración PostgreSQL.
 - `migrate.py` + `migrations/NNN_*.sql` — migraciones ordenadas (sección 17.8).
@@ -589,10 +590,11 @@ Panel de administración en **Next.js 14 (App Router) + TypeScript + Tailwind**,
 
 ### 16.1. Qué permite
 
-- **Dashboard**: conteos (grupos, empresas, agencias, tareas), estado por cliente ETL (`/monitor/clients`: última conexión, última ejecución, errores pendientes) y últimos errores sin reconocer.
+- **Dashboard**: conteos (grupos, empresas, agencias, tareas), **resumen de salud** (instalaciones por conectividad, tareas por estado, incidencias abiertas por severidad) y las incidencias abiertas más relevantes; estado por cliente ETL (`/monitor/clients`) y últimos errores sin reconocer (eventos legados).
+- **Salud**, **Incidencias** y **Notificaciones**: ver sección 18. El menú muestra un contador de incidencias abiertas **sin reconocer** (rojo si hay críticas/errores; se consulta cada 30 s).
 - **Grupos / Empresas / Agencias**: alta, edición, baja, habilitar/deshabilitar; tokens con mostrar/copiar/regenerar (y revocar en grupo/agencia); contraseñas de **solo escritura**.
 - **Catálogo de objetos**: tabla destino, `create_table_sql`, `upsert_keys`, constraint y `static_columns` (editores monoespaciados).
-- **Tareas**: por agencia, `extract_sql`, `schedule_seconds` (con atajos), activa, modo empresa (`run_on_company_token`), última ejecución y reinicio de `last_run_at`; filtros por grupo/empresa/agencia.
+- **Tareas**: por agencia, `extract_sql`, `schedule_seconds` (con atajos), activa, modo empresa (`run_on_company_token`), duración esperada y tolerancia de retraso (opcionales, sección 18), última ejecución y reinicio de `last_run_at`; filtros por grupo/empresa/agencia.
 - **Eventos**: `/monitor/events` con filtros, reconocer uno o todos.
 - **Actividad**: `/monitor/activity` (log HTTP).
 - **Instalaciones**: agentes enrolados (alcance, estado, último contacto con semáforo, versión, cola, fallos 24 h), acciones **Rotar credencial** y **Revocar**; debajo, **clientes legados** que aún usan tokens.
@@ -741,12 +743,12 @@ Hilo independiente con su propia sesión HTTP: cada `heartbeat_seconds` (defecto
 
 - Motor común: `dwh_back/redact.py`, copiado tal cual en `dwh_client/nexus_agent/redact_core.py` (una prueba verifica que sean idénticos). Contra ReDoS: la entrada se recorta a 16 KB **antes** de sanear, todas las expresiones usan cuantificadores acotados sobre clases negadas y el SQL se detecta con búsqueda lineal; en el backend el saneamiento del middleware corre en el threadpool, nunca en el event loop.
 - Enfoque **conservador** (puede ocultar información útil; es a propósito):
-  - se ocultan **todos** los literales entre comillas simples y los literales entre comillas dobles, salvo los que siguen a una palabra de identificador (`relation`, `column`, `table`, `constraint`, `index`, `schema`, `type`, `function`…): se conservan nombres de tablas/columnas/constraints y se ocultan valores (`invalid input syntax for type integer: "***"`), usuarios (`Login failed for user '***'`), `Duplicate entry '***'`, `converting the varchar value '***'`, nombres de objeto de SQL Server entre comillas simples, etc.;
+  - se ocultan **todos** los literales entre comillas simples (una comilla precedida por una letra —apóstrofo de `Can't`, `doesn't`— no abre literal, así el texto en inglés no se desfigura) y los literales entre comillas dobles, salvo los que siguen a una palabra de identificador (`relation`, `column`, `table`, `constraint`, `index`, `schema`, `type`, `function`…): se conservan nombres de tablas/columnas/constraints y se ocultan valores (`invalid input syntax for type integer: "***"`), usuarios (`Login failed for user '***'`), `Duplicate entry '***'`, `converting the varchar value '***'`, nombres de objeto de SQL Server entre comillas simples, etc.;
   - listas de valores entre paréntesis (`Key (col)=(***)`, `Failing row contains (***)`, `The duplicate key value is (***)` y cualquier paréntesis con comas o `@`);
   - SQL también **multilínea**: desde `select…from`, `insert…into`, `update…set`, `delete…from`, `with…as`, `merge…into`, `create/alter…`, `exec …` hasta el **final** del mensaje;
   - líneas `DETAIL/LINE/HINT/QUERY/CONTEXT/WHERE`, pares `clave=valor` de conexión/DSN, URLs con credenciales, IPs, puertos y los valores sensibles conocidos (credenciales recibidas de Nexus, tokens, secreto de la instalación).
   - además, en cualquier parte del texto: correos electrónicos, secuencias de ≥ 9 dígitos (y formatos de tarjeta `dddd dddd dddd d…` y teléfono `dd dddd dddd`) y valores entre corchetes `[...]`, salvo la cadena de drivers ODBC y los SQLSTATE (`[Microsoft][ODBC Driver 17 for SQL Server][42S02]`). Se conserva el código numérico inicial de MySQL: `(1062, ***)`. Fechas y horas no se tocan.
-  - **Límites residuales**: no se detectan valores de negocio "desnudos" (sin comillas, paréntesis ni corchetes y sin formato reconocible), por ejemplo pares `campo=valor` de negocio cuya clave no es de conexión (`rfc=XAXX…`), fragmentos de filas tipo CSV (`A123;Juan;XAXX…`), teléfonos con espacios o guiones (`+52 (55) 1234-5678`), números de menos de 9 dígitos o nombres sueltos. Los códigos entre corchetes que no son SQLSTATE (p. ej. `[2002]` de MySQL) también se ocultan. Por eso además no se envían filas, SQL ni credenciales en ningún payload (lista negra de claves en la cola local) y los mensajes se recortan a 500/1000 caracteres.
+  - **Límites residuales**: no se detectan valores de negocio "desnudos" (sin comillas, paréntesis ni corchetes y sin formato reconocible), por ejemplo pares `campo=valor` de negocio cuya clave no es de conexión (`rfc=XAXX…`), fragmentos de filas tipo CSV (`A123;Juan;XAXX…`), teléfonos con espacios o guiones (`+52 (55) 1234-5678`), números de menos de 9 dígitos o nombres sueltos. Tampoco una comilla sin cerrar (`abc'VALOR`) ni combinaciones artificiales de apóstrofos y contracciones (`O'Brien='xt't`): es el límite de un enfoque sin parser SQL. Los códigos entre corchetes que no son SQLSTATE (p. ej. `[2002]` de MySQL) también se ocultan. Por eso además no se envían filas, SQL ni credenciales en ningún payload (lista negra de claves en la cola local) y los mensajes se recortan a 500/1000 caracteres.
 - Agente: `nexus_agent/sanitize.py` → `sanitize_error(exc)` devuelve `(error_code, mensaje)`. Códigos estables con prefijo de lado (`SOURCE_…`/`DWH_…`): `CONNECTION_FAILED`, `CONNECT_TIMEOUT`, `AUTH_FAILED`, `QUERY_TIMEOUT`, `LOCK_TIMEOUT`, `SQL_ERROR`, `CONSTRAINT_VIOLATION`, `DATA_ERROR`, `DATABASE_NOT_FOUND`, `DRIVER_NOT_FOUND`, `DB_ERROR`, `UNEXPECTED_ERROR`; además `CANCELLED`, `CONFIG_ERROR`, `AGENT_RESTARTED`, `AGENT_RESTARTED_COMMIT_UNKNOWN`, `OUT_OF_MEMORY`. El mensaje pasa por el motor común descrito arriba; longitud ≤ 500. Se usa en los reportes **y** en todos los logs (`RedactingFormatter`, incluidas trazas).
 - Backend: `redact.py` aplica lo mismo (defensa en profundidad; el detalle legado se recorta a 16 KB antes y a 4000 caracteres después) al detalle de `/client-event`, a los mensajes de ejecución (además con las credenciales del alcance), a `activity_log.error_detail` y a los logs del servidor.
 
@@ -760,6 +762,8 @@ Hilo independiente con su propia sesión HTTP: cada `heartbeat_seconds` (defecto
   - `002_instalaciones`: `installation`, `installation_heartbeat`, `agent_event`, `task_download_log`.
   - `003_ejecuciones_y_sync`: `agency_task.query_version`/`query_hash` + trigger, `task_execution`, `task_sync_state`.
   - `004_rotacion_y_limites`: `installation.pending_secret_enc` (re-entrega idempotente de la rotación).
+  - `005_salud_incidencias`: `agency_task.expected_duration_seconds`/`delay_tolerance_seconds`, `task_health_state`, `incident` (+ índice único parcial: una abierta por clave), `incident_event`, `notification_channel`, `notification_outbox` (sección 18). Solo crea tablas/columnas nuevas: rápida y compatible con BD existentes.
+  - `006_indices_salud`: índices de expresión/parciales de `task_execution` para el modelo de salud y la retención (sección 18.3.1).
 - **Ojo con `001` en BD grandes**: hace `UPDATE` masivos sobre `activity_log` y `client_events` (relleno de ids y recorte de tokens) en una sola transacción: puede tardar y generar mucho WAL/bloqueos si `activity_log` es grande. Recomendado: purgar/archivar `activity_log` antiguo antes, ejecutarla en ventana de mantenimiento y con respaldo.
 - Compatibles con BD existentes (probado sobre una copia de la BD de desarrollo y sobre una BD "legada" creada en las pruebas).
 
@@ -804,3 +808,152 @@ cd dwh_client && .venv/bin/python -m pytest tests -q
 ```
 
 `dwh_back/tests` (`test_agent_api.py`, `test_hardening.py`): DoS/ReDoS con tiempos acotados y `/health` sin bloqueo, límites de cuerpo (413) y de campos (422 sin eco del valor), fugas de drivers en el saneamiento, watermark fuera de rango o de otro reloj, rotación sin cadena de secuestro, migraciones (idempotencia y BD legada), enrolamiento y alcance, autenticación, aislamiento entre grupos (403), idempotencia y máquina de estados de ejecuciones, eventos fuera de orden, saneamiento en servidor, reinicio de watermark, `query_version`, revocación, rotación con gracia, heartbeat/monitor, compatibilidad legada (403 fuera de alcance, prioridad de tokens, endpoints desactivables), `activity_log` sin tokens. `dwh_client/tests/test_units.py`: saneamiento, cola (secuencia, persistencia, backoff, saturación, retención, checkpoints), credenciales (0600 / DPAPI simulado), URL/TLS, watermark, orden de envío, agenda persistente, reintentos. `dwh_client/tests/test_integration.py`: backend + origen + DWH reales (enrolar → ejecutar → verificar filas/ejecución/sync; origen caído y recuperado; DWH caído y recuperado; Nexus caído con cola que crece y se vacía sin duplicados y sin recargar; config caducada; violación de restricción sin carga parcial; SQL inválido; tabla sin claves; heartbeat durante tarea larga con `pg_sleep`; `SIGKILL` a mitad de carga → sin COMMIT ni avance de watermark y re-ejecución idempotente; credencial revocada → salida 3; y búsqueda de SQL/secretos en logs, BD de Nexus y SQLite local).
+
+---
+
+## 18. Salud, incidencias y notificaciones (PostgreSQL)
+
+Módulo `dwh_back/health_postgres.py` (motor + API) y páginas del panel **Salud**, **Incidencias** y **Notificaciones**. Requiere la migración `005_salud_incidencias`. Reutiliza lo que ya existía: `installation.last_seen_at` (cualquier llamada autenticada del agente), el latido de 60 s (`installation_heartbeat`, `last_heartbeat.running`), `task_execution`, `task_sync_state` y `agent_event`. El Dashboard, Eventos y `/monitor/*` legados siguen igual.
+
+### 18.1. Modelo de salud
+
+Todas las fechas y comparaciones se calculan en el **servidor** con la hora de la BD de configuración (`NOW()`); se guardan en UTC y el panel las muestra en `NEXT_PUBLIC_DWH_TIMEZONE` con la zona explícita. El watermark es la excepción: está en el reloj del origen/agente y se muestra **sin zona** (tal cual).
+
+**Instalación** (`GET /admin/health/installations`):
+
+| Dato | Origen |
+|---|---|
+| Último contacto | `installation.last_seen_at` (latido o cualquier llamada autenticada) |
+| Último latido | `MAX(installation_heartbeat.received_at)` |
+| Última ejecución / última carga exitosa | `task_execution` de esa instalación |
+| Cola, apartados, descartes, tareas en curso | último latido |
+| Conectividad | `online` (contacto ≤ `disconnect_after_seconds`), `offline`, `revoked`, `scope_disabled`, `never` |
+
+**Tarea** (`GET /admin/health/tasks`): activa efectiva (tarea + agencia + objeto + empresa + grupo habilitados), última ejecución (estado, código de error, filas), **última carga exitosa** (incluye cargas de **0 filas**: no son falla), **punto de sincronización confirmado** (`task_sync_state.watermark` + tipo de reloj), **error actual** y **errores consecutivos** (de `task_sync_state`, que ya respeta el orden de los eventos), ejecución **en curso** (confirmada por el latido) y plazos. Estado único para el panel:
+
+| Estado | Regla (en este orden) |
+|---|---|
+| `disabled` | no está activa efectivamente (nunca genera alerta de retraso) |
+| `running` | hay una ejecución `running` de una instalación **en línea**, confirmada por su último latido (o iniciada hace < 2× `heartbeat_expected_seconds`). El último latido de una instalación muerta **no** mantiene la tarea en curso ni suprime el retraso |
+| `failing` | la ejecución más reciente (según `agent_seq`/`started_at`) falló o se interrumpió, **o** hay una incidencia `task_failed` abierta para la tarea en **cualquier** instalación (`task_sync_state` es una fila por tarea: el éxito de otra instalación no "cura" la falla). El desglose va en `failing_installations` (instalación, código, ocurrencias, reconocida) y el panel lo muestra bajo *Error actual* |
+| `delayed` | `NOW() > referencia + schedule_seconds + duración esperada + tolerancia` |
+| `never_run` | sin ejecuciones y aún dentro del plazo |
+| `ok` | lo demás |
+
+Además se devuelven los indicadores `delayed`, `failing`, `running`, `running_long` por separado (una tarea puede estar fallando **y** retrasada).
+
+- **Referencia del retraso** = la mayor entre la última carga exitosa y `task_health_state.active_since` (momento en que el evaluador vio la tarea pasar a activa efectiva: al habilitar una tarea, agencia, empresa, grupo u objeto hay un plazo completo de gracia; tras migrar, la gracia empieza en la primera evaluación).
+- **Hora de la última carga exitosa** = `LEAST(finished_at del agente, hora de recepción del servidor)`: un reloj del agente adelantado no puede ocultar un retraso, y una carga reportada tarde (Nexus caído) conserva su hora real.
+- **Duración esperada**: `agency_task.expected_duration_seconds` si está configurada; si no, el **p90** de las últimas `expected_duration_history` (20) ejecuciones exitosas cuando hay al menos 3; si no, `default_expected_duration_seconds` (300).
+- **Tolerancia**: `agency_task.delay_tolerance_seconds` o `max(delay_min_grace_seconds, schedule × delay_tolerance_factor)` (300 s / 0.5).
+- **Ejecución prolongada**: en curso más de `max(esperada × running_long_factor, esperada + tolerancia)`. Mientras una tarea está en curso no se marca retrasada.
+
+### 18.2. Incidencias
+
+Tabla `incident` (+ historial `incident_event`). Categorías:
+
+| Categoría | Severidad | Se abre | Se resuelve (solo con evidencia) |
+|---|---|---|---|
+| `disconnected` | crítica | el **evaluador de Nexus** ve la instalación activa sin contacto > `disconnect_after_seconds` (el agente desconectado no puede avisar) | al recibir un **latido** (`heartbeat_recovered`) o si el evaluador ve contacto reciente (`contact_recovered`). **No toca** las incidencias de tareas |
+| `task_failed` | error (interrumpida: advertencia) | fin de ejecución `failed`/`interrupted` | una **carga confirmada** (`success`, también con 0 filas) de **esa tarea en esa instalación**, más nueva que la última falla (`load_confirmed`). No resuelve otras tareas |
+| `task_delayed` | advertencia | evaluador: tarea activa, no en curso, pasado el plazo | carga confirmada que deja la tarea al día (`load_confirmed`); si deja de estar retrasada sin carga nueva (se cambiaron umbrales): `thresholds_changed` |
+| `task_running_long` | advertencia | evaluador: ejecución en curso más allá del límite | fin de esa ejecución (`execution_finished`) |
+| `checkpoint_kind_mismatch` | advertencia | aviso `CHECKPOINT_KIND_MISMATCH` de la fase 1 (el watermark no avanza) | un checkpoint aceptado (`checkpoint_applied`) o **Reiniciar última ejecución** (`watermark_reset`) |
+| `queue_dead_letter` / `queue_overflow` | advertencia / error | eventos `dead_letter` / `queue_overflow` del agente | **no hay evidencia automática** (lo apartado/descartado no vuelve): se cierran **manualmente con motivo obligatorio** (`manual`) |
+
+Reglas:
+
+- **Agrupación**: `dedup_key = categoría | instalación | tarea` (`task_delayed` es por tarea, sin instalación). Solo puede haber **una abierta** por clave (índice único parcial; `INSERT … ON CONFLICT DO NOTHING` + reintento, seguro con concurrencia). Una recurrencia suma `occurrences`, actualiza última ocurrencia, último código/mensaje saneado y el contador por código (`details.error_codes`), **sin volver a notificar**. Las condiciones continuas (desconexión, retraso, ejecución prolongada) no suman ocurrencias por ciclo del evaluador. Tras resolverse, una nueva falla abre **otra** incidencia (la anterior queda en el historial).
+- Se guarda primera ocurrencia (`opened_at`), última (`last_seen_at`), contador, primera/última ejecución relacionada, `resolved_at`, motivo, ejecución que la resolvió y `duration_seconds`.
+- **Reconocida ≠ resuelta**: `PUT /admin/incidents/{id}/ack` (comentario opcional) solo llena `acknowledged_at/by/ack_comment`; la incidencia sigue **abierta** y el estado técnico (salud de la tarea/instalación, error actual) se sigue mostrando. Una recurrencia no borra el reconocimiento. `acknowledged_by` es texto (`admin` hasta la fase de usuarios/RBAC).
+- **Cierre manual** (`PUT /admin/incidents/{id}/resolve`, motivo obligatorio) solo para `queue_dead_letter` y `queue_overflow`; para las demás responde **409**: se resuelven solas con evidencia.
+- **Eventos fuera de orden**: el orden de la evidencia es el `agent_seq` de **inicio** de la ejecución (el mismo criterio de `task_sync_state`), nunca la hora de llegada. Una falla vieja que llega después de un éxito más nuevo **no** abre incidencia; un éxito viejo que llega después de una falla más nueva **no** la resuelve (queda en el historial como `late_evidence_ignored`).
+- **Cierres administrativos** (motivo explícito, no son recuperación): tarea deshabilitada (o su agencia/empresa/grupo/objeto) → `task_disabled` para todas sus incidencias; tarea borrada → `task_deleted`; instalación revocada → `installation_revoked`; instalación borrada → `installation_deleted`; alcance deshabilitado → `scope_disabled` (desconexión).
+- **Sin doble alerta**: mientras la tarea tenga una `task_failed` abierta (en cualquier instalación) no se abre además `task_delayed`: la falla ya lo cubre. Un retraso que ya estaba abierto se conserva hasta que haya carga confirmada.
+- **Relleno inicial**: el evaluador abre `task_failed` (con `details.backfilled = true`) para tareas que ya estaban fallando antes de la migración y nunca tuvieron incidencia para su clave.
+- Los ganchos de incidencias corren en la **misma transacción** que el reporte del agente, dentro de un `SAVEPOINT`: un error del motor se registra en el log y **nunca** tumba el reporte.
+
+**Evaluador periódico**: hilo del backend cada `evaluator_interval_seconds` (30 s; también `POST /admin/health/evaluate`). Cada instalación, tarea e incidencia se procesa en su propio `SAVEPOINT` y cada fase (instalaciones, tareas, relleno, huérfanas, recordatorios) está aislada: un error se revierte solo para ese elemento/fase, se registra en el log solo con el tipo de error y el resto del ciclo continúa; la respuesta incluye `errors` y `failed_phases`. Usa un **advisory lock de sesión** (`pg_try_advisory_lock`): con varias réplicas o llamadas simultáneas solo una evalúa (las demás responden `ran: false`). Bloquea las filas de `installation` candidatas (`FOR UPDATE SKIP LOCKED`) y re-verifica `last_seen_at`, así que un latido concurrente espera y luego resuelve. Durante `startup_grace_seconds` (por defecto = `disconnect_after_seconds`) tras arrancar el backend **no abre desconexiones**: si el caído era Nexus, los agentes necesitan un latido para volver a verse.
+
+### 18.3. Notificaciones
+
+- **Alertas del panel** siempre activas (menú Incidencias con contador, Dashboard). No había canal externo previo; se agregó una interfaz configurable (`notification_channel`), vacía por defecto: **no se envía nada** hasta que un administrador configure un canal.
+- **Solo transiciones**: apertura (`incident.opened`), resolución (`incident.resolved`) y, opcionalmente por canal, un **recordatorio** cada `reminder_interval_minutes` mientras siga abierta y **sin reconocer** (`incident.reminder`). Nunca una por ciclo ni por recurrencia.
+- **Outbox transaccional** (`notification_outbox`): la notificación se encola en la misma transacción que la transición. Un hilo del backend (`worker_interval_seconds`) la reclama con `FOR UPDATE SKIP LOCKED`, envía fuera de la transacción y registra el resultado; reintentos con backoff exponencial (`backoff_base_seconds × 2^(n-1)`, tope `backoff_max_seconds`) hasta `max_attempts` → `failed` (+ evento `notification_failed` en la incidencia). Entrega **al menos una vez**: si el proceso muere a mitad de un envío, la fila `sending` se reintenta tras `sending_stale_seconds`; el receptor debe descartar repetidos por `X-Nexus-Delivery` (clave `incident-<id>-<transición>`, única por canal).
+- **Filtros por canal**: severidad mínima, grupo (o todos), categorías (vacío = todas), apertura/resolución.
+- **Emisores**: `webhook` y `log` (solo escribe en el log del servidor; para desarrollo). La interfaz es un registro (`SENDERS`) para agregar otros (correo, Teams…).
+- **Anti-SSRF** (`[notifications] block_private_ips = true` por defecto): al guardar el canal **y** justo antes de cada envío se resuelve el host y se rechaza si alguna IP es de loopback, privada (10/8, 172.16/12, 192.168/16, fc00::/7), link-local (169.254/16 —metadatos de nube—, fe80::/10), CGNAT (100.64/10), multicast, reservada o no especificada (también IPv4 mapeada en IPv6). El envío bloqueado queda como error `Destino bloqueado o no resoluble` (reintentos normales). Solo las pruebas lo desactivan (receptor en 127.0.0.1). Riesgo residual: entre la verificación y la conexión el DNS podría cambiar (DNS rebinding de ventana muy corta); para destinos internos legítimos use un proxy/relé público controlado.
+- **Webhook**: `POST` JSON, sin redirecciones, timeout y verificación TLS por canal, solo `https://` salvo `[notifications] allow_http = true`; se rechazan URLs con usuario/contraseña. Cabeceras: `X-Nexus-Event`, `X-Nexus-Delivery`, `X-Nexus-Timestamp` (epoch s) y, si hay secreto, `X-Nexus-Signature: sha256=<hex>` con `HMAC-SHA256(secreto, "<timestamp>." + cuerpo)`. Verificación en el receptor: recalcular el HMAC sobre los bytes recibidos, comparar en tiempo constante y rechazar timestamps viejos (p. ej. > 5 min).
+- **Payload** (sin SQL, sin credenciales; mensaje ya saneado):
+  ```json
+  {"event": "incident.opened", "delivery_id": "incident-42-opened", "generated_at": "…Z",
+   "incident": {"id": 42, "category": "task_failed", "category_label": "Falla de tarea", "severity": "error",
+                "status": "open", "title": "…", "installation": {"id": "…", "name": "…"},
+                "scope": {"group": "…", "company": "…", "agency": "…", "object": "…", "task_id": 7},
+                "opened_at": "…Z", "last_seen_at": "…Z", "occurrences": 1, "last_error_code": "SOURCE_CONNECTION_FAILED",
+                "message": "…", "resolved_at": null, "resolution_reason": null, "duration_seconds": null,
+                "acknowledged": false}}
+  ```
+- **Secretos**: la URL (puede llevar un token, p. ej. webhooks de Slack/Teams) y el secreto de firma se guardan cifrados (`ENC:` Fernet con `config_secret_key`) y son de **solo escritura**: la API y el panel muestran solo `esquema://host/…`, `has_url`, `has_secret`. Sin `config_secret_key` se guardan en claro y el panel lo advierte. Los errores de entrega guardan solo `HTTP <código>` o el tipo de excepción (nunca la URL ni el cuerpo de la respuesta).
+- **Probar canal**: `POST /admin/notification-channels/{id}/test` envía un evento `test` (sin incidencia real) y devuelve el resultado.
+
+### 18.3.1. Retención
+
+La hace el notificador **y** el evaluador (como máximo una vez por hora por proceso; basta con que uno de los dos hilos esté activo):
+
+- `notification_outbox`: entregas terminadas más viejas que `[notifications] retention_days` (30).
+- `task_execution`: filas con `received_at` más viejo que `[health] execution_retention_days` (180; 0 = sin purga), por lotes de 5000. **Nunca** se borran: la última ejecución y la última carga exitosa de cada tarea, la referenciada por `task_sync_state`, las referenciadas por incidencias **abiertas** ni las que siguen `running`.
+- `incident_event`: de incidencias **resueltas** hace más de `[health] incident_event_retention_days` (365; 0 = sin purga) se borran los eventos secundarios (recurrencias, notificaciones…); se conservan apertura, reconocimiento y resolución. Las incidencias no se purgan.
+- La migración `006_indices_salud` agrega índices de expresión/parciales sobre `task_execution` para que las consultas de salud y la retención no recorran la tabla completa.
+
+### 18.4. API
+
+| Método y ruta | Uso |
+|---|---|
+| `GET /admin/health/summary` | Conteos: instalaciones por conectividad, tareas por estado, incidencias abiertas por severidad, sin reconocer, resueltas 24 h |
+| `GET /admin/health/installations` | Filtros `group_id`, `company_id`, `agency_id`, `connectivity` |
+| `GET /admin/health/tasks` | Filtros `group_id`, `company_id`, `agency_id`, `task_id`, `state` |
+| `GET /admin/health/settings` | Umbrales vigentes |
+| `POST /admin/health/evaluate` | Ejecuta un ciclo del evaluador ahora |
+| `GET /admin/incidents` | Filtros `view=active|acknowledged|resolved|open`, `status`, `acknowledged`, `category`, `severity`, `group_id`, `company_id`, `agency_id`, `task_id`, `installation_id`, `since`, `until`, `limit` |
+| `GET /admin/incidents/badge` | Abiertas sin reconocer / abiertas / graves sin reconocer |
+| `GET /admin/incidents/{id}` | Detalle + historial + ejecuciones relacionadas + entregas + estado técnico actual |
+| `PUT /admin/incidents/{id}/ack` | Reconocer (`{"comment": "…"}`) |
+| `PUT /admin/incidents/{id}/resolve` | Cierre manual con `{"reason": "…"}` (solo cola local) |
+| `GET/POST /admin/notification-channels`, `PUT/DELETE /admin/notification-channels/{id}` | Canales (`url` y `signing_secret` solo escritura; en PUT `signing_secret: ""` lo quita y `group_id: 0` = todos los grupos) |
+| `POST /admin/notification-channels/{id}/test` | Envío de prueba |
+| `GET /admin/notification-deliveries` | Registro de entregas (filtros `channel_id`, `incident_id`, `status`) |
+
+`POST/PUT /admin/tasks` aceptan además `expected_duration_seconds` y `delay_tolerance_seconds` (null = automático).
+
+### 18.5. Panel
+
+- **Salud**: tabla de instalaciones (conectividad, último contacto, última ejecución, última carga exitosa, cola/apartados/descartes, incidencias abiertas) y de tareas (estado, última ejecución, última carga exitosa con filas, punto de sincronización confirmado con su tipo de reloj, error actual, errores consecutivos, plazos y de dónde sale la duración esperada). Filtros por grupo/empresa/agencia, conectividad y estado; se actualiza cada 30 s. Aclara que conectividad ≠ éxito del ETL.
+- **Incidencias**: pestañas **Activas** (abiertas sin reconocer), **Reconocidas** (abiertas revisadas) y **Resueltas**; filtros por alcance, categoría y severidad; cada fila muestra por separado el estado técnico (Abierta/Resuelta) y el reconocimiento. Detalle con primera/última ocurrencia, contador, duración, último mensaje saneado, **estado técnico actual**, ejecuciones relacionadas, historial y entregas; acciones **Reconocer** (comentario) y, solo en categorías de cola, **Cerrar con motivo**.
+- **Notificaciones**: alta/edición/baja de canales, **Enviar prueba** y registro de entregas.
+- **Tareas**: campos opcionales *Duración esperada* y *Tolerancia de retraso*.
+
+### 18.6. Variables nuevas
+
+Backend `[health]`: `evaluator_interval_seconds`, `disconnect_after_seconds`, `heartbeat_expected_seconds`, `default_expected_duration_seconds`, `expected_duration_history`, `delay_tolerance_factor`, `delay_min_grace_seconds`, `running_long_factor`, `startup_grace_seconds`. `[notifications]`: `worker_interval_seconds`, `max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`, `allow_http`, `sending_stale_seconds`, `retention_days` (registro de entregas), `block_private_ips`; `[health]` además `execution_retention_days`, `incident_event_retention_days`. Valores por defecto y explicación en `dwh_back/config_postgres.ini.example`. El agente no cambia (ya envía el latido cada 60 s con las ejecuciones en curso).
+
+### 18.7. Limitaciones conocidas
+
+- La detección tiene la **granularidad del evaluador**: una desconexión se abre entre `disconnect_after_seconds` y `disconnect_after_seconds + evaluator_interval_seconds` después del último contacto (más la gracia de arranque si Nexus se reinició).
+- `task_failed` se agrupa **por instalación**: si dos instalaciones ejecutan la misma tarea, el éxito de una no resuelve la falla de la otra (es intencional: la otra sigue rota). El retraso sí es por tarea.
+- Deshabilitar una tarea cierra sus incidencias con `task_disabled` (no es recuperación; el historial lo indica).
+- Los clientes **legados** (v3/v4, tokens) no generan incidencias: su visibilidad sigue siendo Eventos / Dashboard / Clientes legados.
+- Umbrales globales + por tarea; no hay umbrales por instalación ni horarios de mantenimiento/silencio.
+- `/monitor/clients` agrega `last_seen_utc` / `last_execution_utc` (ISO UTC, aditivos) para que el Dashboard muestre la zona; las columnas legadas son `TIMESTAMP` sin zona y se interpretan en la zona de la sesión de la BD.
+- Entrega de notificaciones **al menos una vez** (el receptor debe deduplicar por `X-Nexus-Delivery`). Sin canales configurados, solo hay alertas en el panel.
+- `acknowledged_by`/`resolved_by` = `admin` hasta la fase de usuarios (RBAC); las consultas ya aceptan `group_id` para el aislamiento por grupo de esa fase.
+
+### 18.8. Pruebas
+
+```
+cd dwh_back   && .venv/bin/python -m pytest tests -q          # incluye tests/test_health.py
+cd dwh_client && .venv/bin/python -m pytest tests -q          # incluye tests/test_health_integration.py
+```
+
+- `dwh_back/tests/test_health.py` (BD propia, evaluador manual, receptor webhook **local**): agrupación de recurrencias con una sola notificación y firma HMAC verificada; recuperación solo de su tarea; éxito con 0 filas; eventos fuera de orden (no reabren ni resuelven); desconexión detectada por Nexus y latido que no cierra errores de tareas; reconocer ≠ resolver (409 al cerrar a mano); retraso por periodicidad, tarea deshabilitada sin alerta y cierre `task_disabled`, gracia al rehabilitar; ejecución en curso y prolongada; `checkpoint_kind_mismatch` (resuelta por checkpoint y por reinicio del watermark); dead-letter con cierre manual con motivo; revocación; advisory lock; reintentos con backoff (500, 500, 200) y fallo definitivo; secretos de canal cifrados y de solo escritura; relleno de fallas previas a la migración; modelo de salud sin SQL; evaluador que aísla fallos por instalación y por fase (fallas inyectadas con triggers); latido viejo de una instalación muerta que no deja la tarea "en curso"; falla abierta en otra instalación que mantiene la tarea con error y sin doble alerta de retraso; anti-SSRF (IPs privadas/metadatos al guardar y al enviar); canal borrado a mitad del envío; retención del outbox desde el notificador y del historial de ejecuciones/eventos sin borrar lo protegido.
+- `dwh_client/tests/test_health_integration.py` (backend + origen + DWH reales, evaluador cada 1 s, desconexión a 10 s): DMS caído → incidencia `SOURCE_*` y recuperación que la resuelve (con notificaciones de apertura y resolución); DWH caído/recuperado; **Nexus caído** más que el umbral con la cola guardando falla + éxito → al volver se aplican en orden (abre y resuelve) y **no** se marca desconectado a un agente vivo; **agente muerto** (`SIGKILL`) → Nexus abre `disconnected`, reconocerla no la resuelve, al volver el agente se resuelve la desconexión pero la falla de la tarea sigue abierta; tarea larga (~15 s, > umbral) con latidos → en curso confirmada por latido, sin desconexión.

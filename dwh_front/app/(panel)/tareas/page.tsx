@@ -21,6 +21,8 @@ interface FormState {
   schedule_seconds: string;
   is_active: boolean;
   run_on_company_token: boolean;
+  expected_duration_seconds: string;
+  delay_tolerance_seconds: string;
 }
 
 const EMPTY: FormState = {
@@ -30,7 +32,16 @@ const EMPTY: FormState = {
   schedule_seconds: "3600",
   is_active: true,
   run_on_company_token: true,
+  expected_duration_seconds: "",
+  delay_tolerance_seconds: "",
 };
+
+/** "" → null (valor automático); si no, entero ≥ min o NaN. */
+function optInt(v: string, min: number): number | null {
+  if (!v.trim()) return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= min ? n : NaN;
+}
 
 const PRESETS = [
   { label: "5 min", value: 300 },
@@ -96,6 +107,8 @@ export default function TareasPage() {
       schedule_seconds: String(t.schedule_seconds),
       is_active: t.is_active,
       run_on_company_token: t.run_on_company_token,
+      expected_duration_seconds: t.expected_duration_seconds != null ? String(t.expected_duration_seconds) : "",
+      delay_tolerance_seconds: t.delay_tolerance_seconds != null ? String(t.delay_tolerance_seconds) : "",
     });
     setOpen(true);
   }
@@ -106,6 +119,10 @@ export default function TareasPage() {
     if (!form.agency_id || !form.object_catalog_id) return toast.error("Selecciona agencia y objeto.");
     if (!Number.isInteger(sched) || sched < 10) return toast.error("La programación debe ser un entero ≥ 10 segundos.");
     if (!form.extract_sql.trim()) return toast.error("El SQL de extracción es obligatorio.");
+    const expected = optInt(form.expected_duration_seconds, 1);
+    const tolerance = optInt(form.delay_tolerance_seconds, 0);
+    if (Number.isNaN(expected)) return toast.error("La duración esperada debe ser un entero ≥ 1 (o vacía = automática).");
+    if (Number.isNaN(tolerance)) return toast.error("La tolerancia debe ser un entero ≥ 0 (o vacía = automática).");
     const body = {
       agency_id: Number(form.agency_id),
       object_catalog_id: Number(form.object_catalog_id),
@@ -113,6 +130,8 @@ export default function TareasPage() {
       schedule_seconds: sched,
       is_active: form.is_active,
       run_on_company_token: form.run_on_company_token,
+      expected_duration_seconds: expected,
+      delay_tolerance_seconds: tolerance,
     };
     setSaving(true);
     const res = await run<Task>("save", editing ? `admin/tasks/${editing.id}` : "admin/tasks", {
@@ -304,6 +323,22 @@ export default function TareasPage() {
               </Button>
             ))}
           </div>
+          <Field
+            label="Duración esperada (s)"
+            className="sm:col-span-3"
+            htmlFor="t-expected"
+            hint="Vacío = automática (p90 de las últimas ejecuciones exitosas o el valor por defecto del servidor)."
+          >
+            <Input id="t-expected" inputMode="numeric" placeholder="automática" value={form.expected_duration_seconds} onChange={(e) => set("expected_duration_seconds", e.target.value)} />
+          </Field>
+          <Field
+            label="Tolerancia de retraso (s)"
+            className="sm:col-span-3"
+            htmlFor="t-tolerance"
+            hint="Margen extra antes de marcar la tarea como retrasada. Vacío = automática."
+          >
+            <Input id="t-tolerance" inputMode="numeric" placeholder="automática" value={form.delay_tolerance_seconds} onChange={(e) => set("delay_tolerance_seconds", e.target.value)} />
+          </Field>
           <div className="grid gap-3 sm:col-span-6 sm:grid-cols-2">
             <Switch checked={form.is_active} onChange={(v) => set("is_active", v)} label="Tarea activa" />
             <Switch

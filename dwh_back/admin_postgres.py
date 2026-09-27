@@ -205,6 +205,9 @@ class TaskCreate(_Base):
     schedule_seconds: int = Field(3600, ge=10, le=31_536_000)
     is_active: bool = True
     run_on_company_token: bool = True
+    # Salud (opcionales; NULL = valores de [health] / historial de ejecuciones)
+    expected_duration_seconds: Optional[int] = Field(None, ge=1, le=31_536_000)
+    delay_tolerance_seconds: Optional[int] = Field(None, ge=0, le=31_536_000)
 
 
 class TaskUpdate(_Base):
@@ -214,6 +217,13 @@ class TaskUpdate(_Base):
     schedule_seconds: Optional[int] = Field(None, ge=10, le=31_536_000)
     is_active: Optional[bool] = None
     run_on_company_token: Optional[bool] = None
+    # null explícito = volver al valor automático
+    expected_duration_seconds: Optional[int] = Field(None, ge=1, le=31_536_000)
+    delay_tolerance_seconds: Optional[int] = Field(None, ge=0, le=31_536_000)
+
+
+# Campos de tarea que admiten volver a NULL con un null explícito en el PUT.
+TASK_NULLABLE_FIELDS = ("expected_duration_seconds", "delay_tolerance_seconds")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +237,7 @@ def create_admin_router(
     admin_token: str,
     group_token_column_exists: Callable[[], bool],
     agency_token_column_exists: Callable[[], bool],
+    on_watermark_reset: Optional[Callable[[Any, int], None]] = None,
 ) -> APIRouter:
     """Construye el router /admin usando los helpers de main_postgres."""
 
@@ -849,6 +860,7 @@ def create_admin_router(
                t.object_catalog_id, o.name AS object_name, o.destination_table,
                t.extract_sql, t.schedule_seconds, t.is_active, t.run_on_company_token,
                t.last_run_at, t.created_at, t.updated_at, t.query_version, t.query_hash,
+               t.expected_duration_seconds, t.delay_tolerance_seconds,
                (t.is_active AND a.is_enabled AND o.is_enabled
                  AND c.is_enabled AND g.is_enabled) AS effective_active
         FROM agency_task t
@@ -914,7 +926,8 @@ def create_admin_router(
 
     @router.put("/tasks/{task_id}")
     def update_task(task_id: int, body: TaskUpdate) -> dict:
-        values = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
+        values = {k: v for k, v in body.model_dump(exclude_unset=True).items()
+                  if v is not None or k in TASK_NULLABLE_FIELDS}
         with tx() as cur:
             cur.execute("SELECT agency_id, object_catalog_id FROM agency_task WHERE id = %s", (task_id,))
             current = cur.fetchone()
@@ -966,6 +979,9 @@ def create_admin_router(
                 """,
                 (task_id,),
             )
+            if on_watermark_reset is not None:
+                # Cierra incidencias de "tipo de reloj distinto" de la tarea (motivo watermark_reset).
+                on_watermark_reset(cur, task_id)
         return get_task_or_404(task_id)
 
     # ── Helpers compartidos (definidos al final; usan closures de arriba) ────
