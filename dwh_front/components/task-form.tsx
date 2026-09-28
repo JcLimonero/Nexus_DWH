@@ -201,7 +201,13 @@ export function TaskFormModal({
           message: (
             <>
               Ya hay un objeto del catálogo <b>{existing.name}</b> (tabla <code className="font-mono">{existing.destination_table}</code>) con un{" "}
-              <code className="font-mono">create_table_sql</code> o claves de upsert distintas a lo generado desde el query. ¿Reemplazar su definición?
+              <code className="font-mono">create_table_sql</code> o claves de upsert distintas a lo generado desde el query.
+              {(existing.task_count ?? 0) > 0 && (
+                <>
+                  {" "}<b className="text-red-700">Lo usan {existing.task_count} extractor(es)</b>; reemplazar la definición les afecta a todos.
+                </>
+              )}{" "}
+              ¿Reemplazar su definición?
             </>
           ),
           confirmLabel: "Reemplazar definición",

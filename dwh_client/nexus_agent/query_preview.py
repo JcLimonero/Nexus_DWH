@@ -104,6 +104,22 @@ def wrap_with_limit(sql: str, tipo: str, limit: int) -> Optional[str]:
     return f"SELECT * FROM ({inner}) AS nexus_preview_q LIMIT {limit}"
 
 
+def _streaming_cursor(conn: Any, tipo: str) -> Any:
+    """Cursor que NO trae todo el resultado a memoria al ejecutar: cuando el límite se aplica
+    con ``fetchmany`` (SQL Server/Pervasive o CTE), un cursor cliente de psycopg2/pymysql
+    cargaría el resultado completo. PostgreSQL: cursor con nombre (del lado del servidor);
+    MySQL: SSCursor (sin búfer). pyodbc y fdb ya leen por lotes."""
+    if tipo == "postgresql":
+        return conn.cursor(name="nexus_preview")
+    if tipo == "mysql":
+        try:
+            import pymysql.cursors
+            return conn.cursor(pymysql.cursors.SSCursor)
+        except Exception:
+            return conn.cursor()
+    return conn.cursor()
+
+
 def execute_limited(cursor: Any, sql: str, tipo: str, limit: int) -> str:
     """Ejecuta ``sql`` respetando el límite de filas; devuelve el SQL realmente ejecutado (para
     describir columnas). Si no se pudo envolver, ejecuta el original (limpio) y confía en
@@ -168,15 +184,16 @@ def sqlserver_columns(cursor: Any, wrapped_sql: str) -> List[Dict[str, Any]]:
     return []
 
 
-def pg_columns(cursor: Any) -> List[Dict[str, Any]]:
-    """PostgreSQL: cursor.description trae el OID de tipo; se resuelve con pg_type."""
+def pg_columns(cursor: Any, description: Any) -> List[Dict[str, Any]]:
+    """PostgreSQL: la descripción del resultado trae el OID de tipo; se resuelve con pg_type usando
+    un cursor APARTE (no el del query, para no descartar su resultado)."""
     out = []
-    oids = {c[1] for c in cursor.description or []}
+    oids = {c[1] for c in description or []}
     names: Dict[int, str] = {}
     if oids:
         cursor.execute("SELECT oid, typname FROM pg_type WHERE oid = ANY(%s)", (list(oids),))
         names = {int(r[0]): r[1] for r in cursor.fetchall()}
-    for col in cursor.description or []:
+    for col in description or []:
         typname = names.get(col[1], "text")
         out.append({"name": col[0], "source_type": typname, "nullable": True,
                    "length": col[3] if col[3] and col[3] > 0 else None,
@@ -185,14 +202,22 @@ def pg_columns(cursor: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def describe_columns(cursor: Any, tipo: str, wrapped_sql: str) -> List[Dict[str, Any]]:
-    if tipo in ("sqlserver", "pervasive"):
-        cols = sqlserver_columns(cursor, wrapped_sql)
+class _Described:
+    """Adaptador: expone una ``description`` ya capturada como si fuera un cursor."""
+    def __init__(self, description: Any) -> None:
+        self.description = description
+
+
+def describe_columns(meta_cursor: Any, tipo: str, wrapped_sql: str, description: Any) -> List[Dict[str, Any]]:
+    """Metadatos de columnas. ``description`` se capturó del cursor del query DESPUÉS de leer la
+    muestra; ``meta_cursor`` es un cursor distinto para consultas de catálogo (o None)."""
+    if tipo in ("sqlserver", "pervasive") and meta_cursor is not None:
+        cols = sqlserver_columns(meta_cursor, wrapped_sql)
         if cols:
             return cols
-    if tipo == "postgresql":
-        return pg_columns(cursor)
-    return _from_cursor_description(cursor, tipo)
+    if tipo == "postgresql" and meta_cursor is not None:
+        return pg_columns(meta_cursor, description)
+    return _from_cursor_description(_Described(description), tipo)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,10 +248,21 @@ def run_query_preview(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
     try:
         sql = prepare_extract_sql(str(cmd.get("extract_sql") or ""), None)
         conn, tipo = connect_source(src, settings, RunContext())
-        cur = conn.cursor()
+        cur = _streaming_cursor(conn, tipo)
         executed_sql = execute_limited(cur, sql, tipo, limit)
-        columns = describe_columns(cur, tipo, executed_sql)
+        # Primero la muestra (con cursor del lado del servidor la descripción existe tras leer),
+        # luego los metadatos en otro cursor: consultar el catálogo en el MISMO cursor descartaría
+        # el resultado del query.
         rows_raw = cur.fetchmany(limit)
+        description = cur.description
+        meta_cur = None
+        if tipo in ("sqlserver", "pervasive", "postgresql"):
+            try:
+                cur.close()  # libera el resultado pendiente (SQL Server sin MARS no admite otro cursor)
+            except Exception:  # noqa: BLE001
+                pass
+            meta_cur = conn.cursor()
+        columns = describe_columns(meta_cur, tipo, executed_sql, description)
         row_count = len(rows_raw)
         out: Dict[str, Any] = {"status": "ok", "columns": columns, "row_count": row_count,
                                "agent_version": AGENT_VERSION}
@@ -296,10 +332,10 @@ def run_upsert_check(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
     try:
         sql = prepare_extract_sql(str(cmd.get("extract_sql") or ""), None)
         src_conn, tipo = connect_source(src, settings, RunContext())
-        scur = src_conn.cursor()
+        scur = _streaming_cursor(src_conn, tipo)
         execute_limited(scur, sql, tipo, limit)
-        columns = [c[0] for c in scur.description or []]
         rows_raw = scur.fetchmany(limit)
+        columns = [c[0] for c in scur.description or []]
         src_conn.close()
         src_conn = None
         if not rows_raw:

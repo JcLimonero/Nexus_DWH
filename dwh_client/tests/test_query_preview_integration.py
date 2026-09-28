@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 import support
-from nexus_agent.query_preview import execute_limited, run_upsert_check, wrap_with_limit
+from nexus_agent.query_preview import execute_limited, run_query_preview, run_upsert_check, wrap_with_limit
 
 DWH_SCHEMA = "qp_upsert_check_test"
 DWH_TABLE = f"{DWH_SCHEMA}.destino"
@@ -134,3 +134,28 @@ def test_wrap_with_limit_con_cte_order_by_comentarios_y_punto_y_coma(qpenv):
         conn.close()
     assert len(rows) == 2
     assert [r[0] for r in rows] == [3, 2]  # ORDER BY id DESC del query original, sin reescribir
+
+
+@pytest.mark.parametrize("sql", [
+    f"SELECT id, monto, nombre FROM {SRC_TABLE} ORDER BY id",
+    f"WITH base AS (SELECT id, monto, nombre FROM {SRC_TABLE}) SELECT * FROM base ORDER BY id; -- fin",
+])
+def test_query_preview_devuelve_filas_y_tipos(qpenv, sql):
+    """La vista previa debe traer la MUESTRA y los TIPOS: los metadatos se consultan en otro
+    cursor, después de leer las filas (antes, consultar pg_type en el mismo cursor descartaba el
+    resultado del query y la muestra llegaba vacía)."""
+    cmd = {"source": _source_dict(), "extract_sql": sql, "sample_limit": 2, "include_rows": True}
+    result = run_query_preview(cmd, _settings())
+    assert result["status"] == "ok", result
+    assert result["row_count"] == 2 and len(result["rows"]) == 2
+    assert [r[0] for r in result["rows"]] == [1, 2]
+    tipos = {c["name"]: c["source_type"] for c in result["columns"]}
+    assert tipos == {"id": "int4", "monto": "int4", "nombre": "text"}, tipos
+
+
+def test_query_preview_sin_filas_si_la_empresa_no_lo_permite(qpenv):
+    cmd = {"source": _source_dict(), "extract_sql": f"SELECT id FROM {SRC_TABLE}", "sample_limit": 2,
+           "include_rows": False}
+    result = run_query_preview(cmd, _settings())
+    assert result["status"] == "ok", result
+    assert "rows" not in result and result["columns"][0]["name"] == "id"
