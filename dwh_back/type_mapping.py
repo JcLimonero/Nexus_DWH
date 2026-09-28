@@ -228,6 +228,27 @@ class DdlColumnSpec:
     nullable: bool = True
 
 
+# Lista blanca ESTRICTA de tipos PostgreSQL admitidos en el DDL generado (nunca una expresión
+# arbitraria): los que produce map_source_type() más los que el usuario puede escribir a mano en el
+# panel. Nada fuera de este patrón se acepta (evita inyección de DDL vía el "tipo destino editable",
+# p. ej. "integer default (select pg_sleep(5))" o "integer); drop table x --").
+_SIZED_TYPE_RE = re.compile(r"^(?:varchar|char|character varying|character)\((?:[1-9][0-9]{0,3})\)$")
+_NUMERIC_TYPE_RE = re.compile(r"^(?:numeric|decimal)\((?:[1-9][0-9]{0,3})(?:\s*,\s*[0-9]{1,3})?\)$")
+_PLAIN_TYPES = {
+    "text", "smallint", "integer", "bigint", "boolean", "double precision", "real", "date",
+    "timestamp", "timestamptz", "timestamp without time zone", "timestamp with time zone",
+    "time", "time without time zone", "uuid", "bytea", "jsonb", "json", "money",
+}
+
+
+def is_safe_pg_type(pg_type: str) -> bool:
+    """True solo si ``pg_type`` es exactamente uno de la lista blanca (opcionalmente como arreglo ``[]``)."""
+    t = (pg_type or "").strip().lower()
+    if t.endswith("[]"):
+        t = t[:-2].strip()
+    return bool(t) and (t in _PLAIN_TYPES or _SIZED_TYPE_RE.match(t) or _NUMERIC_TYPE_RE.match(t))
+
+
 def _validate_columns(columns: Sequence[DdlColumnSpec]) -> None:
     if not columns:
         raise DdlError("La tabla necesita al menos una columna.")
@@ -238,8 +259,8 @@ def _validate_columns(columns: Sequence[DdlColumnSpec]) -> None:
         if c.name in seen:
             raise DdlError(f"Columna duplicada: «{c.name}».")
         seen.add(c.name)
-        if not re.match(r"^[a-z][a-z0-9_ ,()]*$", c.pg_type or ""):
-            raise DdlError(f"Tipo de columna no válido para «{c.name}».")
+        if not is_safe_pg_type(c.pg_type):
+            raise DdlError(f"Tipo de columna no válido para «{c.name}»: «{c.pg_type}».")
 
 
 def build_create_table_sql(schema: Optional[str], table: str, columns: Sequence[DdlColumnSpec],

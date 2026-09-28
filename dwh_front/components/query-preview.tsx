@@ -15,9 +15,9 @@ import { useToast } from "@/components/ui/feedback";
  * DWH y validar el upsert antes de guardar.
  */
 
-type Status = "pending" | "running" | "ok" | "failed" | "expired" | "no_agent";
+export type CommandStatus = "pending" | "running" | "ok" | "failed" | "expired" | "no_agent";
 
-interface ColumnMeta {
+export interface ColumnMeta {
   name: string;
   source_type: string;
   nullable: boolean;
@@ -27,9 +27,9 @@ interface ColumnMeta {
   type_warning: string | null;
 }
 
-interface CommandOut {
+export interface CommandOut {
   id: string;
-  status: Status;
+  status: CommandStatus;
   result: { columns?: ColumnMeta[]; row_count?: number; upsert?: UpsertReport } | null;
   error_code: string | null;
   message: string | null;
@@ -37,7 +37,7 @@ interface CommandOut {
   rows?: unknown[][];
 }
 
-interface UpsertReport {
+export interface UpsertReport {
   inserted: number;
   updated: number;
   duplicate_keys_in_sample: number;
@@ -52,11 +52,31 @@ interface EditableColumn extends ColumnMeta {
   is_key: boolean;
 }
 
+/** Columna ya lista para pedir "Crear tabla" / "Validar upsert" (sin los campos de edición del panel). */
+export interface DefColumn {
+  name: string;
+  pg_type: string;
+  nullable: boolean;
+}
+
+/** Todo lo que "Usar esta definición" genera: el objeto del catálogo + el query ya probado. */
+export interface AppliedDefinition {
+  destination_table: string;
+  create_table_sql: string;
+  upsert_keys: string;
+  constraint_name: string;
+  create_constraint_sql: string;
+  /** El query EXACTO que se probó (el mismo que debe guardar el extractor). */
+  extract_sql: string;
+  columns: DefColumn[];
+  key_columns: string[];
+}
+
 function quoteSnake(s: string): string {
   return (s || "col").toLowerCase();
 }
 
-async function poll(id: string, includeRows: boolean, onTick?: (c: CommandOut) => void): Promise<CommandOut> {
+export async function pollCommand(id: string, includeRows: boolean, onTick?: (c: CommandOut) => void): Promise<CommandOut> {
   const started = Date.now();
   while (Date.now() - started < 180_000) {
     const c = await api<CommandOut>(`admin/query-commands/${id}${includeRows ? "?include_rows=true" : ""}`);
@@ -67,23 +87,44 @@ async function poll(id: string, includeRows: boolean, onTick?: (c: CommandOut) =
   throw new Error("El comando tardó demasiado en responder.");
 }
 
+async function createAndPoll(body: Record<string, unknown>): Promise<CommandOut> {
+  const created = await api<CommandOut>("admin/query-commands", { method: "POST", body });
+  return pollCommand(created.id, false);
+}
+
+/** Pide al agente crear la tabla destino (idempotente) para una definición ya aplicada. */
+export function runCreateTableCommand(companyId: number, def: AppliedDefinition): Promise<CommandOut> {
+  return createAndPoll({
+    kind: "create_table", company_id: companyId, destination_table: def.destination_table,
+    columns: def.columns, key_columns: def.key_columns,
+  });
+}
+
+/** Pide al agente validar el upsert (dos pasadas + ROLLBACK) para una definición ya aplicada. */
+export function runUpsertCheckCommand(companyId: number, def: AppliedDefinition): Promise<CommandOut> {
+  return createAndPoll({
+    kind: "upsert_check", company_id: companyId, extract_sql: def.extract_sql,
+    destination_table: def.destination_table, key_columns: def.key_columns, sample_limit: 20,
+  });
+}
+
 export function QueryPreviewBuilder({
   companyId,
   onApply,
+  initialSql = "",
+  initialTable = "",
 }: {
   companyId: number | null;
-  /** Copia la definición generada al resto del formulario del objeto. */
-  onApply: (def: {
-    destination_table: string;
-    create_table_sql: string;
-    upsert_keys: string;
-    constraint_name: string;
-    create_constraint_sql: string;
-  }) => void;
+  /** Copia la definición generada (objeto del catálogo + el query ya probado) al formulario que lo use. */
+  onApply: (def: AppliedDefinition) => void;
+  /** Precarga el query (p. ej. el extract_sql actual al editar un extractor). */
+  initialSql?: string;
+  /** Precarga la tabla destino (p. ej. la del objeto actual del extractor). */
+  initialTable?: string;
 }) {
   const toast = useToast();
-  const [sql, setSql] = useState("");
-  const [table, setTable] = useState("");
+  const [sql, setSql] = useState(initialSql);
+  const [table, setTable] = useState(initialTable);
   const [status, setStatus] = useState<"idle" | "running" | "done">("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [columns, setColumns] = useState<EditableColumn[]>([]);
@@ -117,7 +158,7 @@ export function QueryPreviewBuilder({
         body: { kind: "query_preview", company_id: companyId, extract_sql: sql, sample_limit: 20 },
       });
       lastCommandId.current = created.id;
-      const final = await poll(created.id, false, (c) => {
+      const final = await pollCommand(created.id, false, (c) => {
         if (c.status === "pending") setMessage("En espera de un agente en línea…");
         if (c.status === "running") setMessage("El agente está ejecutando el query…");
       });
@@ -163,8 +204,11 @@ export function QueryPreviewBuilder({
       upsert_keys: keys.join(", "),
       constraint_name: "",
       create_constraint_sql: "",
+      extract_sql: sql,
+      columns: columns.map((c) => ({ name: c.name_edit, pg_type: c.type_edit, nullable: c.nullable })),
+      key_columns: keys,
     });
-    toast.success("Definición copiada al formulario. Revisa y guarda el objeto.");
+    toast.success("Definición aplicada. Revisa y guarda el extractor.");
   }
 
   async function createTable() {
@@ -182,7 +226,7 @@ export function QueryPreviewBuilder({
           key_columns: keyColumns,
         },
       });
-      const final = await poll(created.id, false);
+      const final = await pollCommand(created.id, false);
       if (final.status === "ok") toast.success("Tabla creada (o ya existía) en el DWH.");
       else toast.error(final.message || "No se pudo crear la tabla.");
     } catch (e) {
@@ -203,7 +247,7 @@ export function QueryPreviewBuilder({
         method: "POST",
         body: { kind: "upsert_check", company_id: companyId, extract_sql: sql, destination_table: table.trim(), key_columns: keyColumns, sample_limit: 20 },
       });
-      const final = await poll(created.id, false);
+      const final = await pollCommand(created.id, false);
       if (final.status === "ok" && final.result?.upsert) {
         setUpsertReport(final.result.upsert);
         toast.success("Validación de upsert completada (sin confirmar cambios: se hizo ROLLBACK).");

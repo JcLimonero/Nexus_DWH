@@ -18,6 +18,7 @@ Nunca se registran SQL ni valores de fila en los logs del agente (mismo
 criterio que etl.py); los errores se sanean con ``sanitize_error``.
 """
 
+import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -37,17 +38,79 @@ MAX_SAMPLE_ROWS = 20
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Límite de filas por motor (envuelve el query del usuario como subconsulta)
+# Límite de filas por motor
 # ─────────────────────────────────────────────────────────────────────────────
-def wrap_with_limit(sql: str, tipo: str, limit: int) -> str:
-    inner = sql.strip().rstrip(";")
+# Envolver el query del usuario como subconsulta (``SELECT * FROM (<query>) AS q LIMIT n``) es
+# frágil ante CTE (``WITH ...``), comentarios finales o un punto y coma final: T-SQL directamente
+# no admite un ``WITH`` dentro de una subconsulta, y un comentario/`;` sobrante rompe la subconsulta
+# igual en cualquier motor. Por eso ``wrap_with_limit`` primero limpia el ruido final (comentarios y
+# `;`) y, cuando envolver no es seguro (SQL Server/Pervasive siempre — mejor ``TOP`` en la sesión que
+# reescribir el query —, o un ``WITH`` inicial en cualquier motor), devuelve ``None``: en ese caso se
+# ejecuta el query TAL CUAL y el límite lo impone ``cursor.fetchmany(limit)`` con cierre temprano de
+# la conexión (no se seguirán leyendo filas del servidor).
+_TRAILING_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/\s*$", re.DOTALL)
+_TRAILING_LINE_COMMENT_RE = re.compile(r"--[^\n]*$")
+_LEADING_BLOCK_COMMENT_RE = re.compile(r"^\s*/\*.*?\*/", re.DOTALL)
+_LEADING_LINE_COMMENT_RE = re.compile(r"^\s*--[^\n]*\n")
+_CTE_RE = re.compile(r"(?is)^\s*with\b")
+
+
+def _strip_trailing_noise(sql: str) -> str:
+    """Quita, del final, comentarios de bloque/línea y un ``;`` sobrante (repite hasta estabilizar)."""
+    s = sql.strip()
+    for _ in range(50):  # cota defensiva: nunca un bucle infinito
+        new = _TRAILING_BLOCK_COMMENT_RE.sub("", s).rstrip()
+        m = _TRAILING_LINE_COMMENT_RE.search(new)
+        if m:
+            new = new[: m.start()].rstrip()
+        if new.endswith(";"):
+            new = new[:-1].rstrip()
+        if new == s:
+            return s
+        s = new
+    return s
+
+
+def _strip_leading_noise(sql: str) -> str:
+    """Quita, del inicio, comentarios de bloque/línea (para detectar un CTE bajo un comentario)."""
+    s = sql
+    for _ in range(50):
+        new = _LEADING_BLOCK_COMMENT_RE.sub("", s)
+        new = _LEADING_LINE_COMMENT_RE.sub("", new)
+        new = new.lstrip()
+        if new == s:
+            return s
+        s = new
+    return s
+
+
+def _looks_like_cte(sql: str) -> bool:
+    return bool(_CTE_RE.match(_strip_leading_noise(sql)))
+
+
+def wrap_with_limit(sql: str, tipo: str, limit: int) -> Optional[str]:
+    """
+    Devuelve el SQL envuelto con el límite de filas, o ``None`` si debe ejecutarse tal cual (el
+    límite se aplica entonces con ``cursor.fetchmany`` y cierre temprano de la conexión).
+    """
+    inner = _strip_trailing_noise(sql)
     limit = max(1, min(int(limit), MAX_SAMPLE_ROWS))
     if tipo in ("sqlserver", "pervasive"):
-        return f"SELECT TOP {limit} * FROM ({inner}) AS nexus_preview_q"
+        return None  # TOP en una subconsulta reescrita es frágil (CTE, comentarios); mejor fetchmany.
+    if _looks_like_cte(inner):
+        return None  # un WITH inicial no siempre puede anidarse dentro de "FROM (...) AS q".
     if tipo == "firebird":
         return f"SELECT FIRST {limit} * FROM ({inner}) AS nexus_preview_q"
-    # postgresql / mysql
     return f"SELECT * FROM ({inner}) AS nexus_preview_q LIMIT {limit}"
+
+
+def execute_limited(cursor: Any, sql: str, tipo: str, limit: int) -> str:
+    """Ejecuta ``sql`` respetando el límite de filas; devuelve el SQL realmente ejecutado (para
+    describir columnas). Si no se pudo envolver, ejecuta el original (limpio) y confía en
+    ``fetchmany`` + cierre temprano de la conexión (ver módulo)."""
+    to_run = wrap_with_limit(sql, tipo, limit) or _strip_trailing_noise(sql)
+    cursor.execute(to_run)
+    return to_run
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,10 +214,9 @@ def run_query_preview(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
     try:
         sql = prepare_extract_sql(str(cmd.get("extract_sql") or ""), None)
         conn, tipo = connect_source(src, settings, RunContext())
-        wrapped = wrap_with_limit(sql, tipo, limit)
         cur = conn.cursor()
-        cur.execute(wrapped)
-        columns = describe_columns(cur, tipo, wrapped)
+        executed_sql = execute_limited(cur, sql, tipo, limit)
+        columns = describe_columns(cur, tipo, executed_sql)
         rows_raw = cur.fetchmany(limit)
         row_count = len(rows_raw)
         out: Dict[str, Any] = {"status": "ok", "columns": columns, "row_count": row_count,
@@ -225,9 +287,8 @@ def run_upsert_check(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
     try:
         sql = prepare_extract_sql(str(cmd.get("extract_sql") or ""), None)
         src_conn, tipo = connect_source(src, settings, RunContext())
-        wrapped = wrap_with_limit(sql, tipo, limit)
         scur = src_conn.cursor()
-        scur.execute(wrapped)
+        execute_limited(scur, sql, tipo, limit)
         columns = [c[0] for c in scur.description or []]
         rows_raw = scur.fetchmany(limit)
         src_conn.close()
@@ -261,22 +322,30 @@ def run_upsert_check(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
         try:
             for pass_no in (1, 2):
                 inserted = updated = 0
-                for row in rows:
+                for i, row in enumerate(rows):
+                    # SAVEPOINT por fila: un error de una fila (tipo, NOT NULL, overflow...) se
+                    # descarta con ROLLBACK TO SAVEPOINT y NO se pierde lo ya insertado/actualizado
+                    # por las filas anteriores de esta misma pasada (antes un ROLLBACK de toda la
+                    # transacción las borraba también). El ROLLBACK final de la transacción completa
+                    # sigue garantizado: esto nunca confirma nada en el DWH.
+                    dcur.execute("SAVEPOINT nexus_upsert_check_row")
                     try:
                         dcur.execute(sql_upsert_returning, row)
                         r = dcur.fetchone()
+                        dcur.execute("RELEASE SAVEPOINT nexus_upsert_check_row")
                         if r and r[0]:
                             inserted += 1
                         else:
                             updated += 1
                     except Exception as exc:  # noqa: BLE001 — error de tipos/constraint por fila
                         code, msg = sanitize_error(StageError("load", exc, side="DWH"))
-                        column_errors[f"fila_{len(column_errors) + 1}"] = f"{code}: {msg}"
-                        dwh_conn.rollback()
-                        dcur = dwh_conn.cursor()
+                        column_errors[f"fila_{i + 1}"] = f"{code}: {msg}"
+                        dcur.execute("ROLLBACK TO SAVEPOINT nexus_upsert_check_row")
+                        dcur.execute("RELEASE SAVEPOINT nexus_upsert_check_row")
             # Segunda pasada esperada: 0 insertadas, N actualizadas (mismas llaves).
         finally:
-            dwh_conn.rollback()  # NUNCA se confirma: es solo una validación.
+            dwh_conn.rollback()  # NUNCA se confirma: es solo una validación (deshace TODO, incluidas
+                                 # las filas que sí se insertaron/actualizaron bien en cada pasada).
         return {"status": "ok", "columns": [], "row_count": len(rows_raw),
                 "duration_ms": int((time.monotonic() - t0) * 1000), "agent_version": AGENT_VERSION,
                 "upsert": {"inserted": inserted, "updated": updated, "duplicate_keys_in_sample": dup_keys,

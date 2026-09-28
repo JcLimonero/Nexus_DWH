@@ -64,6 +64,12 @@ def report(url, h, command_id, body):
 
 
 def call(env, who, method, path, body=None, expect=None):
+    """Devuelve el JSON ya parseado (como support.Backend.admin); use call_raw si necesita el Response."""
+    r = call_raw(env, who, method, path, body, expect)
+    return r.json() if r.content else None
+
+
+def call_raw(env, who, method, path, body=None, expect=None):
     r = requests.request(method, env["b"].url + path, json=body, headers=env["users"][who], timeout=T)
     if expect is not None:
         assert r.status_code == expect, f"{who} {method} {path} -> {r.status_code}: {r.text[:300]}"
@@ -258,7 +264,11 @@ def test_limite_de_intervalo_minimo(qenv):
     token = _company_token(qenv, qenv["c"])
     h = enroll(b.url, token, name="agente_rl")
     heartbeat(b.url, h)
+    # Aísla la prueba del tope "abiertas por grupo": las pruebas anteriores pueden haber dejado
+    # comandos pendientes sin reclamar (p. ej. test_ajeno_no_ve_el_comando). Aquí solo se quiere
+    # probar el intervalo mínimo entre dos solicitudes IDÉNTICAS, no el tope de abiertas.
+    q("DELETE FROM agent_command WHERE group_id = %s", (qenv["g"]["id"],))
     body = {"kind": "query_preview", "company_id": qenv["c"]["id"], "extract_sql": "SELECT 1 AS x"}
     call(qenv, "cfg_q", "POST", "/admin/query-commands", body, expect=201)
     r = call(qenv, "cfg_q", "POST", "/admin/query-commands", body, expect=429)
-    assert r.json()["detail"]["code"] == "too_soon"
+    assert r["detail"]["code"] == "too_soon"

@@ -11,6 +11,7 @@ from type_mapping import (
     build_unique_constraint_sql,
     detect_watermark_column,
     is_safe_identifier,
+    is_safe_pg_type,
     map_columns,
     map_source_type,
     normalize_columns,
@@ -160,6 +161,34 @@ def test_build_create_table_sql_rejects_bad_type():
     cols = [DdlColumnSpec("id", "integer); drop table x --")]
     with pytest.raises(DdlError):
         build_create_table_sql(None, "clientes", cols)
+
+
+@pytest.mark.parametrize("bad_type", [
+    "integer default (select pg_sleep(5))",
+    "integer); drop table x --",
+    "text); delete from agent_command; --",
+    "integer, (select 1)",
+    "varchar(50) collate \"C\"",
+    "integer[1:2]",
+    "integer references otra_tabla(id)",
+    "unknown_type",
+    "varchar(99999)",
+    "numeric(9999,9999)",
+    "",
+])
+def test_is_safe_pg_type_rechaza_tipos_peligrosos_o_desconocidos(bad_type):
+    assert not is_safe_pg_type(bad_type)
+    with pytest.raises(DdlError):
+        build_create_table_sql(None, "clientes", [DdlColumnSpec("id", bad_type)])
+
+
+@pytest.mark.parametrize("good_type", [
+    "text", "smallint", "integer", "bigint", "boolean", "double precision", "real", "date",
+    "timestamp", "timestamptz", "time", "uuid", "bytea", "jsonb", "json", "money",
+    "varchar(255)", "char(10)", "numeric(18,4)", "numeric(10)", "integer[]", "text[]",
+])
+def test_is_safe_pg_type_acepta_lista_blanca(good_type):
+    assert is_safe_pg_type(good_type)
 
 
 def test_build_create_table_sql_rejects_key_not_in_columns():
