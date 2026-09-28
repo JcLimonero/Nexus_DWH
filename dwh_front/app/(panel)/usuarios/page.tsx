@@ -66,6 +66,8 @@ function UsersAdmin({ isSuper, myId }: { isSuper: boolean; myId: number | null }
   const roles = useApi<{ roles: PanelRole[]; permissions: { code: string; description: string; global_only: boolean }[] }>("admin/roles");
   const groups = useApi<ListResponse<Group>>("admin/groups");
   const sessions = useApi<ListResponse<PanelSession>>("admin/sessions");
+  const { me } = useSession();
+  const minPw = me?.password_min_length ?? 8;
   const { run, busy } = useActions(() => {
     void users.reload();
     void sessions.reload();
@@ -410,7 +412,7 @@ function UsersAdmin({ isSuper, myId }: { isSuper: boolean; myId: number | null }
               required
               className="sm:col-span-6"
               htmlFor="u-pass"
-              hint="Mínimo 12 caracteres. Entréguela por un canal seguro; el usuario deberá cambiarla al entrar."
+              hint={`Mínimo ${minPw} caracteres. Entréguela por un canal seguro; el usuario deberá cambiarla al entrar.`}
             >
               <div className="flex gap-2">
                 <Input id="u-pass" required className="font-mono" autoComplete="new-password" value={form.password} onChange={(e) => set("password", e.target.value)} />
@@ -541,7 +543,7 @@ function UsersAdmin({ isSuper, myId }: { isSuper: boolean; myId: number | null }
           </>
         }
       >
-        <Field label="Contraseña temporal" htmlFor="reset-pw" hint="Mínimo 12 caracteres.">
+        <Field label="Contraseña temporal" htmlFor="reset-pw" hint={`Mínimo ${minPw} caracteres.`}>
           <div className="flex gap-2">
             <Input id="reset-pw" className="font-mono" autoComplete="new-password" value={resetPw} onChange={(e) => setResetPw(e.target.value)} />
             <Button type="button" variant="secondary" icon={<Wand2 className="h-4 w-4" />} onClick={() => setResetPw(randomPassword())}>

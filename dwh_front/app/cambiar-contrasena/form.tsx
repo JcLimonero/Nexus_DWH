@@ -13,6 +13,7 @@ function PasswordInput(props: { id: string; autoComplete: string; value: string;
 interface MeLite {
   user: { username: string; display_name: string };
   must_change_password: boolean;
+  password_min_length?: number;
 }
 
 /** Cambio de contraseña (obligatorio si el administrador la reinició o es el primer ingreso). */
@@ -76,7 +77,7 @@ export default function ChangePasswordForm() {
         </label>
         <PasswordInput id="rep" autoComplete="new-password" value={repeat} onChange={(e) => setRepeat(e.target.value)} />
         <p className="mt-2 text-[11px] text-slate-500">
-          Mínimo 12 caracteres; no puede contener su usuario ni ser una contraseña común. Al cambiarla se cierran sus demás sesiones.
+          Mínimo {me?.password_min_length ?? 8} caracteres; no puede contener su usuario ni ser una contraseña común. Al cambiarla se cierran sus demás sesiones.
         </p>
         {error && (
           <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
