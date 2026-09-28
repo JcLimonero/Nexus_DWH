@@ -154,8 +154,8 @@ export const SECTIONS: DocSection[] = [
           contraseña por defecto: un administrador debe crear su cuenta primero (sección «Usuarios y Auditoría»).
         </P>
         <P>
-          La sesión dura como máximo 12 horas desde el inicio de sesión, y se cierra sola tras 30 minutos sin
-          actividad. Si se equivoca varias veces con la contraseña, su cuenta se bloquea temporalmente (el tiempo de
+          La sesión tiene una duración máxima desde el inicio de sesión y se cierra sola tras un tiempo sin
+          actividad (por defecto 12 horas y 30 minutos; el administrador del sistema puede ajustarlos). Si se equivoca varias veces con la contraseña, su cuenta se bloquea temporalmente (el tiempo de
           bloqueo aumenta con cada intento fallido); espere e intente de nuevo, o pida a un administrador que la
           desbloquee (<UiLabel>Desbloquear</UiLabel>, en Usuarios).
         </P>
@@ -164,7 +164,7 @@ export const SECTIONS: DocSection[] = [
           Si un administrador le reinició la contraseña o le creó la cuenta, el panel lo llevará automáticamente a{" "}
           <Code>/cambiar-contrasena</Code> y no le dejará usar el resto del panel hasta que la cambie. También puede
           cambiarla usted mismo en cualquier momento desde esa misma pantalla. La contraseña nueva debe tener al
-          menos 12 caracteres, no puede contener su nombre de usuario, no puede ser una contraseña obvia/común y debe
+          menos la longitud mínima que exija el sistema (el formulario la indica), no puede contener su nombre de usuario, no puede ser una contraseña obvia/común y debe
           ser distinta de la actual. Al cambiarla se cierran las demás sesiones abiertas de su cuenta.
         </P>
         <H3 id="ps-roles">Roles y alcance por grupo</H3>
@@ -456,7 +456,7 @@ export const SECTIONS: DocSection[] = [
     id: "salud-ejecuciones",
     title: "Salud y Ejecuciones",
     icon: HeartPulse,
-    keywords: "salud estados ok en curso fallando retrasada deshabilitada sin ejecutar columnas conectividad ejecuciones",
+    keywords: "salud estados al día ok en curso con error fallando retrasada deshabilitada sin ejecuciones sin ejecutar columnas conectividad ejecuciones",
     body: (
       <div className="space-y-4">
         <H3 id="se-salud">Salud</H3>
@@ -470,12 +470,12 @@ export const SECTIONS: DocSection[] = [
         <Table>
           <THead cols={["Estado de la tarea", "Significa"]} />
           <tbody>
-            <Row cells={[<UiLabel key="1">ok</UiLabel>, "Todo en orden: última carga dentro del plazo esperado."]} />
-            <Row cells={[<UiLabel key="1">en curso</UiLabel>, "Hay una ejecución corriendo ahora mismo, confirmada por el latido del agente."]} />
-            <Row cells={[<UiLabel key="1">fallando</UiLabel>, "La ejecución más reciente falló o se interrumpió, o hay una incidencia de falla abierta para esa tarea."]} />
-            <Row cells={[<UiLabel key="1">retrasada</UiLabel>, "Pasó el plazo esperado (programación + duración + tolerancia) sin una carga nueva y sin estar en curso."]} />
-            <Row cells={[<UiLabel key="1">deshabilitada</UiLabel>, "El extractor, la agencia, la empresa, el grupo o el objeto están deshabilitados; nunca genera alertas de retraso."]} />
-            <Row cells={[<UiLabel key="1">sin ejecutar</UiLabel>, "Nunca se ha ejecutado y todavía está dentro del plazo de gracia."]} />
+            <Row cells={[<UiLabel key="1">Al día</UiLabel>, "Todo en orden: última carga dentro del plazo esperado."]} />
+            <Row cells={[<UiLabel key="1">En curso</UiLabel>, "Hay una ejecución corriendo ahora mismo, confirmada por el latido del agente."]} />
+            <Row cells={[<UiLabel key="1">Con error</UiLabel>, "La ejecución más reciente falló o se interrumpió, o hay una incidencia de falla abierta para esa tarea."]} />
+            <Row cells={[<UiLabel key="1">Retrasada</UiLabel>, "Pasó el plazo esperado (programación + duración + tolerancia) sin una carga nueva y sin estar en curso."]} />
+            <Row cells={[<UiLabel key="1">Deshabilitada</UiLabel>, "El extractor, la agencia, la empresa, el grupo o el objeto están deshabilitados; nunca genera alertas de retraso."]} />
+            <Row cells={[<UiLabel key="1">Sin ejecuciones</UiLabel>, "Nunca se ha ejecutado y todavía está dentro del plazo de gracia."]} />
           </tbody>
         </Table>
         <P>
