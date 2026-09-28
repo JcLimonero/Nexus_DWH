@@ -230,3 +230,10 @@ class NexusApi:
 
     def report_connection_test(self, test_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self.request("POST", f"/agent/connection-tests/{test_id}/result", json_body=payload)
+
+    # Comandos "Tabla destino desde el query" pedidos desde el panel (sección 24)
+    def claim_command(self) -> Dict[str, Any]:
+        return self.request("POST", "/agent/commands/claim")
+
+    def report_command(self, command_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.request("POST", f"/agent/commands/{command_id}/result", json_body=payload)

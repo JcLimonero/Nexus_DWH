@@ -49,6 +49,7 @@ from .destination import (
     connection_key, prune_ca_files, register_warehouse_secrets, run_connection_test, task_warehouse,
 )
 from .inventory import InventoryRunner
+from .query_preview import run_command as run_query_command
 from .etl import RunContext, TaskResult, parse_watermark, register_task_secrets, run_task, watermark_iso
 from .localstate import LocalState, OutboxItem
 from .logsetup import get_logger
@@ -134,6 +135,8 @@ class Agent:
         self._test_times: List[float] = []            # inicios de pruebas (monotónico), último minuto
         self._test_last_by_target: Dict[str, float] = {}
         self.last_connection_test: Optional[Dict[str, Any]] = None
+        self._commands_wakeup = threading.Event()
+        self.last_query_command: Optional[Dict[str, Any]] = None
 
     # ═════════════════════════════════════════════════════════════════════════
     # Credencial
@@ -709,7 +712,8 @@ class Agent:
             "config_age_seconds": int(age) if age is not None else None,
             "event_time": iso_utc(utcnow()),
             "features": [f for f in AGENT_FEATURES
-                         if f != "connection-test" or self.settings.connection_test_enabled],
+                         if (f != "connection-test" or self.settings.connection_test_enabled)
+                         and (f != "query-preview" or self.settings.query_preview_enabled)],
         }
 
     def send_heartbeat(self, api: NexusApi) -> bool:
@@ -729,6 +733,8 @@ class Agent:
             self._rotation_requested.set()
         if resp.get("connection_tests_pending"):
             self._tests_wakeup.set()
+        if resp.get("query_commands_pending"):
+            self._commands_wakeup.set()
         return True
 
     def _heartbeat_loop(self) -> None:
@@ -841,6 +847,54 @@ class Agent:
         finally:
             api.close()
 
+    def run_one_query_command(self, api: NexusApi) -> Optional[Dict[str, Any]]:
+        """Toma un comando pendiente de 'Tabla destino desde el query' (sección 24), si hay, y lo reporta."""
+        resp = api.claim_command()
+        self.mark_api_ok()
+        cmd = resp.get("command")
+        if not cmd:
+            return None
+        cid = str(cmd.get("id"))
+        log.info("Comando %s (%s): en curso.", cid[:8], cmd.get("kind"))
+        result = run_query_command(cmd, self.settings)
+        try:
+            api.report_command(cid, result)
+        except ApiError as exc:
+            log.warning("Comando %s: no se pudo reportar el resultado (%s).", cid[:8], exc.code)
+        log.info("Comando %s: %s%s.", cid[:8], result.get("status"),
+                 f" (código {result['error_code']})" if result.get("error_code") else "")
+        self.last_query_command = {"id": cid, "status": result.get("status"), "error_code": result.get("error_code")}
+        return self.last_query_command
+
+    def _command_loop(self) -> None:
+        api = self.api_factory(self.settings, self.holder)  # sesión HTTP propia
+        failures = 0
+        try:
+            while not self.stop_event.is_set():
+                delay = float(self.settings.query_preview_poll_seconds)
+                try:
+                    while not self.stop_event.is_set() and self.run_one_query_command(api):
+                        pass
+                    failures = 0
+                except ApiAuthError as exc:
+                    self._handle_auth_error(exc)
+                    failures += 1
+                except ApiError as exc:
+                    failures += 1
+                    if exc.status == 404:
+                        delay = 600.0  # Nexus anterior sin la ruta: se consulta muy de vez en cuando.
+                    log.debug("Comandos: consulta no disponible (%s).", exc.code)
+                except Exception as exc:  # noqa: BLE001 — el hilo nunca muere
+                    failures += 1
+                    code, msg = sanitize_error(exc)
+                    log.warning("Comandos: error inesperado [%s] %s", code, msg)
+                if failures:
+                    delay = max(delay, min(300.0, delay * (2 ** min(failures, 5))))
+                self._commands_wakeup.wait(delay)
+                self._commands_wakeup.clear()
+        finally:
+            api.close()
+
     def start_threads(self) -> None:
         self._sender_stop_deadline = float("inf")
         threads = [("heartbeat", self._heartbeat_loop), ("sender", self._sender_loop),
@@ -849,6 +903,8 @@ class Agent:
             threads.append(("inventory", self._inventory_loop))
         if self.settings.connection_test_enabled:
             threads.append(("connection-tests", self._connection_test_loop))
+        if self.settings.query_preview_enabled:
+            threads.append(("query-commands", self._command_loop))
         for name, target in threads:
             th = threading.Thread(target=target, name=name, daemon=True)
             th.start()

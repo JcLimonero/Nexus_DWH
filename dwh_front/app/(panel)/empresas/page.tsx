@@ -43,6 +43,7 @@ interface FormState {
   refresh_seconds: string;
   verbose_logging: boolean;
   is_enabled: boolean;
+  allow_data_preview: boolean;
   /** true = usa el destino del grupo (predeterminado) */
   inherit_warehouse: boolean;
   warehouse: WarehouseForm;
@@ -62,6 +63,7 @@ const EMPTY: FormState = {
   refresh_seconds: "60",
   verbose_logging: false,
   is_enabled: true,
+  allow_data_preview: true,
   inherit_warehouse: true,
   warehouse: EMPTY_WAREHOUSE,
 };
@@ -161,6 +163,7 @@ export default function EmpresasPage() {
       refresh_seconds: String(c.refresh_seconds),
       verbose_logging: c.verbose_logging,
       is_enabled: c.is_enabled,
+      allow_data_preview: c.allow_data_preview,
       inherit_warehouse: c.warehouse_mode !== "custom",
       warehouse: companyWarehouse(c),
     });
@@ -183,6 +186,7 @@ export default function EmpresasPage() {
         refresh_seconds: refresh,
         verbose_logging: form.verbose_logging,
         is_enabled: form.is_enabled,
+        allow_data_preview: form.allow_data_preview,
       });
       if (!editing || Number(form.group_id) !== editing.group_id) body.group_id = Number(form.group_id);
     }
@@ -540,6 +544,13 @@ export default function EmpresasPage() {
           <div className="flex flex-col justify-end gap-3 sm:col-span-4">
             <Switch checked={form.verbose_logging} disabled={!formCfg} onChange={(v) => set("verbose_logging", v)} label="Log detallado (verbose)" />
             <Switch checked={form.is_enabled} disabled={!formCfg} onChange={(v) => set("is_enabled", v)} label="Empresa habilitada" />
+            <Switch
+              checked={form.allow_data_preview}
+              disabled={!formCfg}
+              onChange={(v) => set("allow_data_preview", v)}
+              label="Permitir muestra de datos en el panel"
+              description="Si se desactiva, 'Crear un extractor desde el query' solo muestra columnas y tipos (nunca filas)."
+            />
           </div>
           </fieldset>
           {editing && (
