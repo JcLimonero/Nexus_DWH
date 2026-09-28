@@ -204,8 +204,17 @@ def _cell(value: Any) -> Any:
     return str(value)[:500]
 
 
+def _source_conn_dict(src: Dict[str, Any]) -> Dict[str, Any]:
+    """``connect_source`` espera la clave ``type`` (como en etl.py/agency_task); Nexus manda el
+    motor como ``engine`` (mismo contrato que la prueba de conexión, sección 22 — ver
+    destination.py._test_source, que hace este mismo remapeo)."""
+    return {"type": src.get("engine"), "host": src.get("host"), "port": src.get("port"),
+            "database": src.get("database"), "username": src.get("username"),
+            "password": src.get("password"), "dsn": src.get("dsn")}
+
+
 def run_query_preview(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
-    src = cmd.get("source") or {}
+    src = _source_conn_dict(cmd.get("source") or {})
     SECRETS.add(src.get("host"), src.get("username"), src.get("password"), src.get("database"), src.get("dsn"))
     limit = int(cmd.get("sample_limit") or MAX_SAMPLE_ROWS)
     include_rows = bool(cmd.get("include_rows", True))
@@ -274,7 +283,7 @@ def run_create_table(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
 # upsert_check — inserta dos veces dentro de una transacción y hace ROLLBACK
 # ─────────────────────────────────────────────────────────────────────────────
 def run_upsert_check(cmd: Dict[str, Any], settings: Any) -> Dict[str, Any]:
-    src = cmd.get("source") or {}
+    src = _source_conn_dict(cmd.get("source") or {})
     wh = cmd.get("warehouse") or {}
     SECRETS.add(src.get("host"), src.get("username"), src.get("password"), src.get("database"), src.get("dsn"))
     SECRETS.add(wh.get("host"), wh.get("username"), wh.get("password"), wh.get("database"))
