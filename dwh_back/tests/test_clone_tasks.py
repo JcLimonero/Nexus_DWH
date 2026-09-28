@@ -53,9 +53,9 @@ def cenv():
             "lector_a": [{"role": "lectura", "group_id": A}],
         }.items():
             p = pw()
-            b.admin("POST", "/admin/users", {"username": name, "password": p, "must_change_password": False,
+            b.admin("POST", "/admin/users", {"username": name, "email": f"{name}@ejemplo.test", "password": p, "must_change_password": False,
                                              "roles": roles}, expect=201)
-            r = requests.post(b.url + "/admin/auth/login", json={"username": name, "password": p}, timeout=T)
+            r = requests.post(b.url + "/admin/auth/login", json={"email": f"{name}@ejemplo.test", "password": p}, timeout=T)
             assert r.status_code == 200, r.text
             sessions[name] = {"authorization": "Bearer " + r.json()["token"]}
         yield {"b": b, "ids": ids, "A": A, "B": B, "ca2": ca2, "s": sessions}

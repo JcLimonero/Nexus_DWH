@@ -116,9 +116,9 @@ def denv():
                                    ("viewer_d", [{"role": "lectura", "group_id": g["id"]}], {}),
                                    ("ajeno_d", [{"role": "admin_config", "group_id": other["id"]}], {})):
             p = pw()
-            b.admin("POST", "/admin/users", {"username": name, "password": p, "must_change_password": False,
+            b.admin("POST", "/admin/users", {"username": name, "email": f"{name}@ejemplo.test", "password": p, "must_change_password": False,
                                              "roles": roles, **extra}, expect=201)
-            r = requests.post(b.url + "/admin/auth/login", json={"username": name, "password": p}, timeout=T)
+            r = requests.post(b.url + "/admin/auth/login", json={"email": f"{name}@ejemplo.test", "password": p}, timeout=T)
             assert r.status_code == 200, r.text
             users[name] = {"authorization": "Bearer " + r.json()["token"]}
         yield dict(b=b, g=g, other=other, c_inh=c_inh, c_own=c_own, c_other=c_other, tasks=tks, users=users,
