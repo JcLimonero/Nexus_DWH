@@ -201,6 +201,9 @@ def test_ajeno_no_ve_el_comando(qenv):
     out = call(qenv, "cfg_q", "POST", "/admin/query-commands",
               {"kind": "query_preview", "company_id": qenv["c"]["id"], "extract_sql": "SELECT 1"}, expect=201)
     call(qenv, "ajeno_q", "GET", f"/admin/query-commands/{out['id']}", expect=404)
+    # Este comando queda "pending" sin reclamar a propósito (solo se probaba el permiso de lectura).
+    # Se limpia para que no lo tome, por orden de creación, un agente de una prueba posterior.
+    q("DELETE FROM agent_command WHERE id = %s", (out["id"],))
 
 
 def test_allow_data_preview_false_bloquea_filas_aunque_el_agente_las_mande(qenv):
