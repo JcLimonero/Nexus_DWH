@@ -610,6 +610,8 @@ Si vas a trabajar con la variante PostgreSQL y aún ves nombres en español en l
 
 Panel de administración en **Next.js 14 (App Router) + TypeScript + Tailwind**, en español. Solo para la variante **PostgreSQL** (usa `/admin/*` de `main_postgres.py`).
 
+El panel incluye además su propia **documentación de usuario** en `/docs` (menú **Documentación**, visible para cualquier usuario con sesión, sin permiso especial): tabla de contenido con búsqueda, guías «cómo hacer X» con los nombres exactos de botones/campos de cada pantalla y qué permiso requiere cada acción. El diagrama de flujo de esa página también existe como archivo estático en [`docs/diagramas/flujo-sistema.svg`](docs/diagramas/flujo-sistema.svg).
+
 ### 16.1. Qué permite
 
 - **Dashboard**: conteos (grupos, empresas, agencias, tareas), **resumen de salud** (instalaciones por conectividad, tareas por estado, incidencias abiertas por severidad) y las incidencias abiertas más relevantes; estado por cliente ETL (`/monitor/clients`) y últimos errores sin reconocer (eventos legados).

@@ -7,6 +7,7 @@ import {
   Activity,
   Bell,
   BellRing,
+  BookOpen,
   HeartPulse,
   Siren,
   Boxes,
@@ -61,6 +62,10 @@ const NAV = [
       { href: "/usuarios", label: "Usuarios", icon: UserCog, perm: "users.manage" as Permission },
       { href: "/auditoria", label: "Auditoría", icon: ScrollText, perm: "audit.view" as Permission },
     ],
+  },
+  {
+    section: "Ayuda",
+    items: [{ href: "/docs", label: "Documentación", icon: BookOpen }],
   },
 ];
 
