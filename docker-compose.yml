@@ -27,6 +27,8 @@ services:
       NEXUS__SERVER__PROXY_HEADERS: ${NEXUS_PROXY_HEADERS:-true}
       NEXUS__SERVER__FORWARDED_ALLOW_IPS: ${NEXUS_FORWARDED_ALLOW_IPS:-10.0.0.0/16}
       NEXUS__AGENT__LATEST_VERSION: ${NEXUS_AGENT_LATEST_VERSION:-}
+      # Longitud mínima de contraseñas del panel (piso 8 en el código).
+      NEXUS__AUTH__PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
     restart: unless-stopped
 
   frontend:
