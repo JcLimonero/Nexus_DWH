@@ -117,6 +117,7 @@ def create_users_router(*, auth: AuthService) -> APIRouter:
     @router.get("/auth/me")
     def me(ctx: AuthContext = Depends(auth.authenticated())) -> dict:
         out = auth.profile(ctx)
+        out["password_min_length"] = auth.s.password_min_length
         # Grupos visibles (para selectores) sin exponer nada más.
         with _Tx() as cur:
             sql, params = ctx.scope_sql("g.id")

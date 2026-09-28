@@ -28,6 +28,8 @@ export interface Me {
   session_expires_at: string | null;
   idle_timeout_seconds: number;
   groups: { id: number; name: string }[];
+  /** Longitud mínima de contraseñas configurada en el backend. */
+  password_min_length?: number;
 }
 
 interface SessionValue {
