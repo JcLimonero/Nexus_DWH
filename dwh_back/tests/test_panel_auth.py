@@ -11,8 +11,10 @@ import hashlib
 import importlib
 import os
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -31,6 +33,14 @@ PK_IP = "pk-ip-" + secrets.token_urlsafe(16)   # clave panel↔backend (backend 
 
 def pw() -> str:
     return "Pr-" + secrets.token_urlsafe(14)
+
+
+EMAIL_DOMAIN = "@nexus.test"
+
+
+def email_for(username: str) -> str:
+    """Correo determinista para un nombre de prueba dado (el acceso ahora es por correo)."""
+    return username + EMAIL_DOMAIN
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,8 +102,11 @@ class Env(dict):
     pass
 
 
-def login(url, username, password):
-    r = requests.post(url + "/admin/auth/login", json={"username": username, "password": password}, timeout=T)
+def login(url, username, password, *, email=None):
+    """Inicia sesión por correo. `username` se traduce a su correo determinista salvo que se
+    pase `email` explícito (usuarios inexistentes, mayúsculas, etc.)."""
+    em = email if email is not None else email_for(username)
+    r = requests.post(url + "/admin/auth/login", json={"email": em, "password": password}, timeout=T)
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -152,9 +165,9 @@ def aenv():
 
         def user(name, roles, **kw):
             p = pw()
-            u = b.admin("POST", "/admin/users", {"username": name, "password": p, "must_change_password": False,
-                                                 "roles": roles, **kw}, expect=201)
-            users[name] = {"id": u["id"], "password": p}
+            u = b.admin("POST", "/admin/users", {"username": name, "email": email_for(name), "password": p,
+                                                 "must_change_password": False, "roles": roles, **kw}, expect=201)
+            users[name] = {"id": u["id"], "password": p, "email": email_for(name)}
             return u
 
         user("super", [], is_superadmin=True)
@@ -193,17 +206,26 @@ def test_login_ok_y_fallos_genericos(aenv):
     assert d["user"]["username"] == "viewer_a" and d["must_change_password"] is False
     assert d["permissions"] == {"view": [aenv["A"]]}
     assert len(d["token"]) >= 40 and d["idle_timeout_seconds"] == 1800
-    # Contraseña mala y usuario inexistente: mismo 401 y mismo mensaje.
-    r1 = requests.post(b.url + "/admin/auth/login", json={"username": "viewer_a", "password": "x" * 14}, timeout=T)
-    r2 = requests.post(b.url + "/admin/auth/login", json={"username": "no_existe_" + uuid.uuid4().hex[:6],
+    # Correo insensible a mayúsculas.
+    d2 = login(b.url, "viewer_a", aenv["users"]["viewer_a"]["password"],
+              email=email_for("viewer_a").upper())
+    assert d2["user"]["username"] == "viewer_a"
+    # Contraseña mala y correo inexistente: mismo 401 y mismo mensaje.
+    r1 = requests.post(b.url + "/admin/auth/login", json={"email": email_for("viewer_a"), "password": "x" * 14},
+                       timeout=T)
+    r2 = requests.post(b.url + "/admin/auth/login", json={"email": email_for("no_existe_" + uuid.uuid4().hex[:6]),
                                                           "password": "x" * 14}, timeout=T)
     assert r1.status_code == r2.status_code == 401
     assert r1.json()["detail"] == r2.json()["detail"]
+    # El backend YA NO acepta "username" en el cuerpo (solo "email").
+    r3 = requests.post(b.url + "/admin/auth/login",
+                       json={"username": "viewer_a", "password": aenv["users"]["viewer_a"]["password"]}, timeout=T)
+    assert r3.status_code == 422
     # Sin credenciales: 401 en /admin/*.
     assert requests.get(b.url + "/admin/groups", timeout=T).status_code == 401
     assert requests.get(b.url + "/admin/groups", headers=bearer("x" * 43), timeout=T).status_code == 401
     ev = q("SELECT action, details->>'reason' FROM panel_audit_log WHERE action = 'auth.login_failed'")
-    assert {r[1] for r in ev} >= {"bad_password", "unknown_user"}
+    assert {r[1] for r in ev} >= {"bad_password", "unknown_email"}
 
 
 def test_token_de_sesion_guardado_solo_hasheado(aenv):
@@ -227,11 +249,11 @@ def test_token_de_sesion_guardado_solo_hasheado(aenv):
 def test_bloqueo_por_usuario_con_backoff_exponencial(aenv):
     lim = aenv["lim"]
     p = pw()
-    aenv["b"].admin("POST", "/admin/users", {"username": "lock_me", "password": p,
+    aenv["b"].admin("POST", "/admin/users", {"username": "lock_me", "email": email_for("lock_me"), "password": p,
                                              "must_change_password": False}, expect=201)
 
     def attempt(password):
-        return requests.post(lim.url + "/admin/auth/login", json={"username": "lock_me", "password": password},
+        return requests.post(lim.url + "/admin/auth/login", json={"email": email_for("lock_me"), "password": password},
                              timeout=T)
 
     assert [attempt("mala-" + "x" * 12).status_code for _ in range(3)] == [401, 401, 401]
@@ -246,9 +268,9 @@ def test_bloqueo_por_usuario_con_backoff_exponencial(aenv):
     time.sleep(4.2)
     assert attempt(p).status_code == 200
     assert q("SELECT failed_attempts, locked_until FROM panel_user WHERE username = 'lock_me'")[0] == (0, None)
-    # Usuario inexistente: mismas reglas (el 429 no revela si existe).
-    ghost = "ghost_" + uuid.uuid4().hex[:6]
-    codes = [requests.post(lim.url + "/admin/auth/login", json={"username": ghost, "password": "z" * 14},
+    # Correo inexistente: mismas reglas (el 429 no revela si existe; el bloqueo queda por correo).
+    ghost = email_for("ghost_" + uuid.uuid4().hex[:6])
+    codes = [requests.post(lim.url + "/admin/auth/login", json={"email": ghost, "password": "z" * 14},
                            timeout=T).status_code for _ in range(4)]
     assert codes == [401, 401, 401, 429]
 
@@ -261,10 +283,10 @@ def test_limite_de_fallos_por_ip(aenv):
 
     # IP real enviada por el panel con la clave compartida → límite por IP (5).
     codes = [requests.post(ipb.url + "/admin/auth/login", headers=panel("203.0.113.7"),
-                           json={"username": f"u{i}_" + uuid.uuid4().hex[:4], "password": "w" * 14},
+                           json={"email": email_for(f"u{i}_" + uuid.uuid4().hex[:4]), "password": "w" * 14},
                            timeout=T).status_code for i in range(6)]
     assert codes == [401] * 5 + [429]
-    good = {"username": "viewer_a", "password": aenv["users"]["viewer_a"]["password"]}
+    good = {"email": email_for("viewer_a"), "password": aenv["users"]["viewer_a"]["password"]}
     r = requests.post(ipb.url + "/admin/auth/login", headers=panel("203.0.113.7"), json=good, timeout=T)
     assert r.status_code == 429 and r.json()["detail"]["code"] == "too_many_attempts"
     # Solo esa IP: otro usuario desde otra IP entra (no hay bloqueo global).
@@ -275,7 +297,7 @@ def test_limite_de_fallos_por_ip(aenv):
     # (solo bloqueo por usuario), así los fallos de otros nunca bloquean a todos.
     codes = [requests.post(ipb.url + "/admin/auth/login",
                            headers={"x-forwarded-for": f"198.51.100.{i}", **panel("203.0.113.7", "mala")},
-                           json={"username": f"spray{i}_" + uuid.uuid4().hex[:4], "password": "w" * 14},
+                           json={"email": email_for(f"spray{i}_" + uuid.uuid4().hex[:4]), "password": "w" * 14},
                            timeout=T).status_code for i in range(40)]
     assert codes == [401] * 40
     assert requests.post(ipb.url + "/admin/auth/login", json=good, timeout=T).status_code == 200
@@ -290,13 +312,13 @@ def test_ip_de_sesion_solo_con_clave_del_panel(aenv):
     def last_ip():
         return q("SELECT ip FROM panel_session ORDER BY id DESC LIMIT 1")[0][0]
 
-    requests.post(b.url + "/admin/auth/login", json={"username": "viewer_a", "password": p}, timeout=T,
+    requests.post(b.url + "/admin/auth/login", json={"email": email_for("viewer_a"), "password": p}, timeout=T,
                   headers={"x-nexus-proxy-key": PK_B, "x-nexus-client-ip": "198.51.100.4"})
     assert last_ip() == "198.51.100.4"
-    requests.post(b.url + "/admin/auth/login", json={"username": "viewer_a", "password": p}, timeout=T,
+    requests.post(b.url + "/admin/auth/login", json={"email": email_for("viewer_a"), "password": p}, timeout=T,
                   headers={"x-forwarded-for": "6.6.6.6", "x-nexus-client-ip": "7.7.7.7"})
     assert last_ip() == "127.0.0.1"
-    requests.post(b.url + "/admin/auth/login", json={"username": "viewer_a", "password": p}, timeout=T,
+    requests.post(b.url + "/admin/auth/login", json={"email": email_for("viewer_a"), "password": p}, timeout=T,
                   headers={"x-nexus-proxy-key": PK_B, "x-nexus-client-ip": "no-es-ip"})
     assert last_ip() == ""
 
@@ -304,16 +326,16 @@ def test_ip_de_sesion_solo_con_clave_del_panel(aenv):
 def test_tiempo_similar_usuario_inexistente(aenv):
     b = aenv["b"]
 
-    def t(username):
+    def t(email):
         t0 = time.perf_counter()
-        requests.post(b.url + "/admin/auth/login", json={"username": username, "password": "q" * 14}, timeout=T)
+        requests.post(b.url + "/admin/auth/login", json={"email": email, "password": "q" * 14}, timeout=T)
         return time.perf_counter() - t0
 
     p = pw()
-    b.admin("POST", "/admin/users", {"username": "timing_u", "password": p, "must_change_password": False},
-            expect=201)
-    known = sorted(t("timing_u") for _ in range(4))[1:3]
-    unknown = sorted(t("nadie_" + uuid.uuid4().hex[:6]) for _ in range(4))[1:3]
+    b.admin("POST", "/admin/users", {"username": "timing_u", "email": email_for("timing_u"), "password": p,
+                                     "must_change_password": False}, expect=201)
+    known = sorted(t(email_for("timing_u")) for _ in range(4))[1:3]
+    unknown = sorted(t(email_for("nadie_" + uuid.uuid4().hex[:6])) for _ in range(4))[1:3]
     ratio = (sum(unknown) / 2) / (sum(known) / 2)
     # Ambos verifican un hash argon2id (≈ decenas de ms): sin atajo para usuarios inexistentes.
     assert 0.5 < ratio < 2.0, (known, unknown)
@@ -347,7 +369,8 @@ def test_logout_revoca_la_sesion(aenv):
 def test_politica_y_cambio_de_contrasena(aenv):
     b = aenv["b"]
     p = pw()
-    b.admin("POST", "/admin/users", {"username": "cambia", "password": p, "must_change_password": False}, expect=201)
+    b.admin("POST", "/admin/users", {"username": "cambia", "email": email_for("cambia"), "password": p,
+                                     "must_change_password": False}, expect=201)
     t1 = login(b.url, "cambia", p)["token"]
     t2 = login(b.url, "cambia", p)["token"]
 
@@ -369,14 +392,14 @@ def test_politica_y_cambio_de_contrasena(aenv):
     assert login(b.url, "cambia", new)["user"]["username"] == "cambia"
     # Crear usuario con contraseña débil también se rechaza.
     r = requests.post(b.url + "/admin/users", headers={"x-admin-token": b.admin_token}, timeout=T,
-                      json={"username": "debil", "password": "123456789012"})
+                      json={"username": "debil", "email": email_for("debil"), "password": "123456789012"})
     assert r.status_code == 422
 
 
 def test_must_change_password_bloquea_lo_demas(aenv):
     b = aenv["b"]
     p = pw()
-    b.admin("POST", "/admin/users", {"username": "nuevo", "password": p,
+    b.admin("POST", "/admin/users", {"username": "nuevo", "email": email_for("nuevo"), "password": p,
                                      "roles": [{"role": "lectura", "group_id": aenv["A"]}]}, expect=201)
     d = login(b.url, "nuevo", p)
     assert d["must_change_password"] is True
@@ -388,6 +411,49 @@ def test_must_change_password_bloquea_lo_demas(aenv):
                       json={"current_password": p, "new_password": pw()})
     assert r.status_code == 200
     assert requests.get(b.url + "/admin/groups", headers=h, timeout=T).status_code == 200
+
+
+def test_correo_duplicado_409_y_formato_invalido_422(aenv):
+    b = aenv["b"]
+    dup_email = email_for("correo_dup_" + uuid.uuid4().hex[:6])
+    b.admin("POST", "/admin/users", {"username": "dupu1", "email": dup_email, "password": pw(),
+                                     "must_change_password": False}, expect=201)
+    # Mismo correo (sin distinguir mayúsculas) al crear otro usuario → 409.
+    r = requests.post(b.url + "/admin/users", headers={"x-admin-token": b.admin_token}, timeout=T,
+                      json={"username": "dupu2", "email": dup_email.upper(), "password": pw()})
+    assert r.status_code == 409
+    # Formato de correo inválido → 422.
+    r = requests.post(b.url + "/admin/users", headers={"x-admin-token": b.admin_token}, timeout=T,
+                      json={"username": "malcorreo", "email": "no-es-un-correo", "password": pw()})
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "invalid_email"
+    # Editar el correo de OTRO usuario al mismo correo ya usado → también 409.
+    other = b.admin("POST", "/admin/users", {"username": "otrou", "email": email_for("otrou_" + uuid.uuid4().hex[:6]),
+                                             "password": pw(), "must_change_password": False}, expect=201)
+    r2 = requests.put(b.url + f"/admin/users/{other['id']}", headers={"x-admin-token": b.admin_token}, timeout=T,
+                      json={"email": dup_email})
+    assert r2.status_code == 409
+    # El usuario que ya tenía ese correo no se vio afectado.
+    assert q("SELECT COUNT(*) FROM panel_user WHERE lower(email) = %s", (dup_email.lower(),))[0][0] == 1
+
+
+def test_usuario_sin_correo_no_puede_iniciar_sesion_hasta_que_se_le_asigne(aenv):
+    """Un usuario preexistente sin correo (caso típico tras la migración 011, antes de que un
+    administrador lo complete) no puede iniciar sesión con ninguna combinación de correo/contraseña;
+    en cuanto se le asigna uno (PUT /admin/users/{id}), sí puede."""
+    b = aenv["b"]
+    from argon2 import PasswordHasher
+    ph = PasswordHasher()
+    raw_pw = pw()
+    uname = "sin_correo_" + uuid.uuid4().hex[:6]
+    uid = q("""INSERT INTO panel_user (username, email, password_hash, must_change_password, created_by)
+               VALUES (%s, NULL, %s, FALSE, 'test') RETURNING id""", (uname, ph.hash(raw_pw)))[0][0]
+    assert q("SELECT email FROM panel_user WHERE id = %s", (uid,))[0][0] is None
+    guess_email = email_for(uname)
+    r = requests.post(b.url + "/admin/auth/login", json={"email": guess_email, "password": raw_pw}, timeout=T)
+    assert r.status_code == 401
+    b.admin("PUT", f"/admin/users/{uid}", {"email": guess_email}, expect=200)
+    d = login(b.url, uname, raw_pw, email=guess_email)
+    assert d["user"]["username"] == uname
 
 
 def test_token_estatico_deshabilitado_por_defecto_y_auditado(aenv):
@@ -410,22 +476,60 @@ def test_token_estatico_deshabilitado_por_defecto_y_auditado(aenv):
 def test_cli_crea_superadmin(aenv):
     b = aenv["b"]
     p = pw()
+    raiz_email = email_for("raiz_cli_" + uuid.uuid4().hex[:6])
     env = dict(os.environ, NEXUS_CONFIG_FILE=b.ini_path, NX_TEST_PW=p)
-    out = subprocess.run([support.BACK_PY, "manage_users.py", "create-superadmin", "--username", "raiz",
+    out = subprocess.run([support.BACK_PY, "manage_users.py", "create-superadmin", "--email", raiz_email,
                           "--password-env", "NX_TEST_PW"], cwd=support.BACK_DIR, env=env,
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert p not in out.stdout + out.stderr
-    d = login(b.url, "raiz", p)
+    assert raiz_email in out.stdout
+    d = login(b.url, "raiz", p, email=raiz_email)
     assert d["user"]["is_superadmin"] is True and d["must_change_password"] is True
-    # Duplicado y contraseña débil → error.
-    assert subprocess.run([support.BACK_PY, "manage_users.py", "create-superadmin", "--username", "raiz",
+    # Correo duplicado y contraseña débil → error (sin tocar la BD).
+    assert subprocess.run([support.BACK_PY, "manage_users.py", "create-superadmin", "--email", raiz_email,
                            "--password-env", "NX_TEST_PW"], cwd=support.BACK_DIR, env=env,
                           capture_output=True, text=True, timeout=60).returncode != 0
     env["NX_TEST_PW"] = "123456789012"
-    assert subprocess.run([support.BACK_PY, "manage_users.py", "create-superadmin", "--username", "raiz2",
+    assert subprocess.run([support.BACK_PY, "manage_users.py", "create-superadmin",
+                           "--email", email_for("raiz2_" + uuid.uuid4().hex[:6]),
                            "--password-env", "NX_TEST_PW"], cwd=support.BACK_DIR, env=env,
                           capture_output=True, text=True, timeout=60).returncode != 0
+
+
+def test_cli_username_se_deriva_del_correo_y_set_email(aenv):
+    """El usuario (identificador interno) se deriva de la parte local del correo si no se indica
+    --username; `set-email` cambia el correo de acceso de una cuenta existente."""
+    b = aenv["b"]
+    env = dict(os.environ, NEXUS_CONFIG_FILE=b.ini_path)
+    local = "cli.derivado." + uuid.uuid4().hex[:6]
+    email1 = local + EMAIL_DOMAIN
+    p = pw()
+    env["NX_TEST_PW"] = p
+    out = subprocess.run([support.BACK_PY, "manage_users.py", "create-superadmin", "--email", email1,
+                          "--password-env", "NX_TEST_PW"], cwd=support.BACK_DIR, env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    row = q("SELECT username FROM panel_user WHERE lower(email) = %s", (email1.lower(),))
+    assert row and row[0][0]
+    derived_username = row[0][0]
+    assert derived_username == local
+
+    email2 = "cli.nuevo." + uuid.uuid4().hex[:6] + EMAIL_DOMAIN
+    out2 = subprocess.run([support.BACK_PY, "manage_users.py", "set-email", "--username", derived_username,
+                          "--new-email", email2], cwd=support.BACK_DIR, env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out2.returncode == 0, out2.stderr
+    assert q("SELECT email FROM panel_user WHERE username = %s", (derived_username,))[0][0] == email2
+    # El correo anterior ya no sirve para iniciar sesión; el nuevo sí.
+    r_old = requests.post(b.url + "/admin/auth/login", json={"email": email1, "password": p}, timeout=T)
+    assert r_old.status_code == 401
+    d = login(b.url, derived_username, p, email=email2)
+    assert d["user"]["username"] == derived_username
+    # `list` incluye el correo.
+    out3 = subprocess.run([support.BACK_PY, "manage_users.py", "list"], cwd=support.BACK_DIR, env=env,
+                          capture_output=True, text=True, timeout=60)
+    assert out3.returncode == 0 and email2 in out3.stdout
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -697,24 +801,26 @@ def test_admin_de_usuarios(aenv):
     e = aenv
     b = e["b"]
     # users.manage no se asigna por grupo
-    r = call(e, "uadmin", "POST", "/admin/users", {"username": "x_" + uuid.uuid4().hex[:5], "password": pw(),
+    r = call(e, "uadmin", "POST", "/admin/users", {"username": "x_" + uuid.uuid4().hex[:5],
+                                                   "email": email_for("x_" + uuid.uuid4().hex[:5]), "password": pw(),
                                                    "roles": [{"role": "admin_usuarios", "group_id": e["A"]}]})
     assert r.status_code == 422 and r.json()["detail"]["code"] == "global_only_role"
     # uadmin (no superadmin) no crea superadmins
-    r = call(e, "uadmin", "POST", "/admin/users", {"username": "y_" + uuid.uuid4().hex[:5], "password": pw(),
+    r = call(e, "uadmin", "POST", "/admin/users", {"username": "y_" + uuid.uuid4().hex[:5],
+                                                   "email": email_for("y_" + uuid.uuid4().hex[:5]), "password": pw(),
                                                    "is_superadmin": True})
     assert r.status_code == 403
     # Desactivar cierra sus sesiones; no puede desactivarse a sí mismo.
     p = pw()
-    u = call(e, "uadmin", "POST", "/admin/users", {"username": "temporal", "password": p,
-                                                   "must_change_password": False,
+    u = call(e, "uadmin", "POST", "/admin/users", {"username": "temporal", "email": email_for("temporal"),
+                                                   "password": p, "must_change_password": False,
                                                    "roles": [{"role": "lectura", "group_id": e["B"]}]},
              expect=201).json()
     tok = login(b.url, "temporal", p)["token"]
     assert requests.get(b.url + "/admin/groups", headers=bearer(tok), timeout=T).status_code == 200
     call(e, "uadmin", "PUT", f"/admin/users/{u['id']}", {"is_active": False}, expect=200)
     assert requests.get(b.url + "/admin/groups", headers=bearer(tok), timeout=T).status_code == 401
-    r = requests.post(b.url + "/admin/auth/login", json={"username": "temporal", "password": p}, timeout=T)
+    r = requests.post(b.url + "/admin/auth/login", json={"email": email_for("temporal"), "password": p}, timeout=T)
     assert r.status_code == 401
     assert call(e, "uadmin", "PUT", f"/admin/users/{e['users']['uadmin']['id']}", {"is_active": False}).status_code == 409
     # Reinicio de contraseña → must_change_password y sesiones cerradas
@@ -808,7 +914,8 @@ def test_dwh_compartido_no_revela_el_grupo_dueno(aenv):
     e = aenv
     b = e["b"]
     p = pw()
-    b.admin("POST", "/admin/users", {"username": "viewer_b", "password": p, "must_change_password": False,
+    b.admin("POST", "/admin/users", {"username": "viewer_b", "email": email_for("viewer_b"), "password": p,
+                                     "must_change_password": False,
                                      "roles": [{"role": "lectura", "group_id": e["B"]}]}, expect=201)
     h = bearer(login(b.url, "viewer_b", p)["token"])
     items = requests.get(b.url + "/admin/monitored-databases", headers=h, timeout=T).json()["items"]
@@ -876,7 +983,8 @@ def test_nombre_neutro_y_nombres_de_otros_grupos_ocultos(aenv):
     q("UPDATE monitored_database SET lease_installation_id = %s, lease_until = NOW() + INTERVAL '1 hour' "
       "WHERE id = %s", (e["ia"], e["mdb_s"]))
     p = pw()
-    e["b"].admin("POST", "/admin/users", {"username": "viewer_b2", "password": p, "must_change_password": False,
+    e["b"].admin("POST", "/admin/users", {"username": "viewer_b2", "email": email_for("viewer_b2"), "password": p,
+                                          "must_change_password": False,
                                           "roles": [{"role": "lectura", "group_id": e["B"]}]}, expect=201)
     h = bearer(login(e["b"].url, "viewer_b2", p)["token"])
     d = requests.get(e["b"].url + f"/admin/monitored-databases/{e['mdb_s']}", headers=h, timeout=T).json()
@@ -903,3 +1011,84 @@ def test_pool_reutiliza_conexiones_y_limpia_estado(aenv):
     assert len(after) <= 5
     idle = q("""SELECT query FROM pg_stat_activity WHERE application_name = 'nexus_test_lim' AND state = 'idle'""")
     assert idle and all(r[0] == "DISCARD ALL" for r in idle), idle
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Migración 011 — acceso por correo (normalización, aborto en duplicados)
+# ─────────────────────────────────────────────────────────────────────────────
+def test_migracion_011_normaliza_correos_y_aborta_con_duplicados():
+    """
+    BD propia y aislada (no usa el fixture `aenv`): se aplican la línea base + migraciones
+    001..010, se insertan usuarios ficticios (con correos duplicados sin distinguir mayúsculas,
+    con espacios, y uno SIN correo) directamente en panel_user, y luego se aplica SOLO la
+    migración 011 dos veces: la primera debe ABORTAR (duplicados) sin tocar nada; tras corregir
+    el duplicado, la segunda debe aplicarse y crear el índice único.
+    """
+    if not support.docker_available():
+        pytest.skip("Docker no disponible")
+    import migrate
+
+    dbname = "nexus_test_cfg_migr011"
+    admin = psycopg2.connect(host=support.CFG_PG["host"], port=support.CFG_PG["port"], user=support.CFG_PG["user"],
+                             password=support.CFG_PG["password"], dbname="postgres")
+    admin.autocommit = True
+    with admin.cursor() as cur:
+        cur.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        cur.execute(f'CREATE DATABASE "{dbname}"')
+    admin.close()
+
+    tmp = tempfile.mkdtemp(prefix="nx_migr011_")
+    conn = None
+    try:
+        # Copia de las migraciones EXCEPTO la 011 (se aplica aparte, a mano, más abajo).
+        for fname in os.listdir(migrate.MIGRATIONS_DIR):
+            if not fname.startswith("011_"):
+                shutil.copy(os.path.join(migrate.MIGRATIONS_DIR, fname), os.path.join(tmp, fname))
+
+        conn = psycopg2.connect(host=support.CFG_PG["host"], port=support.CFG_PG["port"],
+                                user=support.CFG_PG["user"], password=support.CFG_PG["password"], dbname=dbname)
+        migrate.run_migrations(conn, directory=tmp, log=lambda *_: None)
+
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO panel_user (username, email, password_hash) VALUES (%s, %s, %s)",
+                       ("migr_dup1", "Dup@Ejemplo.com", "x"))
+            cur.execute("INSERT INTO panel_user (username, email, password_hash) VALUES (%s, %s, %s)",
+                       ("migr_dup2", "  dup@ejemplo.com  ", "x"))
+            cur.execute("INSERT INTO panel_user (username, email, password_hash) VALUES (%s, %s, %s)",
+                       ("migr_sin_correo", None, "x"))
+        conn.commit()
+
+        # 1.ª vez: aborta (duplicados sin distinguir mayúsculas) — nada se pierde ni se modifica.
+        with pytest.raises(Exception):
+            migrate.run_migrations(conn, baseline=False, directory=migrate.MIGRATIONS_DIR, log=lambda *_: None)
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('ux_panel_user_email')")
+            assert cur.fetchone()[0] is None
+            cur.execute("SELECT email FROM panel_user WHERE username = 'migr_dup1'")
+            assert cur.fetchone()[0] == "Dup@Ejemplo.com"  # sin normalizar: la migración abortó y revirtió todo
+
+        # Se corrige el duplicado (a mano, como pediría el mensaje de la migración) y se reintenta.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE panel_user SET email = 'dup2@ejemplo.com' WHERE username = 'migr_dup2'")
+        conn.commit()
+        applied = migrate.run_migrations(conn, baseline=False, directory=migrate.MIGRATIONS_DIR, log=lambda *_: None)
+        assert "011" in applied
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('ux_panel_user_email')")
+            assert cur.fetchone()[0] is not None
+            cur.execute("SELECT email FROM panel_user WHERE username = 'migr_dup1'")
+            assert cur.fetchone()[0] == "dup@ejemplo.com"        # normalizado a minúsculas/trim
+            cur.execute("SELECT email FROM panel_user WHERE username = 'migr_sin_correo'")
+            assert cur.fetchone()[0] is None                     # nunca se inventa un correo
+            # El índice único rechaza un nuevo duplicado.
+            with pytest.raises(psycopg2.errors.UniqueViolation):
+                with conn.cursor() as cur2:
+                    cur2.execute("INSERT INTO panel_user (username, email, password_hash) "
+                                "VALUES ('migr_dup3', 'DUP@EJEMPLO.COM', 'x')")
+            conn.rollback()
+    finally:
+        if conn is not None:
+            conn.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+        support.drop_config_db(dbname)
