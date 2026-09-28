@@ -145,13 +145,15 @@ export const SECTIONS: DocSection[] = [
     id: "primeros-pasos",
     title: "Primeros pasos",
     icon: Rocket,
-    keywords: "iniciar sesión login cambiar contraseña roles alcance grupo usuario contraseña",
+    keywords: "iniciar sesión login cambiar contraseña roles alcance grupo correo contraseña",
     body: (
       <div className="space-y-4">
         <H3 id="ps-login">Iniciar sesión</H3>
         <P>
-          Abra el panel y entre a <Code>/login</Code> con su <b>usuario y contraseña</b>. No hay usuario ni
-          contraseña por defecto: un administrador debe crear su cuenta primero (sección «Usuarios y Auditoría»).
+          Abra el panel y entre a <Code>/login</Code> con su <b>correo y contraseña</b>. El acceso es por
+          correo (no por nombre de usuario). No hay correo ni contraseña por defecto: un administrador debe
+          crear su cuenta primero, con su correo, en «Usuarios y Auditoría». Si su cuenta no tiene correo
+          asignado, no podrá iniciar sesión hasta que un administrador se lo asigne.
         </P>
         <P>
           La sesión tiene una duración máxima desde el inicio de sesión y se cierra sola tras un tiempo sin
@@ -646,11 +648,14 @@ export const SECTIONS: DocSection[] = [
         </P>
         <H3 id="ua-usuarios">Usuarios</H3>
         <P>
-          Desde <UiLabel>Usuarios</UiLabel> un administrador puede: crear un usuario (se genera una contraseña
-          temporal que el nuevo usuario deberá cambiar en su primer inicio), editar sus datos, activarlo/desactivarlo,
-          asignarle roles con su alcance (todos los grupos o uno en concreto), reiniciar su contraseña, desbloquearlo
-          (botón <UiLabel>Desbloquear</UiLabel>) y cerrar sus <b>sesiones activas</b>. Solo un <b>superadministrador</b>{" "}
-          puede crear, editar, desactivar, desbloquear, reiniciar la contraseña o cambiar los roles de{" "}
+          Desde <UiLabel>Usuarios</UiLabel> un administrador puede: crear un usuario con su <b>correo</b> (obligatorio
+          y único: con él iniciará sesión; se genera una contraseña temporal que el nuevo usuario deberá cambiar en su
+          primer inicio), editar sus datos —incluido el correo—, activarlo/desactivarlo, asignarle roles con su
+          alcance (todos los grupos o uno en concreto), reiniciar su contraseña, desbloquearlo (botón{" "}
+          <UiLabel>Desbloquear</UiLabel>) y cerrar sus <b>sesiones activas</b>. El campo <UiLabel>Usuario</UiLabel> es
+          solo un identificador interno/visible: si se deja vacío al crear la cuenta, se deriva automáticamente del
+          correo. Un usuario sin correo asignado no puede iniciar sesión. Solo un <b>superadministrador</b> puede
+          crear, editar, desactivar, desbloquear, reiniciar la contraseña o cambiar los roles de{" "}
           <b>otro superadministrador</b>; nadie puede quitarse a sí mismo el rol de superadministrador ni sus propios
           roles (debe hacerlo otro administrador), y siempre queda al menos un superadministrador activo.
         </P>

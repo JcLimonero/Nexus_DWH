@@ -5,24 +5,24 @@ import { SESSION_COOKIE, SESSION_MAX_AGE, cookieSecure } from "@/lib/server/conf
 export const dynamic = "force-dynamic";
 
 /**
- * Inicio de sesión: valida usuario/contraseña contra el backend
+ * Inicio de sesión: valida correo/contraseña contra el backend
  * (POST /admin/auth/login) y guarda SOLO el token opaco de sesión en una cookie
  * httpOnly + SameSite=Strict (+ Secure en producción). El navegador nunca ve el token.
  */
 export async function POST(req: NextRequest) {
   const bad = csrfProblem(req);
   if (bad) return NextResponse.json({ detail: bad }, { status: 403 });
-  let username = "";
+  let email = "";
   let password = "";
   try {
-    const body = (await req.json()) as { username?: unknown; password?: unknown };
-    username = typeof body.username === "string" ? body.username.trim() : "";
+    const body = (await req.json()) as { email?: unknown; password?: unknown };
+    email = typeof body.email === "string" ? body.email.trim() : "";
     password = typeof body.password === "string" ? body.password : "";
   } catch {
     return NextResponse.json({ detail: "Solicitud no válida." }, { status: 400 });
   }
-  if (!username || !password || username.length > 64 || password.length > 1024) {
-    return NextResponse.json({ detail: "Ingresa usuario y contraseña." }, { status: 400 });
+  if (!email || !password || email.length > 255 || password.length > 1024) {
+    return NextResponse.json({ detail: "Ingresa correo y contraseña." }, { status: 400 });
   }
 
   let res: Response;
@@ -30,7 +30,7 @@ export async function POST(req: NextRequest) {
     res = await backendFetch("/admin/auth/login", {
       method: "POST",
       headers: { ...forwardHeaders(req), "content-type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ email, password }),
     });
   } catch {
     return NextResponse.json({ detail: "No se pudo contactar al backend DWH." }, { status: 502 });

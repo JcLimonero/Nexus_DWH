@@ -1,7 +1,7 @@
 """
 users_postgres.py — API de sesión y de administración de usuarios del panel
 ───────────────────────────────────────────────────────────────────────────
-  POST /admin/auth/login            (público; límite por IP y bloqueo por usuario)
+  POST /admin/auth/login             {email, password} (público; límite por IP y bloqueo por correo)
   POST /admin/auth/logout           (sesión)
   GET  /admin/auth/me               (sesión; también con must_change_password)
   POST /admin/auth/change-password  (sesión; política de contraseñas)
@@ -25,7 +25,8 @@ from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from panel_auth import (
-    AuthContext, AuthService, err, iso, not_found, password_problems, valid_username,
+    AuthContext, AuthService, derive_username_from_email, err, iso, not_found, password_problems,
+    valid_email, valid_username,
 )
 
 
@@ -34,7 +35,7 @@ class _Base(BaseModel):
 
 
 class LoginBody(_Base):
-    username: str = Field(..., min_length=1, max_length=64)
+    email: str = Field(..., min_length=1, max_length=255)
     password: str = Field(..., min_length=1, max_length=1024)
 
 
@@ -49,9 +50,9 @@ class RoleAssignment(_Base):
 
 
 class UserCreate(_Base):
-    username: str = Field(..., min_length=3, max_length=64)
+    email: str = Field(..., min_length=3, max_length=255)
+    username: Optional[str] = Field(None, max_length=64)
     display_name: str = Field("", max_length=120)
-    email: Optional[str] = Field(None, max_length=255)
     password: str = Field(..., min_length=1, max_length=256)
     is_superadmin: bool = False
     must_change_password: bool = True
@@ -60,7 +61,7 @@ class UserCreate(_Base):
 
 class UserUpdate(_Base):
     display_name: Optional[str] = Field(None, max_length=120)
-    email: Optional[str] = Field(None, max_length=255)
+    email: Optional[str] = Field(None, min_length=3, max_length=255)
     is_active: Optional[bool] = None
     is_superadmin: Optional[bool] = None
 
@@ -96,7 +97,7 @@ def create_users_router(*, auth: AuthService) -> APIRouter:
                 else:
                     self.conn.rollback()
                     if isinstance(ev, psycopg2.errors.UniqueViolation):
-                        raise err(409, "duplicate", "Ya existe un usuario con ese nombre.")
+                        raise err(409, "duplicate", "Ya existe un usuario con ese correo o nombre de usuario.")
                     if isinstance(ev, psycopg2.errors.ForeignKeyViolation):
                         raise err(404, "not_found", "Rol o grupo inexistente.")
             finally:
@@ -106,7 +107,7 @@ def create_users_router(*, auth: AuthService) -> APIRouter:
     # ── Sesión ──────────────────────────────────────────────────────────────
     @router.post("/auth/login", dependencies=[Depends(auth.public())])
     def login(body: LoginBody, request: Request) -> dict:
-        return auth.login(body.username, body.password, client_ip(request),
+        return auth.login(body.email, body.password, client_ip(request),
                           request.headers.get("user-agent", ""))
 
     @router.post("/auth/logout")
@@ -171,10 +172,22 @@ def create_users_router(*, auth: AuthService) -> APIRouter:
             raise not_found("Usuario")
         return user_out(r)
 
-    def check_password(pw: str, username: str) -> None:
-        problems = password_problems(pw, username, auth.s.password_min_length)
+    def check_password(pw: str, username: str, email: Optional[str] = None) -> None:
+        problems = password_problems(pw, username, auth.s.password_min_length, email=email)
         if problems:
             raise err(422, "weak_password", "La contraseña " + "; ".join(problems) + ".", problems=problems)
+
+    def unique_username(cur: Any, base: str) -> str:
+        """`base` saneado a las reglas de username; si ya existe, se sufija -2, -3, ... hasta caber en 64."""
+        candidate = base
+        n = 2
+        while True:
+            cur.execute("SELECT 1 FROM panel_user WHERE lower(username) = %s", (candidate,))
+            if not cur.fetchone():
+                return candidate
+            suffix = f"-{n}"
+            candidate = base[: 64 - len(suffix)] + suffix
+            n += 1
 
     def set_roles(cur: Any, user_id: int, roles: List[RoleAssignment], actor: str) -> None:
         cur.execute("SELECT code FROM panel_role")
@@ -220,24 +233,32 @@ def create_users_router(*, auth: AuthService) -> APIRouter:
 
     @router.post("/users", status_code=201)
     def create_user(body: UserCreate, request: Request, ctx: AuthContext = Depends(manage)) -> dict:
-        uname = body.username.strip().lower()
-        if not valid_username(uname):
-            raise err(422, "invalid_username",
-                      "Usuario: 3-64 caracteres en minúsculas, números, punto, guion o guion bajo.")
+        email = body.email.strip().lower()
+        if not valid_email(email):
+            raise err(422, "invalid_email", "Correo no válido.")
         if body.is_superadmin and not ctx.is_superadmin:
             raise err(403, "superadmin_required", "Solo un superadministrador puede crear otro superadministrador.")
-        check_password(body.password, uname)
+        base_uname = (body.username or "").strip().lower() or derive_username_from_email(email)
+        if not valid_username(base_uname):
+            raise err(422, "invalid_username",
+                      "Usuario: 3-64 caracteres en minúsculas, números, punto, guion o guion bajo.")
+        check_password(body.password, base_uname, email=email)
         with _Tx() as cur:
+            cur.execute("SELECT 1 FROM panel_user WHERE lower(email) = %s", (email,))
+            if cur.fetchone():
+                raise err(409, "duplicate", "Ya existe un usuario con ese correo.")
+            uname = unique_username(cur, base_uname)
             cur.execute("""INSERT INTO panel_user (username, display_name, email, password_hash, is_superadmin,
                                                    must_change_password, created_by, created_by_user_id)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                        (uname, body.display_name.strip() or uname, (body.email or "").strip() or None,
+                        (uname, body.display_name.strip() or uname, email,
                          auth.hash_password(body.password), body.is_superadmin, body.must_change_password,
                          ctx.username, ctx.user_id))
             uid = cur.fetchone()["id"]
             set_roles(cur, uid, body.roles, ctx.username)
             auth.audit(ctx, action="users.create", ip=client_ip(request), status_code=201, target_type="user",
-                       target_id=str(uid), details={"username": uname, "superadmin": body.is_superadmin,
+                       target_id=str(uid), details={"username": uname, "email": email,
+                                                    "superadmin": body.is_superadmin,
                                                     "roles": [a.model_dump() for a in body.roles]}, cur=cur)
             return get_user(cur, uid)
 
@@ -262,8 +283,14 @@ def create_users_router(*, auth: AuthService) -> APIRouter:
             for k in ("display_name", "email", "is_active", "is_superadmin"):
                 if k in data and data[k] is not None:
                     sets[k] = data[k].strip() if isinstance(data[k], str) else data[k]
-            if "email" in sets and not sets["email"]:
-                sets["email"] = None
+            if "email" in sets:
+                em = sets["email"].lower()
+                if not valid_email(em):
+                    raise err(422, "invalid_email", "Correo no válido.")
+                cur.execute("SELECT 1 FROM panel_user WHERE lower(email) = %s AND id <> %s", (em, user_id))
+                if cur.fetchone():
+                    raise err(409, "duplicate", "Ya existe un usuario con ese correo.")
+                sets["email"] = em
             if sets:
                 cols = ", ".join(f"{k} = %s" for k in sets)  # claves de lista blanca
                 cur.execute(f"UPDATE panel_user SET {cols}, updated_at = NOW() WHERE id = %s", (*sets.values(), user_id))
@@ -277,13 +304,13 @@ def create_users_router(*, auth: AuthService) -> APIRouter:
     def reset_password(user_id: int, body: ResetPasswordBody, request: Request,
                        ctx: AuthContext = Depends(manage)) -> dict:
         with _Tx() as cur:
-            cur.execute("SELECT username, is_superadmin FROM panel_user WHERE id = %s FOR UPDATE", (user_id,))
+            cur.execute("SELECT username, email, is_superadmin FROM panel_user WHERE id = %s FOR UPDATE", (user_id,))
             u = cur.fetchone()
             if not u:
                 raise not_found("Usuario")
             if u["is_superadmin"] and not ctx.is_superadmin:
                 raise err(403, "superadmin_required", "Solo un superadministrador puede reiniciar esa contraseña.")
-            check_password(body.password, u["username"])
+            check_password(body.password, u["username"], email=u["email"])
             cur.execute("""UPDATE panel_user SET password_hash = %s, must_change_password = TRUE,
                                   failed_attempts = 0, locked_until = NULL, password_changed_at = NOW(),
                                   updated_at = NOW() WHERE id = %s""", (auth.hash_password(body.password), user_id))

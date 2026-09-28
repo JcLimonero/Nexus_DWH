@@ -22,7 +22,7 @@ export function safeNext(next: string | null): string {
 
 export default function LoginForm() {
   const params = useSearchParams();
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -36,7 +36,7 @@ export default function LoginForm() {
       const res = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "content-type": "application/json", [CSRF_HEADER]: CSRF_VALUE },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ email, password }),
       });
       const data = (await res.json().catch(() => ({}))) as { detail?: string; must_change_password?: boolean };
       if (!res.ok) {
@@ -62,18 +62,19 @@ export default function LoginForm() {
         <p className="text-sm text-slate-500">Panel de administración</p>
       </div>
       <form onSubmit={onSubmit} className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-        <label htmlFor="username" className="mb-1 block text-sm font-medium text-slate-700">
-          Usuario
+        <label htmlFor="email" className="mb-1 block text-sm font-medium text-slate-700">
+          Correo
         </label>
         <Input
-          id="username"
-          autoComplete="username"
+          id="email"
+          type="email"
+          autoComplete="username email"
           autoCapitalize="none"
           spellCheck={false}
           autoFocus
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          maxLength={64}
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          maxLength={255}
         />
         <label htmlFor="password" className="mb-1 mt-4 block text-sm font-medium text-slate-700">
           Contraseña
@@ -106,7 +107,7 @@ export default function LoginForm() {
           type="submit"
           className="mt-5 w-full"
           loading={loading}
-          disabled={!username.trim() || !password}
+          disabled={!email.trim() || !password}
           icon={<LogIn className="h-4 w-4" />}
         >
           Entrar

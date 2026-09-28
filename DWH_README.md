@@ -629,7 +629,7 @@ El panel incluye además su propia **documentación de usuario** en `/docs` (men
 
 ### 16.2. Seguridad
 
-- Login en `/login` con **usuario y contraseña** (sección 20). La ruta del servidor Next `POST /api/auth/login` llama a `POST /admin/auth/login` y guarda **solo el token opaco de sesión** en una cookie **httpOnly, SameSite=Strict** (Secure en producción); nunca la contraseña, y el token no llega al JavaScript del navegador. Si la contraseña debe cambiarse, el panel lleva a `/cambiar-contrasena` y el backend rechaza todo lo demás (403 `password_change_required`). Cerrar sesión revoca la sesión en el backend y borra la cookie.
+- Login en `/login` con **correo y contraseña** (sección 20; el acceso es por correo, no por nombre de usuario). La ruta del servidor Next `POST /api/auth/login` llama a `POST /admin/auth/login` con `{email, password}` y guarda **solo el token opaco de sesión** en una cookie **httpOnly, SameSite=Strict** (Secure en producción); nunca la contraseña, y el token no llega al JavaScript del navegador. Si la contraseña debe cambiarse, el panel lleva a `/cambiar-contrasena` y el backend rechaza todo lo demás (403 `password_change_required`). Cerrar sesión revoca la sesión en el backend y borra la cookie.
 - El navegador **nunca** habla directo con el backend: todo pasa por el proxy `app/api/dwh/[...path]` (solo `/admin/*`; `admin/auth/login|logout` bloqueados), que agrega `Authorization: Bearer <sesión>` y la IP real del navegador (`X-Forwarded-For`).
 - **CSRF**: además de SameSite=Strict, toda petición que modifica (login, logout y el proxy) exige la cabecera `x-nexus-csrf: 1`, y se rechaza si `Origin` no es el del panel o `Sec-Fetch-Site` es de otro sitio (403). El origen esperado es `DWH_PUBLIC_ORIGIN` (recomendado en producción, p. ej. `https://panel.midominio.com`); sin él, el `Host` de la petición (nunca `X-Forwarded-Host`, que controla el cliente).
 - IP del usuario hacia el backend: `x-nexus-client-ip` + clave `DWH_PANEL_PROXY_KEY` (sección 20.3); el panel no reenvía `X-Forwarded-For`.
@@ -664,9 +664,9 @@ cd dwh_back
 python3.12 -m venv .venv && .venv/bin/pip install -r requirements_postgres.txt
 .venv/bin/python main_postgres.py --port 8010
 
-# 3) Primer usuario (no hay usuario por defecto)
+# 3) Primer usuario (no hay usuario por defecto; el acceso es por correo)
 .venv/bin/python migrate.py
-.venv/bin/python manage_users.py create-superadmin --username mi_usuario
+.venv/bin/python manage_users.py create-superadmin --email mi_correo@dominio.com
 
 # 4) Panel
 cd dwh_front
@@ -1179,27 +1179,30 @@ cd dwh_client && .venv/bin/python -m pytest tests/test_inventory_integration.py 
 
 ## 20. Usuarios, roles, permisos por grupo y auditoría (PostgreSQL)
 
-Módulos `dwh_back/panel_auth.py`, `users_postgres.py`, `manage_users.py`, `db_pool.py`, `ratelimit.py`; migración `009_usuarios_permisos`; páginas **Usuarios** y **Auditoría** del panel. Sustituye el acceso con un único token de administrador.
+Módulos `dwh_back/panel_auth.py`, `users_postgres.py`, `manage_users.py`, `db_pool.py`, `ratelimit.py`; migraciones `009_usuarios_permisos` y `011_login_correo`; páginas **Usuarios** y **Auditoría** del panel. Sustituye el acceso con un único token de administrador.
 
 ### 20.1. Usuarios y contraseñas
 
-- `panel_user`: usuario (minúsculas, único sin distinguir mayúsculas), nombre visible, correo opcional, activo, superadministrador, `must_change_password`, intentos fallidos, bloqueo, último acceso, auditoría de alta.
+- `panel_user`: usuario (minúsculas, único sin distinguir mayúsculas; identificador interno/visible, no sirve para iniciar sesión), **correo** (único sin distinguir mayúsculas desde la migración `011_login_correo`; **el acceso al panel es por correo**), nombre visible, activo, superadministrador, `must_change_password`, intentos fallidos, bloqueo, último acceso, auditoría de alta. Un usuario sin correo (heredado de antes de la migración 011) **no puede iniciar sesión** hasta que un administrador (panel o `manage_users.py set-email`) le asigne uno; nunca se inventa un correo.
 - **Hash argon2id** (`argon2-cffi`, parámetros RFC 9106 perfil *low memory*: 64 MiB, t=3, p=4; ≈ 40 ms). Elegido frente a `hashlib.scrypt` por ser el estándar recomendado (OWASP) y re-hashear solo si cambian los parámetros. Nunca se guarda ni registra la contraseña.
-- Política: mínimo `[auth] password_min_length` (12), máximo 256, no puede contener el usuario, no puede ser una contraseña común/predecible (lista corta + caracteres repetidos), distinta de la actual. Sin reglas de composición (NIST 800-63B).
-- **No hay usuario ni contraseña por defecto.** Primer superadministrador (en el servidor del backend, con el mismo `config.ini`):
+- Política: mínimo `[auth] password_min_length` (12), máximo 256, no puede contener el usuario ni la parte local de su correo (lo anterior de la `@`), no puede ser una contraseña común/predecible (lista corta + caracteres repetidos), distinta de la actual. Sin reglas de composición (NIST 800-63B).
+- **No hay usuario, correo ni contraseña por defecto.** Primer superadministrador (en el servidor del backend, con el mismo `config.ini`):
 
   ```
   python migrate.py
-  python manage_users.py create-superadmin --username jlimon          # pide la contraseña 2 veces
-  NEXUS_NEW_USER_PASSWORD=... python manage_users.py create-superadmin --username jlimon --password-env NEXUS_NEW_USER_PASSWORD
-  python manage_users.py list | reset-password --username X | unlock --username X | deactivate --username X | revoke-sessions --username X
+  python manage_users.py create-superadmin --email jlimon@nexusqtech.com          # pide la contraseña 2 veces
+  NEXUS_NEW_USER_PASSWORD=... python manage_users.py create-superadmin --email jlimon@nexusqtech.com \
+      --password-env NEXUS_NEW_USER_PASSWORD
+  python manage_users.py list
+  python manage_users.py set-email --username jlimon --new-email jlimon2@nexusqtech.com   # o --user-id N
+  python manage_users.py reset-password --email X | unlock --email X | deactivate --email X | revoke-sessions --email X
   ```
 
-  Por defecto obliga a cambiar la contraseña en el primer inicio (`--no-force-change` lo evita). Cada acción queda en `panel_audit_log` con actor `cli`.
+  `--username` (opcional) fija el identificador interno/visible; si se omite, se **deriva de la parte local del correo** (saneada a las reglas de usuario y sufijada si ya existe). Los comandos de mantenimiento aceptan `--email` **o** `--username` (no ambos) para identificar la cuenta. Por defecto obliga a cambiar la contraseña en el primer inicio (`--no-force-change` lo evita). Cada acción queda en `panel_audit_log` con actor `cli`.
 
 ### 20.2. Sesiones
 
-- `POST /admin/auth/login {username, password}` → token **opaco** de 256 bits (`secrets.token_urlsafe(32)`) + perfil + permisos efectivos. En BD solo `sha256(token)` (`panel_session.token_hash`).
+- **El acceso al panel es por correo** (migración `011_login_correo`; antes era por usuario). `POST /admin/auth/login {email, password}` → token **opaco** de 256 bits (`secrets.token_urlsafe(32)`) + perfil + permisos efectivos. La búsqueda es por `lower(email)`: un usuario sin correo asignado nunca puede iniciar sesión. En BD solo `sha256(token)` (`panel_session.token_hash`).
 - Vencimiento **absoluto** `[auth] session_absolute_seconds` (12 h) y por **inactividad** `session_idle_seconds` (30 min; cada petición renueva `last_seen_at`). Se revoca al cerrar sesión, al cambiar/reiniciar la contraseña (las demás sesiones), al desactivar el usuario o desde **Usuarios → Sesiones activas**.
 - `GET /admin/auth/me` (perfil, permisos por grupo y grupos visibles), `POST /admin/auth/logout`, `POST /admin/auth/change-password {current_password, new_password}`.
 - Con `must_change_password` todo lo demás responde **403** `password_change_required` (solo `me`, `logout` y `change-password`).
@@ -1207,8 +1210,8 @@ Módulos `dwh_back/panel_auth.py`, `users_postgres.py`, `manage_users.py`, `db_p
 
 ### 20.3. Protección contra fuerza bruta
 
-- **Por usuario (BD)**: tras `max_failed_attempts` (5) fallos, bloqueo de `lockout_base_seconds × 2^(fallos − 5)` (30 s, 60 s, 120 s…, tope `lockout_max_seconds` = 1 h). Durante el bloqueo ni la contraseña correcta entra (429 `account_locked`). Un inicio correcto reinicia el contador; **Usuarios → Desbloquear** o `manage_users.py unlock`.
-- **Usuarios inexistentes**: mismo bloqueo en memoria (el 429 no revela si el usuario existe) y la contraseña se verifica contra un hash argon2id de referencia (tiempo de respuesta similar; misma respuesta 401 `invalid_credentials`).
+- **Por correo (BD)**: tras `max_failed_attempts` (5) fallos, bloqueo de `lockout_base_seconds × 2^(fallos − 5)` (30 s, 60 s, 120 s…, tope `lockout_max_seconds` = 1 h). Durante el bloqueo ni la contraseña correcta entra (429 `account_locked`). Un inicio correcto reinicia el contador; **Usuarios → Desbloquear** o `manage_users.py unlock`.
+- **Correos inexistentes (o sin cuenta)**: mismo bloqueo en memoria, contado por correo (el 429 no revela si el correo existe) y la contraseña se verifica contra un hash argon2id de referencia (tiempo de respuesta similar; misma respuesta 401 `invalid_credentials`).
 - **Por IP**: `ip_max_failures` (30) fallos (de cualquier usuario: cubre el "rociado" de contraseñas) en `ip_window_seconds` (15 min) → 429, **solo si la IP del usuario es conocida y no compartida**. Con IP desconocida, loopback o la de un proxy de confianza (el panel sin clave), **no** hay límite por IP y queda solo el bloqueo por usuario: los fallos de un atacante nunca bloquean a todos los usuarios.
 - **Cómo se conoce la IP** (despliegue): `X-Forwarded-For` **nunca** se usa en el backend (uvicorn arranca con `proxy_headers = false`; `[server] proxy_headers`/`forwarded_allow_ips` solo si hay un proxy inverso de confianza delante del backend). El servidor del panel envía `x-nexus-client-ip` + `x-nexus-proxy-key`; el backend lo acepta solo si la petición viene de `[auth] trusted_proxies` (direcciones o redes CIDR) **y** la clave coincide con `[auth] panel_proxy_key` (= `DWH_PANEL_PROXY_KEY` del panel; también `NEXUS_PANEL_PROXY_KEY`). El panel obtiene la IP del navegador solo de fuentes de confianza: `DWH_CLIENT_IP_HEADER` (p. ej. `x-real-ip` que su nginx **sobrescribe** con `$remote_addr`) o `DWH_TRUSTED_PROXY_HOPS = N` (N proxies que **agregan** a `X-Forwarded-For`: se toma el N-ésimo desde el final), nunca el primer valor de `X-Forwarded-For`. Sin configurar (defecto) la IP es desconocida: Next como servidor propio no expone la IP del socket cuando el cliente ya manda `X-Forwarded-For`. Recomendado en producción: nginx con HTTPS delante del panel, `proxy_set_header X-Real-IP $remote_addr;`, `DWH_CLIENT_IP_HEADER=x-real-ip` y la clave compartida.
 - Límites en memoria: por proceso (con varias réplicas, el límite es por réplica); el bloqueo por usuario es en BD (compartido).
@@ -1283,7 +1286,7 @@ Backend: `[admin] allow_static_token`; `[auth] session_absolute_seconds`, `sessi
 cd dwh_back && .venv/bin/python -m pytest tests/test_panel_auth.py -q
 ```
 
-`test_panel_auth.py` (BD propia y tres backends: normal, con límites bajos y pool de 5, y con límite por IP): inicio de sesión correcto/fallido con respuesta genérica; token de sesión solo como hash y contraseña en argon2id (ni en logs, `activity_log` ni auditoría); bloqueo por usuario con backoff exponencial (2 s → 4 s) y usuario inexistente con las mismas reglas; límite por IP; tiempo similar usuario existente/inexistente; vencimiento por inactividad y absoluto; logout revoca; política de contraseñas y cambio (cierra las demás sesiones); `must_change_password` bloquea el resto; token estático deshabilitado por defecto y auditado cuando se habilita; CLI de superadministrador; **todas las rutas `/admin` declaran permiso** (introspección de `app.routes`); matriz de permisos (acción representativa de cada permiso, 200/403/409); secretos y tokens solo con `credentials.manage`; aislamiento A/B en ~20 listas, agregados y contadores, 404 en detalles y mutaciones fuera del alcance (incluido DWH compartido que exige el permiso en todos sus grupos) sin cambios en B; auditoría por alcance; administración de usuarios (roles globales, superadmin, desactivar/reiniciar/sesiones); límites de enrolamiento y de credenciales inválidas; **100 peticiones concurrentes con pool de 5** sin errores ni más de 5 conexiones; DWH compartido que no nombra al grupo dueño fuera del alcance. Regresiones (validación): límite por IP solo con la IP enviada por el panel con clave, `X-Forwarded-For` rotado o clave incorrecta ignorados y sin bloqueo global; IP de sesión solo con clave; administrador de usuarios no superadmin no toca superadmins (6 acciones) ni sus propios roles; contador de sesiones sin las inactivas; prefijos de token ocultos sin credenciales; nombre de DWH neutro y nombres de otros grupos/instalaciones ocultos; el pool **reutiliza** las mismas conexiones (PID estables) y deja `DISCARD ALL`.
+`test_panel_auth.py` (BD propia y tres backends: normal, con límites bajos y pool de 5, y con límite por IP): inicio de sesión **por correo** correcto/fallido con respuesta genérica (incluye correo insensible a mayúsculas y rechazo del campo `username` en el cuerpo con 422); token de sesión solo como hash y contraseña en argon2id (ni en logs, `activity_log` ni auditoría); bloqueo por correo con backoff exponencial (2 s → 4 s) y correo inexistente con las mismas reglas; límite por IP; tiempo similar correo existente/inexistente; vencimiento por inactividad y absoluto; logout revoca; política de contraseñas y cambio (cierra las demás sesiones; tampoco puede contener la parte local del correo); `must_change_password` bloquea el resto; token estático deshabilitado por defecto y auditado cuando se habilita; CLI de superadministrador (`--email`, usuario derivado del correo, `set-email`); correo duplicado → 409 (alta y edición) y formato inválido → 422; **usuario sin correo no puede iniciar sesión** hasta que se le asigne uno; migración `011_login_correo` normaliza correos existentes y **aborta** si quedan duplicados (sin perder ni modificar nada), y aplica limpio tras corregirlos; **todas las rutas `/admin` declaran permiso** (introspección de `app.routes`); matriz de permisos (acción representativa de cada permiso, 200/403/409); secretos y tokens solo con `credentials.manage`; aislamiento A/B en ~20 listas, agregados y contadores, 404 en detalles y mutaciones fuera del alcance (incluido DWH compartido que exige el permiso en todos sus grupos) sin cambios en B; auditoría por alcance; administración de usuarios (roles globales, superadmin, desactivar/reiniciar/sesiones); límites de enrolamiento y de credenciales inválidas; **100 peticiones concurrentes con pool de 5** sin errores ni más de 5 conexiones; DWH compartido que no nombra al grupo dueño fuera del alcance. Regresiones (validación): límite por IP solo con la IP enviada por el panel con clave, `X-Forwarded-For` rotado o clave incorrecta ignorados y sin bloqueo global; IP de sesión solo con clave; administrador de usuarios no superadmin no toca superadmins (6 acciones) ni sus propios roles; contador de sesiones sin las inactivas; prefijos de token ocultos sin credenciales; nombre de DWH neutro y nombres de otros grupos/instalaciones ocultos; el pool **reutiliza** las mismas conexiones (PID estables) y deja `DISCARD ALL`.
 
 Panel (servidor Next): script de prueba de CSRF y proxy (cabecera obligatoria, Origin/Sec-Fetch-Site ajenos → 403, cookie httpOnly/SameSite=Strict, token nunca en el cuerpo, `/monitor/*` y `admin/auth/login` no reenviados, logout revoca en el backend).
 
@@ -1629,7 +1632,7 @@ Con proxy headers activos, las peticiones internas del panel (que no envían `X-
 
 Las variables `DWH_*` son solo de servidor y se leen **en tiempo de ejecución** (no se incrustan en el build; verificado en `.next/server`): cambiarlas solo requiere reiniciar, no reconstruir. El panel ya no usa `DWH_MONITOR_TOKEN`.
 
-**IP del navegador detrás de Traefik** (límite de login por IP, §20.3; verificado con Traefik v3 local): Traefik, con su configuración por defecto, **borra** los `X-Forwarded-For`/`X-Real-Ip` que manda el cliente y los reescribe con la IP del socket, así que tanto `DWH_CLIENT_IP_HEADER=x-real-ip` como `DWH_TRUSTED_PROXY_HOPS=1` dan la IP real. Pero si el Traefik del servidor tiene `forwardedHeaders.insecure=true` (o `trustedIPs` amplios), **conserva** el `X-Real-Ip` del cliente (falsificable) mientras que a `X-Forwarded-For` solo **agrega** la IP real al final: `DWH_TRUSTED_PROXY_HOPS=1` sigue siendo correcto en ambos casos, por eso es la opción recomendada. Si hay otro proxy delante de Traefik (p. ej. Cloudflare en modo proxy), súmelo: `DWH_TRUSTED_PROXY_HOPS=2`. Comprobación tras desplegar: intente iniciar sesión con un usuario inexistente enviando `curl -H 'X-Real-Ip: 1.2.3.4' -H 'X-Forwarded-For: 1.2.3.4' -H 'x-nexus-csrf: 1' -H 'Origin: https://dwh-panel.midominio.com' -H 'content-type: application/json' -d '{"username":"prueba_ip","password":"xxxxxxxxxxxxxx"}' https://dwh-panel.midominio.com/api/auth/login` y confirme en **Auditoría** que la IP del intento es la suya y no `1.2.3.4`.
+**IP del navegador detrás de Traefik** (límite de login por IP, §20.3; verificado con Traefik v3 local): Traefik, con su configuración por defecto, **borra** los `X-Forwarded-For`/`X-Real-Ip` que manda el cliente y los reescribe con la IP del socket, así que tanto `DWH_CLIENT_IP_HEADER=x-real-ip` como `DWH_TRUSTED_PROXY_HOPS=1` dan la IP real. Pero si el Traefik del servidor tiene `forwardedHeaders.insecure=true` (o `trustedIPs` amplios), **conserva** el `X-Real-Ip` del cliente (falsificable) mientras que a `X-Forwarded-For` solo **agrega** la IP real al final: `DWH_TRUSTED_PROXY_HOPS=1` sigue siendo correcto en ambos casos, por eso es la opción recomendada. Si hay otro proxy delante de Traefik (p. ej. Cloudflare en modo proxy), súmelo: `DWH_TRUSTED_PROXY_HOPS=2`. Comprobación tras desplegar: intente iniciar sesión con un correo inexistente enviando `curl -H 'X-Real-Ip: 1.2.3.4' -H 'X-Forwarded-For: 1.2.3.4' -H 'x-nexus-csrf: 1' -H 'Origin: https://dwh-panel.midominio.com' -H 'content-type: application/json' -d '{"email":"prueba_ip@dominio.com","password":"xxxxxxxxxxxxxx"}' https://dwh-panel.midominio.com/api/auth/login` y confirme en **Auditoría** que la IP del intento es la suya y no `1.2.3.4`.
 
 ### 23.5. Generar los secretos (en su equipo, nunca en el repo)
 
@@ -1658,11 +1661,13 @@ En la **Terminal** del backend (Coolify → aplicación → *Terminal*; o `docke
 
 ```
 python migrate.py
-python manage_users.py create-superadmin --username jlimon      # pide la contraseña dos veces
+python manage_users.py create-superadmin --email jlimon@nexusqtech.com      # pide la contraseña dos veces
 python manage_users.py list
 ```
 
-Usa las mismas variables `NEXUS__DATABASE__*` del contenedor (no hace falta `config.ini`). Si la terminal no es interactiva: `NEXUS_NEW_USER_PASSWORD=... python manage_users.py create-superadmin --username X --password-env NEXUS_NEW_USER_PASSWORD` (evite dejar la contraseña en el historial). Por defecto obliga a cambiar la contraseña en el primer inicio.
+El acceso al panel es **por correo**; `--username` es opcional (se deriva del correo si se omite). Usa las mismas variables `NEXUS__DATABASE__*` del contenedor (no hace falta `config.ini`). Si la terminal no es interactiva: `NEXUS_NEW_USER_PASSWORD=... python manage_users.py create-superadmin --email jlimon@nexusqtech.com --password-env NEXUS_NEW_USER_PASSWORD` (evite dejar la contraseña en el historial). Por defecto obliga a cambiar la contraseña en el primer inicio.
+
+**Cuentas existentes tras actualizar a esta versión**: la migración `011_login_correo` normaliza los correos ya cargados y crea el índice único; si algún usuario **no tiene correo** (o su correo quedó en conflicto y la migración avisó de un duplicado), no podrá iniciar sesión hasta asignárselo: `python manage_users.py set-email --username X --new-email correo@dominio` (o `--user-id N`), o desde el panel en **Usuarios → Editar**.
 
 ### 23.8. Actualizaciones y agentes
 

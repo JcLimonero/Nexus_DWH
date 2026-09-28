@@ -263,7 +263,7 @@ class AuthContext:
 # ─────────────────────────────────────────────────────────────────────────────
 # Política de contraseñas
 # ─────────────────────────────────────────────────────────────────────────────
-def password_problems(password: str, username: str, min_length: int) -> List[str]:
+def password_problems(password: str, username: str, min_length: int, email: Optional[str] = None) -> List[str]:
     p = password or ""
     problems: List[str] = []
     if len(p) < min_length:
@@ -274,6 +274,10 @@ def password_problems(password: str, username: str, min_length: int) -> List[str
     u = (username or "").lower()
     if u and (low == u or u in low):
         problems.append("no puede contener el nombre de usuario")
+    # Tampoco la parte local del correo (antes de la @): p. ej. "jlimon" en jlimon@dominio.com.
+    local = (email or "").split("@", 1)[0].strip().lower()
+    if local and local != u and (low == local or local in low):
+        problems.append("no puede contener la parte local de su correo")
     if low in COMMON_PASSWORDS or (low and len(set(low)) <= 2):
         problems.append("es demasiado común o predecible")
     return problems
@@ -283,6 +287,8 @@ def password_problems(password: str, username: str, min_length: int) -> List[str
 # Servicio
 # ─────────────────────────────────────────────────────────────────────────────
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
+# Validación de correo pragmática (no exhaustiva RFC 5322): local@dominio.tld.
+EMAIL_RE = re.compile(r"^[^@\s]{1,200}@[^@\s]{1,190}\.[^@\s]{2,24}$")
 
 
 class AuthService:
@@ -468,8 +474,8 @@ class AuthService:
         return dependency
 
     # ── Login / logout / contraseña ─────────────────────────────────────────
-    def login(self, username: str, password: str, ip: str, user_agent: str) -> Dict[str, Any]:
-        uname = (username or "").strip().lower()[:64]
+    def login(self, email: str, password: str, ip: str, user_agent: str) -> Dict[str, Any]:
+        em = (email or "").strip().lower()[:255]
         pw = password or ""
         if len(pw) > 1024:
             pw = pw[:1024]  # nunca se hashea algo enorme (DoS); igual fallará
@@ -483,16 +489,18 @@ class AuthService:
         conn = self._conn()
         try:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            # Solo por correo (minúsculas); un usuario sin correo (email IS NULL) nunca coincide
+            # aquí y por lo tanto no puede iniciar sesión hasta que se le asigne uno.
             cur.execute("""SELECT id, username, display_name, password_hash, is_active, is_superadmin,
                                   must_change_password, failed_attempts, locked_until
-                           FROM panel_user WHERE lower(username) = %s FOR UPDATE""", (uname,))
+                           FROM panel_user WHERE email IS NOT NULL AND lower(email) = %s FOR UPDATE""", (em,))
             u = cur.fetchone()
             now = utcnow()
             locked = None
             if u and u["locked_until"] and u["locked_until"] > now:
                 locked = (u["locked_until"] - now).total_seconds()
             elif not u:
-                locked = self.unknown_users.locked_for(uname)
+                locked = self.unknown_users.locked_for(em)
             if locked:
                 conn.rollback()
                 # Misma conexión (nunca se piden dos a la vez del pool).
@@ -504,7 +512,7 @@ class AuthService:
             ok = self.verify_password(u["password_hash"] if u else None, pw)
             if not u or not ok or not u["is_active"]:
                 self.ip_failures.hit(ipk)
-                reason = "unknown_user" if not u else ("inactive" if ok and not u["is_active"] else "bad_password")
+                reason = "unknown_email" if not u else ("inactive" if ok and not u["is_active"] else "bad_password")
                 if u:
                     fails = int(u["failed_attempts"]) + 1
                     secs = lock_seconds(fails, self.s.max_failed_attempts, self.s.lockout_base_seconds,
@@ -514,7 +522,7 @@ class AuthService:
                                                               ELSE locked_until END
                                    WHERE id = %s""", (fails, secs, secs, u["id"]))
                 else:
-                    self.unknown_users.fail(uname)
+                    self.unknown_users.fail(em)
                 self.audit(None, action="auth.login_failed", actor_user_id=u["id"] if u else None,
                            actor_name=u["username"] if u else "", ip=ip, status_code=401,
                            details={"reason": reason}, cur=cur)
@@ -584,7 +592,8 @@ class AuthService:
         conn = self._conn()
         try:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("SELECT username, password_hash FROM panel_user WHERE id = %s FOR UPDATE", (ctx.user_id,))
+            cur.execute("SELECT username, email, password_hash FROM panel_user WHERE id = %s FOR UPDATE",
+                       (ctx.user_id,))
             u = cur.fetchone()
             if not u or not self.verify_password(u["password_hash"], (current or "")[:1024]):
                 conn.rollback()
@@ -592,7 +601,7 @@ class AuthService:
                 self.audit(ctx, action="auth.change_password_failed", ip=ip, status_code=401, cur=cur)
                 conn.commit()
                 raise err(401, "invalid_credentials", "La contraseña actual no es correcta.")
-            problems = password_problems(new, u["username"], self.s.password_min_length)
+            problems = password_problems(new, u["username"], self.s.password_min_length, email=u["email"])
             if not problems and self.verify_password(u["password_hash"], new):
                 problems.append("debe ser distinta de la actual")
             if problems:
@@ -774,6 +783,23 @@ def mdb_scope_sql(ctx: AuthContext, alias: str = "md", perm: str = "view") -> Tu
 
 def valid_username(username: str) -> bool:
     return bool(USERNAME_RE.match(username or ""))
+
+
+def valid_email(email: str) -> bool:
+    return bool(EMAIL_RE.match((email or "").strip()))
+
+
+def derive_username_from_email(email: str) -> str:
+    """Parte local del correo (antes de la @), saneada a las reglas de USERNAME_RE (3-64: minúsculas,
+    números, punto, guion o guion bajo, empezando por letra/número)."""
+    local = (email or "").split("@", 1)[0].strip().lower()
+    local = re.sub(r"[^a-z0-9._-]", "", local)
+    local = local.lstrip("._-")
+    if not local:
+        local = "usuario"
+    while len(local) < 3:
+        local += "0"
+    return local[:64]
 
 
 def dependency_permissions(dependant: Any) -> List[str]:

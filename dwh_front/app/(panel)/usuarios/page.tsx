@@ -18,9 +18,9 @@ interface RoleRow {
 }
 
 interface FormState {
+  email: string;
   username: string;
   display_name: string;
-  email: string;
   password: string;
   must_change_password: boolean;
   is_superadmin: boolean;
@@ -29,9 +29,9 @@ interface FormState {
 }
 
 const EMPTY: FormState = {
+  email: "",
   username: "",
   display_name: "",
-  email: "",
   password: "",
   must_change_password: true,
   is_superadmin: false,
@@ -91,9 +91,9 @@ function UsersAdmin({ isSuper, myId }: { isSuper: boolean; myId: number | null }
   function openEdit(u: PanelUser) {
     setEditing(u);
     setForm({
+      email: u.email ?? "",
       username: u.username,
       display_name: u.display_name,
-      email: u.email ?? "",
       password: "",
       must_change_password: u.must_change_password,
       is_superadmin: u.is_superadmin,
@@ -132,9 +132,9 @@ function UsersAdmin({ isSuper, myId }: { isSuper: boolean; myId: number | null }
     const res = await run("save", "admin/users", {
       method: "POST",
       body: {
-        username: form.username.trim().toLowerCase(),
+        email: form.email.trim().toLowerCase(),
+        username: form.username.trim().toLowerCase() || undefined,
         display_name: form.display_name.trim(),
-        email: form.email.trim() || null,
         password: form.password,
         must_change_password: form.must_change_password,
         is_superadmin: isSuper ? form.is_superadmin : false,
@@ -389,22 +389,35 @@ function UsersAdmin({ isSuper, myId }: { isSuper: boolean; myId: number | null }
         }
       >
         <form id="user-form" onSubmit={onSubmit} className="grid gap-4 sm:grid-cols-6">
-          <Field label="Usuario" required className="sm:col-span-3" htmlFor="u-name" hint="3-64: minúsculas, números, punto, guion o guion bajo.">
+          <Field label="Correo" required className="sm:col-span-3" htmlFor="u-email" hint="Con este correo iniciará sesión.">
             <Input
-              id="u-name"
+              id="u-email"
+              type="email"
               required
-              disabled={Boolean(editing)}
               autoComplete="off"
-              pattern="[a-z0-9][a-z0-9._\-]{2,63}"
-              value={form.username}
-              onChange={(e) => set("username", e.target.value.toLowerCase())}
+              maxLength={255}
+              value={form.email}
+              onChange={(e) => set("email", e.target.value)}
             />
           </Field>
           <Field label="Nombre visible" className="sm:col-span-3" htmlFor="u-display">
             <Input id="u-display" maxLength={120} value={form.display_name} onChange={(e) => set("display_name", e.target.value)} />
           </Field>
-          <Field label="Correo (opcional)" className="sm:col-span-6" htmlFor="u-email">
-            <Input id="u-email" type="email" maxLength={255} value={form.email} onChange={(e) => set("email", e.target.value)} />
+          <Field
+            label="Usuario"
+            className="sm:col-span-6"
+            htmlFor="u-name"
+            hint={editing ? "3-64: minúsculas, números, punto, guion o guion bajo." : "Opcional: si se deja vacío se deriva del correo. 3-64: minúsculas, números, punto, guion o guion bajo."}
+          >
+            <Input
+              id="u-name"
+              disabled={Boolean(editing)}
+              autoComplete="off"
+              placeholder={editing ? undefined : "(se deriva del correo)"}
+              pattern="[a-z0-9][a-z0-9._\-]{2,63}"
+              value={form.username}
+              onChange={(e) => set("username", e.target.value.toLowerCase())}
+            />
           </Field>
           {!editing && (
             <Field
