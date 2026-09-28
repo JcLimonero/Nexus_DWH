@@ -121,6 +121,8 @@ export interface Company extends Timestamps, SecretInfo, TokenInfo {
   verbose_logging: boolean;
   refresh_seconds: number;
   is_enabled: boolean;
+  /** Si es false, "Crear un extractor desde el query" solo entrega columnas/tipos (nunca filas). */
+  allow_data_preview: boolean;
   group_enabled: boolean;
   agency_count: number;
   object_count: number;

@@ -181,6 +181,7 @@ class CompanyCreate(CompanyWarehouse):
     verbose_logging: bool = False
     refresh_seconds: int = Field(60, ge=5, le=86400)
     is_enabled: bool = True
+    allow_data_preview: bool = True
 
 
 class CompanyUpdate(CompanyWarehouse):
@@ -198,6 +199,7 @@ class CompanyUpdate(CompanyWarehouse):
     verbose_logging: Optional[bool] = None
     refresh_seconds: Optional[int] = Field(None, ge=5, le=86400)
     is_enabled: Optional[bool] = None
+    allow_data_preview: Optional[bool] = None
 
 
 class AgencyCreate(_Base):
@@ -728,7 +730,7 @@ def create_admin_router(
         SELECT c.id, c.group_id, g.name AS group_name, c.name, c.company_token,
                c.source_type, c.source_host, c.source_port, c.source_database,
                c.source_username, c.source_password, c.source_dsn,
-               c.verbose_logging, c.refresh_seconds, c.is_enabled,
+               c.verbose_logging, c.refresh_seconds, c.is_enabled, c.allow_data_preview,
                c.warehouse_mode, c.warehouse_host, c.warehouse_port, c.warehouse_database,
                c.warehouse_username, c.warehouse_password, c.warehouse_schema, c.warehouse_sslmode,
                c.warehouse_sslrootcert,
@@ -877,6 +879,7 @@ def create_admin_router(
             "verbose_logging": body.verbose_logging,
             "refresh_seconds": body.refresh_seconds,
             "is_enabled": body.is_enabled,
+            "allow_data_preview": body.allow_data_preview,
         }
         for f in COMPANY_SECRET_FIELDS:
             values[f] = encrypt_value(getattr(body, f), f)

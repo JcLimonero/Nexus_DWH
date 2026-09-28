@@ -410,6 +410,7 @@ def create_agent_routers(
     inventory: Optional[Any] = None,
     latest_agent_version: str = "",
     connection_tests: Optional[Any] = None,
+    query_commands: Optional[Any] = None,
 ) -> Tuple[APIRouter, APIRouter, APIRouter]:
     """
     Devuelve (agent_router, admin_router, monitor_router).
@@ -1043,9 +1044,16 @@ def create_agent_routers(
                     pending_tests = connection_tests.pending_for(cur, ctx)
                 except Exception:  # noqa: BLE001 — el latido nunca falla por esto
                     pending_tests = 0
+            pending_commands = 0
+            if query_commands is not None:
+                try:
+                    pending_commands = query_commands.pending_for(cur, ctx)
+                except Exception:  # noqa: BLE001 — el latido nunca falla por esto
+                    pending_commands = 0
         return {"status": "ok", "server_time": iso(utcnow()),
                 "credential_rotation_required": ctx.rotation_required,
-                "connection_tests_pending": pending_tests}
+                "connection_tests_pending": pending_tests,
+                "query_commands_pending": pending_commands}
 
     @agent.post("/events")
     def agent_event(body: AgentEventBody, ctx: InstallationCtx = Depends(authenticate)) -> dict:
@@ -1082,6 +1090,11 @@ def create_agent_routers(
     if connection_tests is not None:
         from connection_tests_postgres import register_agent_connection_test_routes
         register_agent_connection_test_routes(agent, authenticate, connection_tests)
+
+    # ── Tabla destino desde el query (sección 24) ───────────────────────────
+    if query_commands is not None:
+        from query_preview import register_agent_command_routes
+        register_agent_command_routes(agent, authenticate, query_commands)
 
     # ── Rotación de credencial ──────────────────────────────────────────────
     @agent.post("/credentials/rotate")

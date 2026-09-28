@@ -326,7 +326,7 @@ export const SECTIONS: DocSection[] = [
     title: "Catálogo de objetos y Extractores",
     icon: Boxes,
     keywords:
-      "catalogo objeto tabla destino create_table_sql upsert_keys extractor tarea crear editar activar desactivar clonar reiniciar última ejecución",
+      "catalogo objeto tabla destino create_table_sql upsert_keys extractor tarea crear editar activar desactivar clonar reiniciar última ejecución query preview muestra de datos crear tabla validar upsert",
     body: (
       <div className="space-y-4">
         <H3 id="ce-catalogo">Catálogo de objetos</H3>
@@ -336,6 +336,35 @@ export const SECTIONS: DocSection[] = [
           <Code>upsert_keys</Code>), restricción y columnas estáticas (<Code>static_columns</Code>), en editores de
           texto monoespaciados. Un extractor siempre apunta a un objeto del catálogo.
         </P>
+        <H3 id="ce-desde-query">Crear un extractor desde el query</H3>
+        <P>
+          Al dar de alta un <b>objeto nuevo</b>, la sección <UiLabel>Crear un extractor desde el query</UiLabel>{" "}
+          permite escribir el <Code>SELECT</Code> de origen y pulsar <UiLabel>Ejecutar prueba</UiLabel>: un{" "}
+          <b>agente en línea</b> (versión 5.4 o superior) ejecuta el query contra la base del cliente — Nexus nunca se
+          conecta a ella — y devuelve las columnas con su tipo de origen, el tipo PostgreSQL <b>sugerido</b> (editable)
+          y, si la empresa lo permite, hasta 20 filas de muestra (con el aviso «no se guardan»: la muestra vive unos
+          minutos en memoria del servidor y se borra al mostrarla, nunca queda en ninguna tabla ni en ningún registro).
+        </P>
+        <OL>
+          <li>Marque las columnas <b>llave</b>; el panel avisa si hay duplicados o nulos en la muestra.</li>
+          <li>
+            <UiLabel>Usar esta definición</UiLabel> copia la tabla destino, el <Code>create_table_sql</Code> generado
+            y las claves de upsert al resto del formulario; revíselas y guarde el objeto normalmente.
+          </li>
+          <li>
+            <UiLabel>Crear tabla en el DWH</UiLabel> le pide al agente que ejecute ese DDL en el destino efectivo de la
+            empresa (idempotente: si la tabla ya existe no la altera).
+          </li>
+          <li>
+            <UiLabel>Validar upsert</UiLabel> le pide al agente que vuelva a traer la muestra y haga upsert dos veces
+            dentro de una transacción que siempre termina en <b>ROLLBACK</b> (no se confirma nada): reporta filas
+            insertadas/actualizadas y errores de tipo por columna.
+          </li>
+        </OL>
+        <Callout tone="warn" title="Sin agente 5.4 en línea">
+          Si ninguna instalación en línea anuncia la capacidad, el panel indica «actualice el agente a 5.4»: instale la
+          versión más reciente (sección Instalaciones) antes de usar esta sección.
+        </Callout>
         <H3 id="ce-extractores">Extractores</H3>
         <P>
           En el panel, las <b>tareas</b> se llaman <b>extractores</b>: un extractor es la combinación de una{" "}

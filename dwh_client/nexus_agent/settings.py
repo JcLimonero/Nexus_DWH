@@ -83,6 +83,9 @@ class Settings:
     connection_test_min_spacing_seconds: int = 30
     connection_test_max_per_minute: int = 6
 
+    query_preview_enabled: bool = True        # "Tabla destino desde el query" del panel (sección 24)
+    query_preview_poll_seconds: int = 10
+
     watermark_clock: str = "source"           # source | agent_local | agent_utc
     watermark_overlap_seconds: int = 120
     legacy_watermark_overlap_seconds: int = 3600
@@ -238,6 +241,8 @@ def load_settings(config_path: Optional[str] = None, data_dir: Optional[str] = N
     s.connection_test_poll_seconds = _int(ini, "agent", "connection_test_poll_seconds", 10, 3)
     s.connection_test_min_spacing_seconds = _int(ini, "agent", "connection_test_min_spacing_seconds", 30, 0)
     s.connection_test_max_per_minute = _int(ini, "agent", "connection_test_max_per_minute", 6, 1)
+    s.query_preview_enabled = _bool(ini, "agent", "query_preview_enabled", True)
+    s.query_preview_poll_seconds = _int(ini, "agent", "query_preview_poll_seconds", 10, 3)
 
     s.watermark_clock = (_get(ini, "agent", "watermark_clock", "source") or "source").lower()
     if s.watermark_clock not in ("source", "agent_local", "agent_utc"):
