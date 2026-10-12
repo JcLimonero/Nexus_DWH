@@ -9,6 +9,7 @@ import { Modal } from "@/components/ui/modal";
 import { DataState } from "@/components/ui/states";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { CompanyOptions } from "@/components/filters";
+import { QueryPreviewBuilder } from "@/components/query-preview";
 import { useRefData } from "@/components/ref-data";
 import { useActions } from "@/components/use-actions";
 import { useToast } from "@/components/ui/feedback";
@@ -238,6 +239,21 @@ export default function CatalogoPage() {
           <Field label="Descripción" className="sm:col-span-6" htmlFor="o-desc">
             <Input id="o-desc" value={form.description} onChange={(e) => set("description", e.target.value)} />
           </Field>
+          {!editing && !readOnly && (
+            <QueryPreviewBuilder
+              companyId={form.company_id ? Number(form.company_id) : null}
+              onApply={(def) =>
+                setForm((f) => ({
+                  ...f,
+                  destination_table: def.destination_table,
+                  create_table_sql: def.create_table_sql,
+                  upsert_keys: def.upsert_keys,
+                  constraint_name: def.constraint_name || f.constraint_name,
+                  create_constraint_sql: def.create_constraint_sql || f.create_constraint_sql,
+                }))
+              }
+            />
+          )}
           <Field label="Tabla destino" required className="sm:col-span-3" htmlFor="o-table" hint="Identificador SQL (opcional esquema.tabla).">
             <Input id="o-table" required className="font-mono" value={form.destination_table} onChange={(e) => set("destination_table", e.target.value)} placeholder="inventory" />
           </Field>

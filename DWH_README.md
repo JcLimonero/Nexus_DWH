@@ -1691,3 +1691,45 @@ docker run -d --name front --network nexus-net -p 127.0.0.1:13000:3000 -e DWH_AP
 ```
 
 (Solo desarrollo: `devpass` es la contraseña del contenedor local de §16.4.) Pruebas: `dwh_back/tests/test_env_config.py` (variables `NEXUS__*`, vacías/mal formadas, sin valores en el resumen, `allow_static_token` falso por defecto, `trusted_proxies` CIDR, `migrate.py`/`manage_users.py` solo con variables).
+
+---
+
+## 24. Crear un extractor desde el query: previsualización, tabla destino y validación de upsert
+
+Módulos `dwh_back/type_mapping.py` (mapeo de tipos único + generación de DDL), `dwh_back/query_preview.py` (comandos del agente: motor + API), `dwh_client/nexus_agent/query_preview.py` (agente) y `dwh_front/components/query-preview.tsx` (panel, dentro del alta de un objeto del catálogo). Requiere la migración `012_consulta_previa` y el agente **5.4.0**.
+
+### 24.1. Flujo
+
+1. En **Catálogo → Nuevo objeto**, con la empresa elegida, la sección *Crear un extractor desde el query* permite escribir el `SELECT` de origen y pulsar **Ejecutar prueba**.
+2. El panel pide `POST /admin/query-commands {kind: "query_preview", company_id, extract_sql, sample_limit: 20}` (permiso `config.manage` sobre el grupo de la empresa). Igual que "Probar conexión" (sección 22), Nexus **nunca** se conecta a la base del cliente: la petición queda `pending` hasta que un agente en línea con la capacidad `query-preview` la toma (`POST /agent/commands/claim`) y ejecuta el query envuelto en un límite de filas por motor (`TOP`/`FIRST`/`LIMIT` según SQL Server, Firebird o PostgreSQL/MySQL), sustituyendo `{last_run}` por el valor por defecto (`1900-01-01`).
+3. El agente lee los metadatos de columna (nombre, tipo de origen, nulabilidad, longitud/precisión/escala): SQL Server con `sp_describe_first_result_set` (con `cursor.description` como respaldo si el query usa un procedimiento sin permiso o una vista que no lo soporta), PostgreSQL resolviendo el OID de `cursor.description` contra `pg_type`, MySQL y Firebird con `cursor.description`. Reporta el resultado con `POST /agent/commands/{id}/result`.
+4. El backend mapea cada tipo de origen a un tipo PostgreSQL sugerido (`type_mapping.map_source_type`, la única función que decide esto; el usuario puede editar cada tipo en el panel) y normaliza los nombres de columna a snake_case cuando el alias del query no es un identificador seguro (se avisa cuál se renombró).
+5. Si la empresa lo permite (`company.allow_data_preview`, por defecto verdadero), el agente también manda hasta 20 filas de muestra. El panel las muestra con el aviso "no se guardan": las filas **nunca** llegan a la BD de Nexus ni a ningún log (§24.3); si `allow_data_preview` es falso, el agente ni siquiera las envía (`include_rows: false` en el comando) y el backend las descarta igual como defensa en profundidad si un agente defectuoso las mandara.
+6. El usuario marca las columnas llave (con aviso de duplicados/nulos calculado en el navegador contra la muestra recibida) y pulsa **Usar esta definición**: se copian `destination_table`, `create_table_sql` (el `CREATE TABLE IF NOT EXISTS` generado), `upsert_keys` y `constraint_name` al resto del formulario del objeto del catálogo, que se guarda con el flujo normal (`POST /admin/objects`).
+7. **Crear tabla en el DWH** pide `kind: "create_table"`: el backend genera el DDL con `type_mapping.build_create_table_sql` (identificadores validados y citados, esquema del destino efectivo de la empresa — sección 22) y el agente lo ejecuta tal cual (`CREATE TABLE IF NOT EXISTS`: idempotente; si la tabla ya existe con otra estructura no se altera).
+8. **Validar upsert** pide `kind: "upsert_check"`: el agente vuelve a ejecutar el query de origen (Nexus nunca reenvía filas), hace upsert de la muestra **dos veces** dentro de una transacción en el DWH (para comprobar que la segunda actualiza en vez de duplicar) y siempre termina en **ROLLBACK**. Reporta insertadas/actualizadas (`RETURNING (xmax = 0)`, igual que la carga real), duplicados/nulos de llave en la muestra y errores por fila (desbordamiento, fechas inválidas, `NOT NULL`), sin exponer los valores.
+
+### 24.2. Comando genérico del agente (`agent_command`)
+
+Generaliza el patrón request/claim/result de "Probar conexión" (`connection_test`, sección 22) a tres `kind` (`query_preview`, `create_table`, `upsert_check`) en una sola tabla `agent_command`, con los mismos límites: una abierta por combinación empresa+comando (idempotente), intervalo mínimo entre repeticiones, tope de comandos abiertos por grupo y de solicitudes por usuario por minuto, vencimiento (`pending`/`running` sin respuesta a tiempo → `expired`) y alcance de instalación (grupo → cualquier comando de sus empresas; empresa/agencia → solo los suyos). El agente anuncia la capacidad `query-preview` en el heartbeat (`features`) y Nexus la exige para asignarle comandos; sin ningún agente elegible en línea el panel muestra "actualice el agente a 5.4".
+
+### 24.3. Privacidad de la muestra de datos
+
+Las filas de muestra **nunca** se guardan: ni en ninguna tabla de la BD de Nexus, ni en `activity_log`/`panel_audit_log`, ni en los logs del backend o del agente. `agent_command.request`/`result_meta` solo contienen metadatos (columnas, tipos, conteos, avisos, duración); el propio query de origen (necesario para que el agente lo ejecute) se borra de `request` en cuanto el comando termina. Las filas que postea el agente viven solo en un almacén **en memoria** del proceso del backend (`PreviewRowStore`, TTL de 10 minutos) y se entregan **una sola vez**, solo al usuario que pidió el comando (mismo alcance/permiso `config.manage`); cualquier otro usuario, o una segunda lectura, no las recibe. Tope de 20 filas, 500 caracteres por celda y un tope total de payload; el cuerpo de `POST /agent/commands/{id}/result` no se valida por Pydantic en el campo de filas (para que un 422 nunca haga eco de datos de negocio en un log de error ≥ 400): el recorte se hace por código.
+
+### 24.4. Mapeo de tipos (origen → PostgreSQL)
+
+Único lugar: `dwh_back/type_mapping.py` (con pruebas puras `dwh_back/tests/test_type_mapping.py`, sin BD). `varchar/nvarchar(n)` → `varchar(n)` (`max` → `text`), `char/nchar` → `char(n)`, `text/ntext/longtext/…` → `text`, `tinyint/smallint/int/bigint` → `smallint/integer/bigint` (con los equivalentes de MySQL/Firebird), `bit/bool` → `boolean`, `decimal/numeric(p,s)` → `numeric(p,s)` (precisión acotada a 1000), `money` → `numeric(19,4)`, `float/double/real` → `double precision`/`real`, `date` → `date`, `datetime*` → `timestamp`, `datetimeoffset`/`timestamptz` → `timestamptz`, `time` → `time`, `uniqueidentifier/uuid` → `uuid`, `binary/varbinary/blob` → `bytea`, `json` → `jsonb`; un tipo no reconocido cae en `text` con un aviso (el usuario puede editarlo en el panel).
+
+### 24.5. Variables nuevas
+
+- Backend `[query_preview]`: `enabled` (true), `pending_ttl_seconds` (120), `running_ttl_seconds` (60), `online_seconds` (180), `agent_timeout_seconds` (30), `retention_days` (7), `poll_seconds` (10), `min_interval_seconds` (15), `max_open_per_group` (5), `max_per_user_per_minute` (10), `rows_ttl_seconds` (600).
+- Agente `[agent]`: `query_preview_enabled` (true), `query_preview_poll_seconds` (10).
+- BD: `company.allow_data_preview` (booleano, defecto verdadero); tabla `agent_command`.
+
+### 24.6. Pendiente / fuera de alcance
+
+- El panel solo ofrece "Crear un extractor desde el query" al dar de alta un objeto nuevo; para un objeto existente con `create_table_sql` propio, la generación automática no se integró aún (mostrar diff antes de reemplazar queda pendiente).
+- Sugerencia automática de índice sobre la columna comparada con `{last_run}` (`type_mapping.detect_watermark_column`/`suggest_indexes`): la función existe y está probada, pero el panel todavía no la usa para proponer un índice adicional al guardar.
+- Probar valores de conexión **sin guardar** (mismo pendiente que la sección 22.9): el query de origen si se prueba contra un origen guardado, no contra credenciales aún sin persistir.
+- Pruebas de integración del agente contra SQL Server/Firebird reales (CI solo cubre PostgreSQL con contenedores; SQL Server/Firebird se prueban con "fakes" a nivel unitario).

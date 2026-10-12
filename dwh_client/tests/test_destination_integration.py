@@ -21,6 +21,7 @@ import pytest
 import requests
 
 import support
+from nexus_agent import AGENT_VERSION
 from nexus_agent.agent import Agent
 from nexus_agent.destination import task_warehouse
 from nexus_agent.inventory import InventoryRunner
@@ -207,7 +208,7 @@ def test_03_prueba_de_conexion_correcta(denv):
     assert res["server_version"].startswith("PostgreSQL 16")
     assert res["ssl_in_use"] is False and codes["SSL"]["severity"] == "warning"   # sslmode=disable
     assert res["schema_exists"] is True and codes["CREATE_TABLE"]["ok"] is True
-    assert res["agent_version"] == "5.3.0" and r["installation_name"]
+    assert res["agent_version"] == AGENT_VERSION and r["installation_name"]
     # Destino propio (prefer, esquema existente) y un esquema que aún no existe.
     r = run_test(denv, a, {"target_kind": "company_dwh", "company_id": denv["c_own"]["id"]})
     assert r["status"] == "ok" and r["result"]["schema_exists"] is True

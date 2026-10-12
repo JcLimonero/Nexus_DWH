@@ -772,10 +772,12 @@ def test_heartbeat_anuncia_capacidades(tmp_path):
     s = Settings(data_dir=str(tmp_path), api_url="http://127.0.0.1:1", mode="development",
                  allow_insecure_http=True)
     a = Agent(s)
-    assert a.heartbeat_payload()["features"] == ["destination-v2", "connection-test"]
+    assert a.heartbeat_payload()["features"] == ["destination-v2", "connection-test", "query-preview"]
     s.connection_test_enabled = False
+    assert a.heartbeat_payload()["features"] == ["destination-v2", "query-preview"]
+    s.query_preview_enabled = False
     assert a.heartbeat_payload()["features"] == ["destination-v2"]
-    assert a.api.session.headers["x-nexus-agent-features"] == "destination-v2,connection-test"
+    assert a.api.session.headers["x-nexus-agent-features"] == "destination-v2,connection-test,query-preview"
 
 
 def test_pruebas_de_conexion_espaciadas_y_con_tope(tmp_path, monkeypatch):

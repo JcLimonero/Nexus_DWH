@@ -1591,6 +1591,18 @@ CONNECTION_TEST_ENGINE = ConnectionTestEngine(
 )
 app.include_router(create_connection_test_admin_router(engine=CONNECTION_TEST_ENGINE, auth=AUTH))
 
+# Tabla destino desde el query: comandos ejecutados por el agente (sección 24 de DWH_README.md)
+from query_preview import (  # noqa: E402
+    AgentCommandEngine, QueryPreviewSettings, create_query_preview_admin_router,
+)
+
+QUERY_PREVIEW_ENGINE = AgentCommandEngine(
+    get_connection=get_connection,
+    decrypt_config_secret=decrypt_config_secret,
+    settings=QueryPreviewSettings.from_ini(_ini),
+)
+app.include_router(create_query_preview_admin_router(engine=QUERY_PREVIEW_ENGINE, auth=AUTH))
+
 _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers(
     get_connection=get_connection,
     decrypt_config_secret=decrypt_config_secret,
@@ -1606,6 +1618,7 @@ _agent_router, _agent_admin_router, _agent_monitor_router = create_agent_routers
     inventory=INVENTORY_ENGINE,
     latest_agent_version=AGENT_LATEST_VERSION,
     connection_tests=CONNECTION_TEST_ENGINE,
+    query_commands=QUERY_PREVIEW_ENGINE,
 )
 app.include_router(_agent_router)
 app.include_router(_agent_admin_router)
